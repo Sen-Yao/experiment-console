@@ -114,6 +114,7 @@ Environment variables:
 - `GET /api/events`
 - `GET /api/wandb/sweeps`
 - `GET /api/hosts/gpus?host=gpu-host-1`
+- `POST /api/runner/validate-config`
 - `POST /api/runner/launch-sweep`
 - `POST /api/runner/register-existing-sweep`
 - `POST /api/runner/status`
@@ -127,6 +128,8 @@ Environment variables:
 - `POST /api/runner/schedule-monitor`
 - `POST /api/runner/unschedule-monitor`
 - `POST /api/runner/watchdog-once`
+
+The temporary local runtime and the full FastAPI runtime are expected to expose the same runner-facing contract. `experiment-runner` should call these endpoints instead of doing SSH, W&B, job-store, result aggregation, or watchdog side effects locally.
 
 ## Development
 

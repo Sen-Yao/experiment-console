@@ -92,6 +92,18 @@ Expected classification:
 ok
 ```
 
+When local YAML dependencies are missing, use the zero-dependency Console client path:
+
+```bash
+EXPERIMENT_CONSOLE_URL=http://127.0.0.1:5174 \
+/opt/homebrew/bin/python3 /Users/oliver/.agents/skills/experiment-runner/scripts/experiment.py \
+  console get /health
+
+EXPERIMENT_CONSOLE_URL=http://127.0.0.1:5174 \
+/opt/homebrew/bin/python3 /Users/oliver/.agents/skills/experiment-runner/scripts/experiment.py \
+  console post /api/runner/status --data '{"job_id":"job_20260615_152258_prod_matguardgt_cleg3_v4_console_20260615"}'
+```
+
 Current production sweep at the time of this handoff:
 
 ```text
