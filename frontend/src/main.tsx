@@ -5,7 +5,6 @@ import {
   AlertTriangle,
   CheckCircle2,
   Clock3,
-  Database,
   Gauge,
   ListChecks,
   RefreshCw,
@@ -66,6 +65,29 @@ type AuditEvent = {
 }
 
 type TabKey = 'sweeps' | 'jobs' | 'events'
+type TimePartMap = Record<string, string>
+
+const SHANGHAI_TIME_ZONE = 'Asia/Shanghai'
+const dateTimeFormatter = new Intl.DateTimeFormat('en-CA', {
+  timeZone: SHANGHAI_TIME_ZONE,
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hour12: false,
+  hourCycle: 'h23',
+})
+const shortTimeFormatter = new Intl.DateTimeFormat('en-CA', {
+  timeZone: SHANGHAI_TIME_ZONE,
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  hour12: false,
+  hourCycle: 'h23',
+})
 
 function App() {
   const [overview, setOverview] = React.useState<Overview | null>(null)
@@ -116,7 +138,7 @@ function App() {
           <StatusPill status={overview?.status ?? 'loading'} degraded={overview?.degraded} />
           <MiniReadout icon={<Activity size={15} />} label="活跃 Sweep" value={String(overview?.active_sweeps ?? 0)} />
           <MiniReadout icon={<Server size={15} />} label="运行作业" value={String(overview?.job_counts.running ?? 0)} />
-          <MiniReadout icon={<Clock3 size={15} />} label="同步" value={formatTime(overview?.generated_at)} />
+          <MiniReadout icon={<Clock3 size={15} />} label="同步" value={formatDateTime(overview?.generated_at)} />
           <button className="iconButton" onClick={refresh} title="刷新" aria-label="刷新" disabled={loading}>
             <RefreshCw size={18} />
           </button>
@@ -132,7 +154,7 @@ function App() {
         <div className="tabs" role="tablist" aria-label="控制台分区">
           <TabButton active={tab === 'sweeps'} onClick={() => setTab('sweeps')} icon={<Gauge size={16} />} label="Sweep" />
           <TabButton active={tab === 'jobs'} onClick={() => setTab('jobs')} icon={<ListChecks size={16} />} label="作业" />
-          <TabButton active={tab === 'events'} onClick={() => setTab('events')} icon={<Database size={16} />} label="审计" />
+          <TabButton active={tab === 'events'} onClick={() => setTab('events')} icon={<Clock3 size={16} />} label="审计" />
         </div>
 
         {tab === 'sweeps' && <CompactSweepList grouped={grouped} />}
@@ -208,9 +230,8 @@ function TelemetryStrip({ sweep }: { sweep: Sweep }) {
   return (
     <div className="telemetryStrip">
       <Telemetry icon={<Timer size={16} />} label="ETA" value={formatEta(sweep.eta_seconds)} />
+      <Telemetry icon={<Clock3 size={16} />} label="预计完成" value={formatExpectedCompletion(sweep.last_sync_at, sweep.eta_seconds)} />
       <Telemetry icon={<Gauge size={16} />} label="速度" value={formatSpeed(sweep.speed_per_hour)} />
-      <Telemetry icon={<Clock3 size={16} />} label="最近同步" value={formatTime(sweep.last_sync_at)} />
-      <Telemetry icon={<Database size={16} />} label="来源" value={sourceText(sweep.source)} />
     </div>
   )
 }
@@ -279,7 +300,7 @@ function EventList({ events }: { events: AuditEvent[] }) {
     <div className="eventList">
       {events.map((event, index) => (
         <div className="eventRow" key={`${event.created_at}-${index}`}>
-          <span>{formatTime(event.created_at)}</span>
+          <span>{formatDateTime(event.created_at)}</span>
           <strong>{event.event_type}</strong>
           <p>{event.message}</p>
         </div>
@@ -381,9 +402,33 @@ function statusText(status: string) {
   return status || '未知'
 }
 
-function formatTime(value?: string) {
-  if (!value) return '-'
-  return value.replace('T', ' ').replace('Z', '')
+function formatterParts(formatter: Intl.DateTimeFormat, date: Date): TimePartMap {
+  return Object.fromEntries(formatter.formatToParts(date).map((part) => [part.type, part.value]))
+}
+
+function parseTime(value?: string) {
+  if (!value) return null
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return null
+  return date
+}
+
+function formatDateTime(value?: string) {
+  const date = parseTime(value)
+  if (!date) return '-'
+  const parts = formatterParts(dateTimeFormatter, date)
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`
+}
+
+function formatShortDateTime(date: Date) {
+  const parts = formatterParts(shortTimeFormatter, date)
+  return `${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`
+}
+
+function formatExpectedCompletion(lastSync?: string, etaSeconds?: number | null) {
+  const base = parseTime(lastSync)
+  if (!base || !etaSeconds || etaSeconds <= 0) return '-'
+  return formatShortDateTime(new Date(base.getTime() + etaSeconds * 1000))
 }
 
 function formatEta(seconds?: number | null) {
@@ -397,13 +442,6 @@ function formatEta(seconds?: number | null) {
 function formatSpeed(speed?: number) {
   if (!speed || speed <= 0) return '-'
   return `${speed.toFixed(speed >= 10 ? 0 : 1)} runs/h`
-}
-
-function sourceText(source?: string) {
-  if (!source) return '-'
-  if (source.includes('wandb')) return 'W&B'
-  if (source.includes('runtime')) return 'Console'
-  return source
 }
 
 ReactDOM.createRoot(document.getElementById('root')!).render(

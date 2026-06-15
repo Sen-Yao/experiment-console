@@ -269,7 +269,7 @@ h3 {
 
 .telemetryStrip {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: minmax(130px, 0.9fr) minmax(190px, 1.35fr) minmax(130px, 0.9fr);
   gap: 1px;
   margin-top: 20px;
   overflow: hidden;

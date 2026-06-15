@@ -114,6 +114,19 @@ Environment variables:
 - `GET /api/events`
 - `GET /api/wandb/sweeps`
 - `GET /api/hosts/gpus?host=gpu-host-1`
+- `POST /api/runner/launch-sweep`
+- `POST /api/runner/register-existing-sweep`
+- `POST /api/runner/status`
+- `POST /api/runner/recover-agents`
+- `POST /api/runner/stop-job`
+- `POST /api/runner/cancel-sweep`
+- `POST /api/runner/auth-check`
+- `POST /api/runner/preflight`
+- `POST /api/runner/pull-results`
+- `POST /api/runner/repair-watchdog`
+- `POST /api/runner/schedule-monitor`
+- `POST /api/runner/unschedule-monitor`
+- `POST /api/runner/watchdog-once`
 
 ## Development
 

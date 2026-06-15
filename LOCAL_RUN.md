@@ -98,10 +98,13 @@ Current production sweep at the time of this handoff:
 HCCS/DualRefGAD/ofzzsan4
 ```
 
-Remote agent check:
+Console-owned agent health check:
 
 ```bash
-ssh HCCS-25 "pgrep -af 'wandb agent HCCS/DualRefGAD/ofzzsan4' || true"
+EXPERIMENT_CONSOLE_URL=http://127.0.0.1:5174 \
+PYTHONPATH="/Users/oliver/Developer/experiment-console/.local_deps:/private/tmp/experiment-console-deps:/Users/oliver/.agents/skills/experiment-runner/scripts" \
+/opt/homebrew/bin/python3 /Users/oliver/.agents/skills/experiment-runner/scripts/experiment.py \
+  watchdog-once --job-id job_20260615_152258_prod_matguardgt_cleg3_v4_console_20260615 --json
 ```
 
 ## Troubleshooting
