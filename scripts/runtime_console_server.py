@@ -6,19 +6,25 @@ import os
 import re
 import shlex
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 
 STATE_DIR = Path("/private/tmp/experiment-console-runtime")
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 JOBS_PATH = STATE_DIR / "jobs.json"
+SWEEP_CACHE_PATH = STATE_DIR / "sweep_summary_cache.json"
+SWEEP_REFRESH_LOCK = threading.Lock()
+SWEEP_REFRESHING: set[str] = set()
+ROOT_DIR = Path(__file__).resolve().parents[1]
+FRONTEND_DIST = ROOT_DIR / "frontend" / "dist"
 REMOTE_CONFIG_PATH = os.environ.get(
     "EXPERIMENT_CONSOLE_REMOTE_CONFIG_PATH",
     "/home/linziyao/DualRefGAD/investigations/nexus/2026-06-01-dualrefgad-matguardgt/experiments/configs/matguardgt_cleg3_v4_reference_token_gt_sweep_2880.yaml",
@@ -33,6 +39,19 @@ def load_jobs() -> list[dict[str, Any]]:
     if not JOBS_PATH.exists():
         return []
     return json.loads(JOBS_PATH.read_text(encoding="utf-8"))
+
+
+def load_sweep_cache() -> dict[str, Any]:
+    if not SWEEP_CACHE_PATH.exists():
+        return {}
+    try:
+        return json.loads(SWEEP_CACHE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_sweep_cache(cache: dict[str, Any]) -> None:
+    SWEEP_CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def save_jobs(jobs: list[dict[str, Any]]) -> None:
@@ -84,6 +103,107 @@ def parse_sweep_id(text: str) -> str | None:
     return None
 
 
+def expected_from_config_path(config_path: str | None) -> int:
+    if config_path and "2880" in config_path:
+        return 2880
+    return 0
+
+
+def fetch_sweep_summary(job: dict[str, Any], cache_key: str) -> dict[str, Any]:
+    remote = (
+        "python3 - <<'PY'\n"
+        "import json, time\n"
+        "from collections import Counter\n"
+        "from wandb.apis.public import Api\n"
+        f"path={cache_key!r}\n"
+        f"expected={expected_from_config_path(job.get('remote_config_path') or job.get('config_path'))!r}\n"
+        "s=Api().sweep(path)\n"
+        "runs=list(s.runs)\n"
+        "counts=Counter(getattr(r,'state',None) for r in runs)\n"
+        "created=[getattr(r,'created_at',None) for r in runs if getattr(r,'created_at',None)]\n"
+        "created_sorted=sorted(str(x) for x in created)\n"
+        "started=created_sorted[0] if created_sorted else None\n"
+        "finished=int(counts.get('finished',0))\n"
+        "running=int(counts.get('running',0))\n"
+        "failed=int(counts.get('failed',0) + counts.get('crashed',0))\n"
+        "speed=0.0\n"
+        "eta=None\n"
+        "if started and finished > 0:\n"
+        "    import datetime\n"
+        "    st=datetime.datetime.fromisoformat(started.replace('Z','+00:00'))\n"
+        "    elapsed=max((datetime.datetime.now(datetime.timezone.utc)-st).total_seconds(),1)\n"
+        "    speed=finished/(elapsed/3600)\n"
+        "    if expected and speed > 0 and finished < expected:\n"
+        "        eta=(expected-finished)/speed*3600\n"
+        "print(json.dumps({\n"
+        "  'id': getattr(s,'id',None) or getattr(s,'name',None) or path.rsplit('/',1)[-1],\n"
+        "  'name': getattr(s,'name',None) or path.rsplit('/',1)[-1],\n"
+        "  'state': getattr(s,'state',None) or 'UNKNOWN',\n"
+        "  'runCount': len(runs),\n"
+        "  'expectedRunCount': expected,\n"
+        "  'finished_runs': finished,\n"
+        "  'running_runs': running,\n"
+        "  'failed_runs': failed,\n"
+        "  'speed_per_hour': speed,\n"
+        "  'eta_seconds': eta,\n"
+        "  'last_sync_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),\n"
+        "}))\n"
+        "PY"
+    )
+    proc = ssh_with_key(job.get("remote_host") or "HCCS-25", remote, timeout=12)
+    require_ok(proc, "wandb sweep summary")
+    summary = json.loads(proc.stdout.strip().splitlines()[-1])
+    summary["_cached_at"] = time.time()
+    summary["source"] = "wandb_public_api_cached"
+    return summary
+
+
+def refresh_sweep_cache(job: dict[str, Any], cache_key: str) -> None:
+    try:
+        summary = fetch_sweep_summary(job, cache_key)
+        cache = load_sweep_cache()
+        cache[cache_key] = summary
+        save_sweep_cache(cache)
+    finally:
+        with SWEEP_REFRESH_LOCK:
+            SWEEP_REFRESHING.discard(cache_key)
+
+
+def cached_sweep_summary(job: dict[str, Any], ttl_seconds: int = 60) -> dict[str, Any]:
+    sweep_id = job.get("sweep_id")
+    entity = job.get("entity") or "HCCS"
+    project = job.get("project") or "DualRefGAD"
+    if not sweep_id:
+        return {}
+    cache_key = f"{entity}/{project}/{sweep_id}"
+    cache = load_sweep_cache()
+    cached = cache.get(cache_key)
+    now_epoch = time.time()
+    if cached and now_epoch - float(cached.get("_cached_at", 0)) <= ttl_seconds:
+        return cached
+    if cached:
+        with SWEEP_REFRESH_LOCK:
+            should_refresh = cache_key not in SWEEP_REFRESHING
+            if should_refresh:
+                SWEEP_REFRESHING.add(cache_key)
+        if should_refresh:
+            threading.Thread(target=refresh_sweep_cache, args=(job, cache_key), daemon=True).start()
+        cached["source"] = "wandb_public_api_cache_refreshing"
+        return cached
+
+    try:
+        summary = fetch_sweep_summary(job, cache_key)
+        cache[cache_key] = summary
+        save_sweep_cache(cache)
+        return summary
+    except Exception as exc:
+        if cached:
+            cached["source"] = "wandb_public_api_cache_stale"
+            cached["degraded"] = redact(str(exc))
+            return cached
+        return {}
+
+
 class LaunchSweepPayload(BaseModel):
     job_name: str
     config_path: str | None = None
@@ -128,76 +248,35 @@ def health() -> dict[str, Any]:
     }
 
 
-@app.get("/", response_class=HTMLResponse)
-def home() -> str:
-    return """
-<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Experiment Console</title>
-  <style>
-    body{margin:0;background:#f7f8f5;color:#17201b;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-    main{max-width:1060px;margin:0 auto;padding:28px}
-    header{display:flex;justify-content:space-between;gap:16px;align-items:center;border-bottom:1px solid #d8ded6;padding-bottom:18px}
-    h1{margin:0;font-size:24px;letter-spacing:0}
-    .pill{border:1px solid #bad0c3;color:#245b47;background:#edf5ef;padding:6px 10px;border-radius:999px;font-weight:650}
-    .panel{margin-top:22px;border:1px solid #d8ded6;background:#fff;border-radius:8px;padding:18px}
-    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
-    .metric{border-left:3px solid #315d8c;padding-left:12px}
-    .label{color:#5e6a61;font-size:12px}
-    .value{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:22px;font-weight:750}
-    pre{white-space:pre-wrap;background:#f2f4ef;border:1px solid #d8ded6;border-radius:8px;padding:12px;overflow:auto}
-  </style>
-</head>
-<body>
-  <main>
-    <header><h1>Experiment Console</h1><span class="pill" id="status">读取中</span></header>
-    <section class="panel">
-      <div class="grid">
-        <div class="metric"><div class="label">活跃 Sweep</div><div class="value" id="active">-</div></div>
-        <div class="metric"><div class="label">运行作业</div><div class="value" id="running">-</div></div>
-        <div class="metric"><div class="label">最近同步</div><div class="value" id="sync">-</div></div>
-      </div>
-    </section>
-    <section class="panel"><h2>当前任务</h2><pre id="jobs">读取中...</pre></section>
-  </main>
-  <script>
-    async function refresh(){
-      const r = await fetch('/api/overview');
-      const data = await r.json();
-      document.getElementById('status').textContent = data.status === 'ok' ? '控制台运行正常' : '控制台降级';
-      document.getElementById('active').textContent = data.active_sweeps_count ?? data.active_sweeps ?? 0;
-      document.getElementById('running').textContent = data.job_counts?.running ?? 0;
-      document.getElementById('sync').textContent = (data.generated_at || '').replace('T',' ').replace('Z','');
-      document.getElementById('jobs').textContent = JSON.stringify(data.jobs || [], null, 2);
-    }
-    refresh(); setInterval(refresh, 15000);
-  </script>
-</body>
-</html>
-"""
-
-
 @app.get("/api/overview")
 def overview() -> dict[str, Any]:
     jobs = load_jobs()
     sweeps = []
     for job in jobs:
         if job.get("sweep_id"):
+            summary = cached_sweep_summary(job)
+            expected = int(summary.get("expectedRunCount") or expected_from_config_path(job.get("remote_config_path") or job.get("config_path")) or 0)
+            run_count = int(summary.get("runCount") or 0)
+            finished = int(summary.get("finished_runs") or 0)
+            progress_base = expected or run_count or 1
             sweeps.append(
                 {
-                    "id": job.get("sweep_id"),
-                    "name": job.get("sweep_id"),
+                    "id": summary.get("id") or job.get("sweep_id"),
+                    "name": summary.get("name") or job.get("sweep_id"),
                     "entity": job.get("entity"),
                     "project": job.get("project"),
-                    "state": "RUNNING" if job.get("status") == "running" else str(job.get("status") or "UNKNOWN").upper(),
-                    "runCount": 0,
-                    "expectedRunCount": 2880,
-                    "progress": 0,
+                    "state": summary.get("state") or ("RUNNING" if job.get("status") == "running" else str(job.get("status") or "UNKNOWN").upper()),
+                    "runCount": run_count,
+                    "expectedRunCount": expected,
+                    "progress": min(finished / progress_base, 1),
+                    "finished_runs": finished,
+                    "running_runs": int(summary.get("running_runs") or 0),
+                    "failed_runs": int(summary.get("failed_runs") or 0),
+                    "speed_per_hour": float(summary.get("speed_per_hour") or 0),
+                    "eta_seconds": summary.get("eta_seconds"),
+                    "last_sync_at": summary.get("last_sync_at") or now(),
                     "createdAt": job.get("created_at"),
-                    "source": "temporary_console_runtime",
+                    "source": summary.get("source") or "temporary_console_runtime",
                 }
             )
     counts: dict[str, int] = {}
@@ -422,3 +501,7 @@ def runner_status(payload: JobPayload) -> dict[str, Any]:
         "provenance": {"source": "temporary_console_runtime"},
         "next_actions": [],
     }
+
+
+if FRONTEND_DIST.exists():
+    app.mount("/", StaticFiles(directory=str(FRONTEND_DIST), html=True), name="frontend")

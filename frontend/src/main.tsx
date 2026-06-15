@@ -1,6 +1,17 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
-import { Activity, AlertTriangle, Check, Play, RefreshCw, ShieldCheck, Square, Terminal } from 'lucide-react'
+import {
+  Activity,
+  AlertTriangle,
+  CheckCircle2,
+  Clock3,
+  Database,
+  Gauge,
+  ListChecks,
+  RefreshCw,
+  Server,
+  Timer,
+} from 'lucide-react'
 import './styles.css'
 
 type Job = {
@@ -12,19 +23,27 @@ type Job = {
   sweep_id?: string | null
   remote_host?: string | null
   remote_cwd?: string | null
-  agent_pids: string[]
-  created_at: string
-  updated_at: string
+  created_at?: string
+  updated_at?: string
 }
 
 type Sweep = {
   id: string
+  name?: string
   entity: string
   project: string
   state: string
   runCount: number
   expectedRunCount: number
   progress: number
+  createdAt?: string
+  source?: string
+  finished_runs?: number
+  running_runs?: number
+  failed_runs?: number
+  speed_per_hour?: number
+  eta_seconds?: number | null
+  last_sync_at?: string
 }
 
 type Overview = {
@@ -40,288 +59,238 @@ type Overview = {
 }
 
 type AuditEvent = {
-  event_id: string
   event_type: string
   message: string
-  intent_id?: string | null
-  job_id?: string | null
   created_at: string
+  detail?: Record<string, unknown>
 }
 
-type IntentRecord = {
-  intent_id: string
-  intent: string
-  status: string
-  confirmation_phrase: string
-  plan: {
-    summary: string
-    risk_level: string
-    warnings: string[]
-    expected_side_effects: string[]
-    commands: Array<{ label: string; argv: string[]; reason: string; side_effect: boolean; host?: string | null }>
-  }
-}
-
-type MetricProps = {
-  label: string
-  value: number
-  icon: React.ReactNode
-}
-
-type FieldProps = {
-  label: string
-  value: string
-  onChange: (nextValue: string) => void
-}
-
-const blankLaunch = {
-  job_name: '',
-  config_path: '',
-  entity: 'my-team',
-  project: 'my-project',
-  remote_host: 'gpu-host-1',
-  remote_cwd: '',
-  conda_env: '',
-  max_agents: ''
-}
+type TabKey = 'sweeps' | 'jobs' | 'events'
 
 function App() {
   const [overview, setOverview] = React.useState<Overview | null>(null)
   const [events, setEvents] = React.useState<AuditEvent[]>([])
-  const [intent, setIntent] = React.useState<IntentRecord | null>(null)
-  const [confirmText, setConfirmText] = React.useState('')
-  const [launch, setLaunch] = React.useState(blankLaunch)
+  const [tab, setTab] = React.useState<TabKey>('sweeps')
+  const [loading, setLoading] = React.useState(false)
   const [message, setMessage] = React.useState('')
-  const [busy, setBusy] = React.useState(false)
 
   const refresh = React.useCallback(async () => {
-    const [overviewResp, eventsResp] = await Promise.all([
-      fetch('/api/overview'),
-      fetch('/api/events?limit=40')
-    ])
-    setOverview(await overviewResp.json())
-    setEvents(await eventsResp.json())
+    setLoading(true)
+    setMessage('')
+    try {
+      const [overviewResp, eventsResp] = await Promise.all([
+        fetch('/api/overview'),
+        fetch('/api/events?limit=40'),
+      ])
+      if (!overviewResp.ok) throw new Error(`overview ${overviewResp.status}`)
+      if (!eventsResp.ok) throw new Error(`events ${eventsResp.status}`)
+      setOverview(await overviewResp.json())
+      setEvents(await eventsResp.json())
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : String(err))
+    } finally {
+      setLoading(false)
+    }
   }, [])
 
   React.useEffect(() => {
-    refresh().catch((err) => setMessage(String(err)))
-    const id = window.setInterval(() => refresh().catch(() => undefined), 30000)
+    refresh()
+    const id = window.setInterval(refresh, 30000)
     return () => window.clearInterval(id)
   }, [refresh])
 
-  async function previewLaunch() {
-    setBusy(true)
-    setMessage('')
-    try {
-      const payload: Record<string, unknown> = {
-        ...launch,
-        max_agents: launch.max_agents ? Number(launch.max_agents) : null,
-        conda_env: launch.conda_env || null
-      }
-      const resp = await fetch('/api/intents/preview', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ intent: 'launch_sweep', payload })
-      })
-      const data = await resp.json()
-      if (!resp.ok) throw new Error(data.detail || 'preview failed')
-      setIntent(data.intent)
-      setConfirmText('')
-    } catch (err) {
-      setMessage(err instanceof Error ? err.message : String(err))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  async function previewJobIntent(kind: 'status_query' | 'stop_job' | 'recover_agents', job: Job) {
-    setBusy(true)
-    setMessage('')
-    try {
-      const payload = kind === 'status_query' ? { job_id: job.job_id } : { job_id: job.job_id }
-      const resp = await fetch('/api/intents/preview', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ intent: kind, payload })
-      })
-      const data = await resp.json()
-      if (!resp.ok) throw new Error(data.detail || 'preview failed')
-      setIntent(data.intent)
-      setConfirmText('')
-    } catch (err) {
-      setMessage(err instanceof Error ? err.message : String(err))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  async function confirmAndExecute() {
-    if (!intent) return
-    setBusy(true)
-    setMessage('')
-    try {
-      if (intent.plan.risk_level !== 'read_only') {
-        const confirmResp = await fetch(`/api/intents/${intent.intent_id}/confirm`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ confirmation_phrase: confirmText })
-        })
-        const confirmData = await confirmResp.json()
-        if (!confirmResp.ok) throw new Error(confirmData.detail || 'confirm failed')
-      }
-      const execResp = await fetch(`/api/intents/${intent.intent_id}/execute`, { method: 'POST' })
-      const execData = await execResp.json()
-      if (!execResp.ok) throw new Error(execData.detail || 'execute failed')
-      setMessage('Execution finished')
-      setIntent(execData.intent)
-      await refresh()
-    } catch (err) {
-      setMessage(err instanceof Error ? err.message : String(err))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const jobs = overview?.jobs ?? []
+  const initialLoading = !overview && loading
   const sweeps = overview?.sweeps ?? []
+  const jobs = overview?.jobs ?? []
+  const primary = selectPrimarySweep(sweeps)
+  const grouped = groupSweeps(sweeps)
 
   return (
-    <main>
-      <header className="topbar">
-        <div>
-          <h1>Experiment Console</h1>
-          <p>Local control plane for W&B sweeps, SSH GPU agents, and auditable experiment actions.</p>
+    <main className="consoleShell">
+      <header className="systemBar">
+        <div className="brandBlock">
+          <span className="eyebrow">Experiment Console</span>
+          <h1>实验控制台</h1>
         </div>
-        <button className="iconButton" onClick={() => refresh()} title="Refresh">
-          <RefreshCw size={18} />
-        </button>
+        <div className="systemReadouts" aria-label="系统状态">
+          <StatusPill status={overview?.status ?? 'loading'} degraded={overview?.degraded} />
+          <MiniReadout icon={<Activity size={15} />} label="活跃 Sweep" value={String(overview?.active_sweeps ?? 0)} />
+          <MiniReadout icon={<Server size={15} />} label="运行作业" value={String(overview?.job_counts.running ?? 0)} />
+          <MiniReadout icon={<Clock3 size={15} />} label="同步" value={formatTime(overview?.generated_at)} />
+          <button className="iconButton" onClick={refresh} title="刷新" aria-label="刷新" disabled={loading}>
+            <RefreshCw size={18} />
+          </button>
+        </div>
       </header>
 
       {message && <div className="notice"><AlertTriangle size={16} />{message}</div>}
-      {overview?.degraded && <div className="notice muted"><ShieldCheck size={16} />Degraded W&B view: {overview.degraded}</div>}
+      {overview?.degraded && <div className="notice amber"><AlertTriangle size={16} />W&B 视图降级：{overview.degraded}</div>}
 
-      <section className="stats">
-        <Metric label="Running Jobs" value={overview?.job_counts.running ?? 0} icon={<Activity size={20} />} />
-        <Metric label="Attention" value={overview?.job_counts.attention ?? 0} icon={<AlertTriangle size={20} />} />
-        <Metric label="Active Sweeps" value={overview?.active_sweeps ?? 0} icon={<Play size={20} />} />
-        <Metric label="Total Runs" value={overview?.total_runs ?? 0} icon={<Terminal size={20} />} />
-      </section>
+      <HeroSweepPanel sweep={primary} loading={initialLoading} />
 
-      <section className="workspace">
-        <div className="panel launchPanel">
-          <div className="panelHeader">
-            <h2>Launch Sweep</h2>
-            <button onClick={previewLaunch} disabled={busy}><Play size={16} />Preview</button>
-          </div>
-          <div className="formGrid">
-            <Field label="Job name" value={launch.job_name} onChange={(v) => setLaunch({ ...launch, job_name: v })} />
-            <Field label="Config path" value={launch.config_path} onChange={(v) => setLaunch({ ...launch, config_path: v })} />
-            <Field label="Entity" value={launch.entity} onChange={(v) => setLaunch({ ...launch, entity: v })} />
-            <Field label="Project" value={launch.project} onChange={(v) => setLaunch({ ...launch, project: v })} />
-            <Field label="Remote host" value={launch.remote_host} onChange={(v) => setLaunch({ ...launch, remote_host: v })} />
-            <Field label="Remote cwd" value={launch.remote_cwd} onChange={(v) => setLaunch({ ...launch, remote_cwd: v })} />
-            <Field label="Conda env" value={launch.conda_env} onChange={(v) => setLaunch({ ...launch, conda_env: v })} />
-            <Field label="Max agents" value={launch.max_agents} onChange={(v) => setLaunch({ ...launch, max_agents: v })} />
-          </div>
+      <section className="tabsPanel">
+        <div className="tabs" role="tablist" aria-label="控制台分区">
+          <TabButton active={tab === 'sweeps'} onClick={() => setTab('sweeps')} icon={<Gauge size={16} />} label="Sweep" />
+          <TabButton active={tab === 'jobs'} onClick={() => setTab('jobs')} icon={<ListChecks size={16} />} label="作业" />
+          <TabButton active={tab === 'events'} onClick={() => setTab('events')} icon={<Database size={16} />} label="审计" />
         </div>
 
-        <div className="panel">
-          <div className="panelHeader"><h2>Intent Gate</h2></div>
-          {intent ? (
-            <div className="intent">
-              <div className={`risk ${intent.plan.risk_level}`}>{intent.plan.risk_level}</div>
-              <h3>{intent.plan.summary}</h3>
-              <div className="commandList">
-                {intent.plan.commands.map((cmd) => (
-                  <div className="command" key={cmd.label}>
-                    <strong>{cmd.label}</strong>
-                    <code>{cmd.argv.join(' ')}</code>
-                    <span>{cmd.reason}</span>
-                  </div>
-                ))}
-              </div>
-              {intent.plan.risk_level !== 'read_only' && (
-                <label className="field">
-                  <span>Confirmation phrase</span>
-                  <code className="phrase">{intent.confirmation_phrase}</code>
-                  <input value={confirmText} onChange={(e) => setConfirmText(e.target.value)} />
-                </label>
-              )}
-              <button
-                className={intent.plan.risk_level === 'read_only' ? '' : 'danger'}
-                onClick={confirmAndExecute}
-                disabled={busy || (intent.plan.risk_level !== 'read_only' && confirmText !== intent.confirmation_phrase)}
-              >
-                <Check size={16} />{intent.plan.risk_level === 'read_only' ? 'Execute Read-only Query' : 'Confirm & Execute'}
-              </button>
-            </div>
-          ) : (
-            <div className="empty">Preview an action to generate a plan and confirmation phrase.</div>
-          )}
-        </div>
-      </section>
-
-      <section className="gridTwo">
-        <div className="panel">
-          <div className="panelHeader"><h2>Jobs</h2></div>
-          <div className="table">
-            {jobs.map((job) => (
-              <div className="row" key={job.job_id}>
-                <div>
-                  <strong>{job.name}</strong>
-                  <span>{job.job_id}</span>
-                </div>
-                <Status value={job.status} />
-                <span>{job.remote_host || '-'}</span>
-                <span>{job.sweep_id || '-'}</span>
-                <div className="actions">
-                  <button onClick={() => previewJobIntent('status_query', job)} title="Status"><RefreshCw size={15} /></button>
-                  <button onClick={() => previewJobIntent('recover_agents', job)} title="Recover"><Play size={15} /></button>
-                  <button onClick={() => previewJobIntent('stop_job', job)} title="Stop"><Square size={15} /></button>
-                </div>
-              </div>
-            ))}
-            {!jobs.length && <div className="empty">No local console jobs yet.</div>}
-          </div>
-        </div>
-
-        <div className="panel">
-          <div className="panelHeader"><h2>W&B Sweeps</h2></div>
-          <div className="sweepList">
-            {sweeps.slice(0, 10).map((sweep) => (
-              <div className="sweep" key={`${sweep.project}/${sweep.id}`}>
-                <div>
-                  <strong>{sweep.id}</strong>
-                  <span>{sweep.entity}/{sweep.project}</span>
-                </div>
-                <Status value={sweep.state.toLowerCase()} />
-                <span>{sweep.runCount}/{sweep.expectedRunCount}</span>
-              </div>
-            ))}
-            {!sweeps.length && <div className="empty">No W&B sweeps loaded.</div>}
-          </div>
-        </div>
-      </section>
-
-      <section className="panel">
-        <div className="panelHeader"><h2>Audit</h2></div>
-        <div className="events">
-          {events.map((event) => (
-            <div className="event" key={event.event_id}>
-              <span>{new Date(event.created_at).toLocaleString()}</span>
-              <strong>{event.event_type}</strong>
-              <p>{event.message}</p>
-            </div>
-          ))}
-        </div>
+        {tab === 'sweeps' && <CompactSweepList grouped={grouped} />}
+        {tab === 'jobs' && <JobList jobs={jobs} />}
+        {tab === 'events' && <EventList events={events} />}
       </section>
     </main>
   )
 }
 
-function Metric({ label, value, icon }: MetricProps) {
+function HeroSweepPanel({ sweep, loading }: { sweep?: Sweep; loading?: boolean }) {
+  if (loading) {
+    return (
+      <section className="heroPanel emptyHero loadingHero">
+        <div>
+          <span className="sectionLabel">主监控</span>
+          <h2>正在同步实验读数</h2>
+          <p>正在从 Console 控制面读取当前 Sweep 和作业状态。</p>
+        </div>
+      </section>
+    )
+  }
+  if (!sweep) {
+    return (
+      <section className="heroPanel emptyHero">
+        <div>
+          <span className="sectionLabel">主监控</span>
+          <h2>暂无可展示 Sweep</h2>
+        </div>
+      </section>
+    )
+  }
+  const expected = Math.max(0, sweep.expectedRunCount || 0)
+  const finished = Math.max(0, sweep.finished_runs ?? (sweep.state === 'FINISHED' ? expected : sweep.runCount || 0))
+  const running = Math.max(0, sweep.running_runs ?? (sweep.state === 'RUNNING' ? 1 : 0))
+  const failed = Math.max(0, sweep.failed_runs ?? 0)
+  const progress = expected > 0 ? Math.min(finished / expected, 1) : Math.min(sweep.progress || 0, 1)
+
   return (
-    <div className="metric">
+    <section className={`heroPanel tone-${toneForStatus(sweep.state)}`}>
+      <div className="heroTopline">
+        <div>
+          <span className="sectionLabel">主 Sweep</span>
+          <h2>{sweep.name || sweep.id}</h2>
+          <p>{sweep.entity}/{sweep.project}</p>
+        </div>
+        <span className="stateBadge">{statusText(sweep.state)}</span>
+      </div>
+
+      <div className="progressReadout">
+        <div className="bigNumber">
+          <strong>{finished}</strong>
+          <span>/ {expected || '-'}</span>
+        </div>
+        <div className="progressTrack" aria-label="Sweep 进度">
+          <span style={{ width: `${Math.round(progress * 100)}%` }} />
+        </div>
+        <div className="percent">{Math.round(progress * 100)}%</div>
+      </div>
+
+      <TelemetryStrip sweep={sweep} />
+
+      <div className="stateLedger">
+        <LedgerItem label="运行中" value={running} tone="running" />
+        <LedgerItem label="已完成" value={finished} tone="finished" />
+        <LedgerItem label="失败" value={failed} tone="failed" />
+      </div>
+    </section>
+  )
+}
+
+function TelemetryStrip({ sweep }: { sweep: Sweep }) {
+  return (
+    <div className="telemetryStrip">
+      <Telemetry icon={<Timer size={16} />} label="ETA" value={formatEta(sweep.eta_seconds)} />
+      <Telemetry icon={<Gauge size={16} />} label="速度" value={formatSpeed(sweep.speed_per_hour)} />
+      <Telemetry icon={<Clock3 size={16} />} label="最近同步" value={formatTime(sweep.last_sync_at)} />
+      <Telemetry icon={<Database size={16} />} label="来源" value={sourceText(sweep.source)} />
+    </div>
+  )
+}
+
+function CompactSweepList({ grouped }: { grouped: Record<string, Sweep[]> }) {
+  const sections: Array<[string, Sweep[]]> = [
+    ['运行中', grouped.running],
+    ['已完成', grouped.finished],
+    ['其他', grouped.other],
+  ]
+  return (
+    <div className="compactList">
+      {sections.map(([label, items]) => (
+        <section className="listSection" key={label}>
+          <h3>{label}</h3>
+          {items.length === 0 ? (
+            <div className="emptyLine">暂无</div>
+          ) : (
+            items.map((sweep) => <SweepRow key={`${sweep.entity}/${sweep.project}/${sweep.id}`} sweep={sweep} />)
+          )}
+        </section>
+      ))}
+    </div>
+  )
+}
+
+function SweepRow({ sweep }: { sweep: Sweep }) {
+  const expected = sweep.expectedRunCount || 0
+  const finished = sweep.finished_runs ?? sweep.runCount ?? 0
+  const pct = expected ? Math.min(finished / expected, 1) : sweep.progress || 0
+  return (
+    <div className="sweepRow">
+      <div>
+        <strong>{sweep.name || sweep.id}</strong>
+        <span>{sweep.entity}/{sweep.project}</span>
+      </div>
+      <span className={`smallBadge tone-${toneForStatus(sweep.state)}`}>{statusText(sweep.state)}</span>
+      <code>{finished}/{expected || '-'}</code>
+      <div className="miniTrack"><span style={{ width: `${Math.round(pct * 100)}%` }} /></div>
+    </div>
+  )
+}
+
+function JobList({ jobs }: { jobs: Job[] }) {
+  if (!jobs.length) return <div className="emptyLine">暂无 Runner 作业</div>
+  return (
+    <div className="jobList">
+      {jobs.map((job) => (
+        <div className="jobRow" key={job.job_id}>
+          <div>
+            <strong>{job.name || job.job_id}</strong>
+            <span>{job.job_id}</span>
+          </div>
+          <span className={`smallBadge tone-${toneForStatus(job.status)}`}>{statusText(job.status)}</span>
+          <code>{job.sweep_id || '-'}</code>
+          <span>{job.remote_host || '-'}</span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function EventList({ events }: { events: AuditEvent[] }) {
+  if (!events.length) return <div className="emptyLine">暂无审计记录</div>
+  return (
+    <div className="eventList">
+      {events.map((event, index) => (
+        <div className="eventRow" key={`${event.created_at}-${index}`}>
+          <span>{formatTime(event.created_at)}</span>
+          <strong>{event.event_type}</strong>
+          <p>{event.message}</p>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function MiniReadout({ icon, label, value }: { icon: React.ReactNode; label: string; value: string }) {
+  return (
+    <div className="miniReadout">
       {icon}
       <span>{label}</span>
       <strong>{value}</strong>
@@ -329,20 +298,115 @@ function Metric({ label, value, icon }: MetricProps) {
   )
 }
 
-function Field({ label, value, onChange }: FieldProps) {
+function Telemetry({ icon, label, value }: { icon: React.ReactNode; label: string; value: string }) {
   return (
-    <label className="field">
+    <div className="telemetry">
+      {icon}
       <span>{label}</span>
-      <input value={value} onChange={(event) => onChange(event.target.value)} />
-    </label>
+      <strong>{value}</strong>
+    </div>
   )
 }
 
-function Status({ value }: { value: string }) {
-  return <span className={`status ${value}`}>{value}</span>
+function LedgerItem({ label, value, tone }: { label: string; value: number; tone: string }) {
+  return (
+    <div className={`ledgerItem ${tone}`}>
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  )
 }
 
-ReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(
+function TabButton({ active, onClick, icon, label }: { active: boolean; onClick: () => void; icon: React.ReactNode; label: string }) {
+  return (
+    <button className={active ? 'tab active' : 'tab'} onClick={onClick}>
+      {icon}
+      {label}
+    </button>
+  )
+}
+
+function StatusPill({ status, degraded }: { status: string; degraded?: string | null }) {
+  if (status === 'loading') {
+    return (
+      <span className="statusPill syncing">
+        <RefreshCw size={15} />
+        正在同步
+      </span>
+    )
+  }
+  const ok = status === 'ok' && !degraded
+  return (
+    <span className={ok ? 'statusPill ok' : 'statusPill attention'}>
+      {ok ? <CheckCircle2 size={15} /> : <AlertTriangle size={15} />}
+      {ok ? '控制台运行正常' : '控制台需关注'}
+    </span>
+  )
+}
+
+function selectPrimarySweep(sweeps: Sweep[]) {
+  return [...sweeps].sort((a, b) => {
+    const ar = a.state === 'RUNNING' ? 1 : 0
+    const br = b.state === 'RUNNING' ? 1 : 0
+    if (ar !== br) return br - ar
+    return String(b.createdAt || '').localeCompare(String(a.createdAt || ''))
+  })[0]
+}
+
+function groupSweeps(sweeps: Sweep[]) {
+  return {
+    running: sweeps.filter((s) => s.state === 'RUNNING'),
+    finished: sweeps.filter((s) => s.state === 'FINISHED'),
+    other: sweeps.filter((s) => !['RUNNING', 'FINISHED'].includes(s.state)),
+  }
+}
+
+function toneForStatus(status: string) {
+  const s = status.toLowerCase()
+  if (['running', 'pending'].includes(s)) return 'running'
+  if (['finished', 'complete', 'completed'].includes(s)) return 'finished'
+  if (['failed', 'crashed', 'killed'].includes(s)) return 'failed'
+  if (['attention', 'stalled'].includes(s)) return 'attention'
+  return 'neutral'
+}
+
+function statusText(status: string) {
+  const s = status.toLowerCase()
+  if (s === 'running') return '运行中'
+  if (s === 'finished') return '已完成'
+  if (s === 'failed') return '失败'
+  if (s === 'cancelled' || s === 'canceled') return '已取消'
+  if (s === 'attention') return '需关注'
+  if (s === 'stalled') return '已悬挂'
+  return status || '未知'
+}
+
+function formatTime(value?: string) {
+  if (!value) return '-'
+  return value.replace('T', ' ').replace('Z', '')
+}
+
+function formatEta(seconds?: number | null) {
+  if (!seconds || seconds <= 0) return '-'
+  const hours = Math.floor(seconds / 3600)
+  const minutes = Math.round((seconds % 3600) / 60)
+  if (hours <= 0) return `${minutes} 分钟`
+  return `${hours} 小时 ${minutes} 分钟`
+}
+
+function formatSpeed(speed?: number) {
+  if (!speed || speed <= 0) return '-'
+  return `${speed.toFixed(speed >= 10 ? 0 : 1)} runs/h`
+}
+
+function sourceText(source?: string) {
+  if (!source) return '-'
+  if (source.includes('wandb')) return 'W&B'
+  if (source.includes('runtime')) return 'Console'
+  return source
+}
+
+ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <App />
   </React.StrictMode>
