@@ -19,3 +19,5 @@ frontend/dist/
 *.local
 id_rsa
 id_ed25519
+
+.local_deps/
