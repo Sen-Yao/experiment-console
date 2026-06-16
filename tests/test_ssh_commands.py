@@ -32,6 +32,7 @@ def test_launch_agent_uses_conda_run_for_agent_process(tmp_path):
     assert result["pid"] == "12345"
     assert runner.calls[0]["input_text"] == "secret\n"
     assert "CUDA_VISIBLE_DEVICES=3" in remote
+    assert "source /opt/anaconda3/etc/profile.d/conda.sh" in remote
     assert "conda run -n DualRefGAD" in remote
     assert "wandb agent HCCS/DualRefGAD/abc123" in remote
     assert "python -c" not in remote
@@ -44,7 +45,7 @@ def test_stop_agents_uses_single_layer_shell_matching(tmp_path):
     ssh.stop_agents(host="HCCS-25", sweep_path="HCCS/DualRefGAD/abc123")
 
     remote = runner.calls[0]["argv"][2]
-    assert "pkill -TERM -f" in remote
     assert "pgrep -af" in remote
+    assert "kill -TERM" in remote
     assert "python3 -c" not in remote
     assert "wandb agent HCCS/DualRefGAD/abc123" in remote

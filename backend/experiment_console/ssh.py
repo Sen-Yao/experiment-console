@@ -170,11 +170,14 @@ except Exception as exc:
         wandb_api_key: str | None = None,
     ) -> dict[str, Any]:
         agent_cmd = ["wandb", "agent", sweep_path]
+        prefix = ""
         if conda_env:
             agent_cmd = ["conda", "run", "-n", conda_env, "--no-capture-output", *agent_cmd]
+            prefix = f"source {shlex.quote(conda_sh)} && "
         inner = (
             f"cd {shlex.quote(remote_cwd)} && "
             f"export CUDA_VISIBLE_DEVICES={shlex.quote(str(gpu_index))} && "
+            f"{prefix}"
             + " ".join(shlex.quote(part) for part in agent_cmd)
         )
         log_name = f"console_wandb_agent_{sweep_path.replace('/', '_')}_gpu{gpu_index}.log"
@@ -196,7 +199,12 @@ except Exception as exc:
     def stop_agents(self, *, host: str, sweep_path: str) -> dict[str, Any]:
         pattern = f"wandb agent {sweep_path}"
         quoted_pattern = shlex.quote(pattern)
-        remote = f"pgrep -af {quoted_pattern} || true; pkill -TERM -f {quoted_pattern} || true"
+        remote = (
+            f"pattern={quoted_pattern}; "
+            f"pids=$(pgrep -af -- \"$pattern\" | awk '{{print $1}}'); "
+            f"if [ -n \"$pids\" ]; then kill -TERM $pids; fi; "
+            f"printf '%s\\n' $pids"
+        )
         result = self.run(host, remote, timeout=self.settings.command_timeout_seconds)
         pids = []
         for line in result.stdout.splitlines():
