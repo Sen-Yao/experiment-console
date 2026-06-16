@@ -458,6 +458,7 @@ class ConsoleService:
         operation_id = operation_id or self._operation_identity(IntentType.launch_sweep, payload.model_dump(mode="json"))[0]
         idempotency_key = idempotency_key or self._operation_identity(IntentType.launch_sweep, payload.model_dump(mode="json"))[1]
         path = Path(payload.config_path).expanduser()
+        conda_env = payload.conda_env or self.settings.default_conda_env
         existing = self.store.find_job_by_launch_identity(
             name=payload.job_name,
             config_path=str(path),
@@ -501,7 +502,7 @@ class ConsoleService:
             config_path=str(path),
             remote_host=payload.remote_host,
             remote_cwd=payload.remote_cwd,
-            conda_env=payload.conda_env,
+            conda_env=conda_env,
             monitor={"stage": "validating"},
         )
         self.store.upsert_job(job)
@@ -537,7 +538,7 @@ class ConsoleService:
         preflight = self.ssh.preflight(
             host=payload.remote_host,
             remote_cwd=payload.remote_cwd,
-            conda_env=payload.conda_env,
+            conda_env=conda_env,
             conda_sh=payload.conda_sh,
             config_path=None,
         )
@@ -607,7 +608,7 @@ class ConsoleService:
                 remote_cwd=payload.remote_cwd,
                 sweep_path=sweep_path,
                 gpu_index=gpu["index"],
-                conda_env=payload.conda_env,
+                conda_env=conda_env,
                 conda_sh=payload.conda_sh,
                 wandb_api_key=wandb_api_key,
             ))
@@ -675,6 +676,7 @@ class ConsoleService:
         project = payload.project or self.settings.default_project
         operation_id = operation_id or self._operation_identity(IntentType.register_existing_sweep, payload.model_dump(mode="json"))[0]
         idempotency_key = idempotency_key or self._operation_identity(IntentType.register_existing_sweep, payload.model_dump(mode="json"))[1]
+        conda_env = payload.conda_env or self.settings.default_conda_env
         existing = self.store.find_job_by_sweep(entity, project, payload.sweep_id)
         if existing:
             if not self._current_operation(existing):
@@ -709,7 +711,7 @@ class ConsoleService:
             config_path=payload.config_path,
             remote_host=payload.remote_host,
             remote_cwd=payload.remote_cwd,
-            conda_env=payload.conda_env,
+            conda_env=conda_env,
             operation_id=operation_id,
             idempotency_key=idempotency_key,
             monitor={
@@ -955,6 +957,9 @@ class ConsoleService:
             eligible = eligible[:payload.max_agents]
         sweep_path = f"{job.entity}/{job.project}/{job.sweep_id}"
         wandb_api_key = self._wandb_api_key()
+        conda_env = job.conda_env or self.settings.default_conda_env
+        if conda_env and not job.conda_env:
+            job.conda_env = conda_env
         auth = self.ssh.auth_check(host=job.remote_host, remote_cwd=job.remote_cwd, sweep_path=sweep_path, wandb_api_key=wandb_api_key)
         launches = [
             self.ssh.launch_agent(
@@ -962,7 +967,7 @@ class ConsoleService:
                 remote_cwd=job.remote_cwd,
                 sweep_path=sweep_path,
                 gpu_index=gpu["index"],
-                conda_env=job.conda_env,
+                conda_env=conda_env,
                 conda_sh=payload.conda_sh,
                 wandb_api_key=wandb_api_key,
             )
@@ -1278,10 +1283,11 @@ class ConsoleService:
         return result
 
     def _preflight(self, payload: PreflightPayload) -> dict[str, Any]:
+        conda_env = payload.conda_env or self.settings.default_conda_env
         result = self.ssh.preflight(
             host=payload.remote_host,
             remote_cwd=payload.remote_cwd,
-            conda_env=payload.conda_env,
+            conda_env=conda_env,
             conda_sh=payload.conda_sh,
             config_path=payload.config_path,
         )

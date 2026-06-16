@@ -20,6 +20,7 @@ class Settings(BaseModel):
     command_timeout_seconds: int = int(os.environ.get("EXPERIMENT_CONSOLE_COMMAND_TIMEOUT", "120"))
     gpu_min_free_gb: float = float(os.environ.get("EXPERIMENT_CONSOLE_GPU_MIN_FREE_GB", "2.0"))
     gpu_max_util: int = int(os.environ.get("EXPERIMENT_CONSOLE_GPU_MAX_UTIL", "85"))
+    default_conda_env: str | None = Field(default_factory=lambda: os.environ.get("EXPERIMENT_CONSOLE_DEFAULT_CONDA_ENV"))
 
     @property
     def sqlite_path(self) -> Path:

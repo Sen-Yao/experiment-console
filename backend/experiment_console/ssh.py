@@ -169,40 +169,40 @@ except Exception as exc:
         conda_sh: str,
         wandb_api_key: str | None = None,
     ) -> dict[str, Any]:
-        env_prefix = f"export CUDA_VISIBLE_DEVICES={gpu_index}; "
-        conda_prefix = ""
+        agent_cmd = ["wandb", "agent", sweep_path]
         if conda_env:
-            conda_prefix = f"source {shlex.quote(conda_sh)} && conda activate {shlex.quote(conda_env)} && "
+            agent_cmd = ["conda", "run", "-n", conda_env, "--no-capture-output", *agent_cmd]
+        inner = (
+            f"cd {shlex.quote(remote_cwd)} && "
+            f"export CUDA_VISIBLE_DEVICES={shlex.quote(str(gpu_index))} && "
+            + " ".join(shlex.quote(part) for part in agent_cmd)
+        )
         log_name = f"console_wandb_agent_{sweep_path.replace('/', '_')}_gpu{gpu_index}.log"
         remote = (
             f"cd {shlex.quote(remote_cwd)} && "
-            f"{env_prefix}{conda_prefix}"
-            f"nohup wandb agent {shlex.quote(sweep_path)} > {shlex.quote(log_name)} 2>&1 & echo $!"
+            f"nohup bash -lc {shlex.quote(inner)} > {shlex.quote(log_name)} 2>&1 < /dev/null & echo $!"
         )
         result = self.run_with_wandb_key(host, remote, wandb_api_key=wandb_api_key, timeout=self.settings.command_timeout_seconds)
         pid = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
-        return {"host": host, "gpu_index": gpu_index, "pid": pid, "log": f"{remote_cwd.rstrip('/')}/{log_name}", "command": result.summary()}
+        return {
+            "host": host,
+            "gpu_index": gpu_index,
+            "pid": pid,
+            "log": f"{remote_cwd.rstrip('/')}/{log_name}",
+            "conda_env": conda_env,
+            "command": result.summary(),
+        }
 
     def stop_agents(self, *, host: str, sweep_path: str) -> dict[str, Any]:
         pattern = f"wandb agent {sweep_path}"
-        remote = (
-            "python3 -c "
-            + shlex.quote(
-                "import os, signal, subprocess\n"
-                f"pattern={pattern!r}\n"
-                "out=subprocess.run(['pgrep','-af','wandb agent'],text=True,capture_output=True)\n"
-                "pids=[]\n"
-                "for line in out.stdout.splitlines():\n"
-                "    parts=line.split(None,1)\n"
-                "    if len(parts)==2 and pattern in parts[1]:\n"
-                "        pids.append(parts[0])\n"
-                "for pid in pids:\n"
-                "    os.kill(int(pid), signal.SIGTERM)\n"
-                "print('\\n'.join(pids))\n"
-            )
-        )
+        quoted_pattern = shlex.quote(pattern)
+        remote = f"pgrep -af {quoted_pattern} || true; pkill -TERM -f {quoted_pattern} || true"
         result = self.run(host, remote, timeout=self.settings.command_timeout_seconds)
-        pids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        pids = []
+        for line in result.stdout.splitlines():
+            parts = line.strip().split(None, 1)
+            if parts and parts[0].isdigit():
+                pids.append(parts[0])
         return {"host": host, "stopped_pids": pids, "command": result.summary()}
 
     def create_sweep(

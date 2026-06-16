@@ -16,6 +16,7 @@ STATE_DIR.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("EXPERIMENT_CONSOLE_STATE_DIR", str(STATE_DIR))
 os.environ.setdefault("EXPERIMENT_CONSOLE_DEFAULT_ENTITY", "HCCS")
 os.environ.setdefault("EXPERIMENT_CONSOLE_DEFAULT_PROJECT", "DualRefGAD")
+os.environ.setdefault("EXPERIMENT_CONSOLE_DEFAULT_CONDA_ENV", "DualRefGAD")
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 FRONTEND_DIST = ROOT_DIR / "frontend" / "dist"

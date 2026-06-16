@@ -30,6 +30,9 @@ class FakeWandB:
 
 
 class FakeSSH:
+    def __init__(self):
+        self.launches = []
+
     def probe_gpus(self, host):
         return {
             "host": host,
@@ -41,6 +44,15 @@ class FakeSSH:
         }
 
     def launch_agent(self, *, host, remote_cwd, sweep_path, gpu_index, conda_env, conda_sh, wandb_api_key=None):
+        self.launches.append({
+            "host": host,
+            "remote_cwd": remote_cwd,
+            "sweep_path": sweep_path,
+            "gpu_index": gpu_index,
+            "conda_env": conda_env,
+            "conda_sh": conda_sh,
+            "wandb_api_key": wandb_api_key,
+        })
         return {"host": host, "gpu_index": gpu_index, "pid": str(1000 + gpu_index), "sweep_path": sweep_path}
 
     def stop_agents(self, *, host, sweep_path):
@@ -129,6 +141,35 @@ def test_launch_sweep_creates_job_after_confirmation(tmp_path):
     assert response.job.sweep_id == "abc123"
     assert response.job.status == JobStatus.running
     assert response.job.agent_pids == ["1000"]
+
+
+def test_launch_sweep_uses_console_default_conda_env(tmp_path):
+    settings = Settings(
+        state_dir=tmp_path,
+        default_entity="my-team",
+        default_project="my-project",
+        default_conda_env="DualRefGAD",
+    )
+    ssh = FakeSSH()
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
+    config_path = tmp_path / "sweep.yaml"
+    config_path.write_text(
+        "method: grid\nname: demo\nprogram: train.py\nparameters:\n  dataset:\n    values: [Cora]\n  seed:\n    values: [0, 1, 2, 3, 4]\n",
+        encoding="utf-8",
+    )
+
+    result = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "demo_default_env",
+        "config_path": str(config_path),
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "max_agents": 1,
+        "idempotency_key": "default-env-test",
+    })
+
+    assert result.job is not None
+    assert result.job.conda_env == "DualRefGAD"
+    assert ssh.launches[0]["conda_env"] == "DualRefGAD"
 
 
 def test_recover_agents_does_not_create_new_sweep(tmp_path):

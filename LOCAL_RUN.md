@@ -18,6 +18,7 @@ The local Console is intentionally a lightweight control-plane runtime:
 - reads W&B auth from a repo-external secret file
 - can register/query/launch W&B sweeps through SSH on HCCS-25
 - keeps local runtime state in `/private/tmp/experiment-console-runtime`
+- defaults remote W&B agent execution to the `DualRefGAD` conda environment
 
 ## Prerequisites
 
@@ -56,6 +57,14 @@ WANDB_API_KEY=...
 ```
 
 The file must be mode `600`. The current W&B value from Bitwarden is accepted by W&B when passed as the `WANDB_API_KEY` environment variable, even though old `wandb login` rejects it with a 40-character length check. Prefer environment authentication; do not run `wandb login --relogin` for this workflow.
+
+The runtime also sets:
+
+```bash
+EXPERIMENT_CONSOLE_DEFAULT_CONDA_ENV=DualRefGAD
+```
+
+This is intentionally Console-owned. Runner may pass `--remote-conda-env`, but production launch/recover should still enter `DualRefGAD` when runner omits it.
 
 ## Start
 
