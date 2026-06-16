@@ -1,6 +1,6 @@
 # Experiment Console Local Run
 
-Last verified: 2026-06-15 on Oliver's MacBook Pro via Codex.
+Last verified: 2026-06-16 on Oliver's MacBook Pro via Codex.
 
 ## Scope
 
@@ -30,6 +30,13 @@ Install local dependencies when needed:
 ```bash
 cd /Users/oliver/Developer/experiment-console
 ./scripts/install_local_deps.sh
+```
+
+If the Developer checkout is not writable from the current sandbox, install the same dependencies into the temporary fallback used by the startup script:
+
+```bash
+cd /Users/oliver/Developer/experiment-console
+EXPERIMENT_CONSOLE_DEPS_DIR=/private/tmp/experiment-console-deps ./scripts/install_local_deps.sh
 ```
 
 ## Secrets
@@ -104,11 +111,14 @@ EXPERIMENT_CONSOLE_URL=http://127.0.0.1:5174 \
   console post /api/runner/status --data '{"job_id":"job_20260615_152258_prod_matguardgt_cleg3_v4_console_20260615"}'
 ```
 
-Current production sweep at the time of this handoff:
+Current verified production sweep at the time of this handoff:
 
 ```text
-HCCS/DualRefGAD/ofzzsan4
+HCCS/DualRefGAD/02f9u8wv
+job_20260616_072248_prod_matguardgt_best_vega_block_spmm_repro_5seed_b9950df0
 ```
+
+This job is a registered existing sweep for the completed best-Vega 5-seed reproduction. It should be used for status and pull-results smoke tests; do not launch a new production sweep for local runtime verification.
 
 Console-owned agent health check:
 
@@ -118,6 +128,32 @@ PYTHONPATH="/Users/oliver/Developer/experiment-console/.local_deps:/private/tmp/
 /opt/homebrew/bin/python3 /Users/oliver/.agents/skills/experiment-runner/scripts/experiment.py \
   watchdog-once --job-id job_20260615_152258_prod_matguardgt_cleg3_v4_console_20260615 --json
 ```
+
+Current compact status smoke:
+
+```bash
+curl -fsS -X POST 'http://127.0.0.1:5174/api/runner/status?requested_by=local-smoke' \
+  -H 'Content-Type: application/json' \
+  -d '{"job_id":"job_20260616_072248_prod_matguardgt_best_vega_block_spmm_repro_5seed_b9950df0"}'
+```
+
+Expected classification is `ok`, with split state fields:
+
+```text
+job_status=finished
+wandb_sweep_status=FINISHED
+agent_health=terminal
+```
+
+Current bounded result smoke:
+
+```bash
+curl -fsS -X POST 'http://127.0.0.1:5174/api/runner/pull-results?requested_by=local-smoke' \
+  -H 'Content-Type: application/json' \
+  -d '{"job_id":"job_20260616_072248_prod_matguardgt_best_vega_block_spmm_repro_5seed_b9950df0","max_runs":1,"allow_partial":true}'
+```
+
+Expected result source is `remote_local_files`, with a scientific metric such as `final_test_auc`.
 
 ## Troubleshooting
 

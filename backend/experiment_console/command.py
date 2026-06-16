@@ -30,11 +30,20 @@ class CommandFailed(RuntimeError):
 
 
 class CommandRunner:
-    def run(self, argv: list[str], *, timeout: int, env: Mapping[str, str] | None = None, cwd: str | None = None) -> CommandResult:
+    def run(
+        self,
+        argv: list[str],
+        *,
+        timeout: int,
+        env: Mapping[str, str] | None = None,
+        cwd: str | None = None,
+        input_text: str | None = None,
+    ) -> CommandResult:
         proc = subprocess.run(
             argv,
             cwd=cwd,
             env=dict(env) if env is not None else None,
+            input=input_text,
             text=True,
             capture_output=True,
             timeout=timeout,
@@ -44,4 +53,3 @@ class CommandRunner:
         if result.returncode != 0:
             raise CommandFailed(result)
         return result
-

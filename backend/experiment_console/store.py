@@ -50,6 +50,8 @@ class ConsoleStore:
                     job_id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    operation_id TEXT,
+                    idempotency_key TEXT,
                     entity TEXT,
                     project TEXT,
                     sweep_id TEXT,
@@ -58,11 +60,22 @@ class ConsoleStore:
                     remote_cwd TEXT,
                     conda_env TEXT,
                     agent_pids_json TEXT NOT NULL,
+                    operation_log_json TEXT NOT NULL DEFAULT '[]',
                     monitor_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
             """)
+            for column, ddl in [
+                ("operation_id", "ALTER TABLE jobs ADD COLUMN operation_id TEXT"),
+                ("idempotency_key", "ALTER TABLE jobs ADD COLUMN idempotency_key TEXT"),
+                ("operation_log_json", "ALTER TABLE jobs ADD COLUMN operation_log_json TEXT NOT NULL DEFAULT '[]'"),
+            ]:
+                existing = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+                if column not in existing:
+                    conn.execute(ddl)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_launch_identity ON jobs(name, config_path, remote_host, remote_cwd)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_sweep ON jobs(entity, project, sweep_id)")
 
     def write_audit(self, event: AuditEvent) -> AuditEvent:
         cleaned = event.model_copy(update={"detail": redact_value(event.detail)})
@@ -161,11 +174,47 @@ class ConsoleStore:
             row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
         return self._job_from_row(row) if row else None
 
+    def find_job_by_launch_identity(
+        self,
+        *,
+        name: str,
+        config_path: str,
+        remote_host: str,
+        remote_cwd: str,
+    ) -> JobRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE name = ? AND config_path = ? AND remote_host = ? AND remote_cwd = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (name, config_path, remote_host, remote_cwd),
+            ).fetchone()
+        return self._job_from_row(row) if row else None
+
+    def find_job_by_sweep(self, entity: str, project: str, sweep_id: str) -> JobRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE entity = ? AND project = ? AND sweep_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (entity, project, sweep_id),
+            ).fetchone()
+        return self._job_from_row(row) if row else None
+
     def _job_from_row(self, row: sqlite3.Row) -> JobRecord:
+        keys = set(row.keys())
         return JobRecord.model_validate({
             "job_id": row["job_id"],
             "name": row["name"],
             "status": row["status"],
+            "operation_id": row["operation_id"] if "operation_id" in keys else None,
+            "idempotency_key": row["idempotency_key"] if "idempotency_key" in keys else None,
             "entity": row["entity"],
             "project": row["project"],
             "sweep_id": row["sweep_id"],
@@ -174,6 +223,7 @@ class ConsoleStore:
             "remote_cwd": row["remote_cwd"],
             "conda_env": row["conda_env"],
             "agent_pids": json.loads(row["agent_pids_json"] or "[]"),
+            "operation_log": json.loads(row["operation_log_json"] or "[]") if "operation_log_json" in keys else [],
             "monitor": json.loads(row["monitor_json"] or "{}"),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
@@ -184,13 +234,15 @@ class ConsoleStore:
         with self._lock, self._connect() as conn:
             conn.execute("""
                 INSERT INTO jobs (
-                    job_id, name, status, entity, project, sweep_id, config_path,
-                    remote_host, remote_cwd, conda_env, agent_pids_json, monitor_json,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    job_id, name, status, operation_id, idempotency_key, entity, project, sweep_id, config_path,
+                    remote_host, remote_cwd, conda_env, agent_pids_json, operation_log_json,
+                    monitor_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(job_id) DO UPDATE SET
                     name = excluded.name,
                     status = excluded.status,
+                    operation_id = excluded.operation_id,
+                    idempotency_key = excluded.idempotency_key,
                     entity = excluded.entity,
                     project = excluded.project,
                     sweep_id = excluded.sweep_id,
@@ -199,12 +251,15 @@ class ConsoleStore:
                     remote_cwd = excluded.remote_cwd,
                     conda_env = excluded.conda_env,
                     agent_pids_json = excluded.agent_pids_json,
+                    operation_log_json = excluded.operation_log_json,
                     monitor_json = excluded.monitor_json,
                     updated_at = excluded.updated_at
             """, (
                 job.job_id,
                 job.name,
                 job.status.value,
+                job.operation_id,
+                job.idempotency_key,
                 job.entity,
                 job.project,
                 job.sweep_id,
@@ -213,6 +268,7 @@ class ConsoleStore:
                 job.remote_cwd,
                 job.conda_env,
                 json.dumps(job.agent_pids, ensure_ascii=False),
+                json.dumps(redact_value(job.operation_log), ensure_ascii=False),
                 json.dumps(redact_value(job.monitor), ensure_ascii=False),
                 job.created_at,
                 job.updated_at,
@@ -228,4 +284,3 @@ class ConsoleStore:
         if monitor:
             job.monitor.update(monitor)
         return self.upsert_job(job)
-

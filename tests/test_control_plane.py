@@ -3,7 +3,8 @@ from __future__ import annotations
 import pytest
 
 from experiment_console.config import Settings
-from experiment_console.models import AuditEvent, ConfirmRequest, IntentPreviewRequest, IntentType, JobRecord, JobStatus
+from experiment_console.models import AuditEvent, ConfirmRequest, IntentPreviewRequest, IntentType, JobRecord, JobStatus, PullResultsPayload
+from experiment_console.redaction import redact_value
 from experiment_console.service import ConsoleService
 from experiment_console.state import InvalidTransition, validate_job_transition
 from experiment_console.store import ConsoleStore
@@ -39,11 +40,38 @@ class FakeSSH:
             ],
         }
 
-    def launch_agent(self, *, host, remote_cwd, sweep_path, gpu_index, conda_env, conda_sh):
+    def launch_agent(self, *, host, remote_cwd, sweep_path, gpu_index, conda_env, conda_sh, wandb_api_key=None):
         return {"host": host, "gpu_index": gpu_index, "pid": str(1000 + gpu_index), "sweep_path": sweep_path}
 
     def stop_agents(self, *, host, sweep_path):
         return {"host": host, "stopped_pids": ["1000"], "sweep_path": sweep_path}
+
+    def auth_check(self, *, host, remote_cwd, sweep_path, wandb_api_key):
+        return {"ok": bool(wandb_api_key), "classification": "auth_ok" if wandb_api_key else "wandb_auth_missing"}
+
+    def preflight(self, *, host, remote_cwd, conda_env=None, conda_sh="/opt/anaconda3/etc/profile.d/conda.sh", config_path=None):
+        return {
+            "ok": True,
+            "classification": "ok",
+            "host": host,
+            "remote_cwd": remote_cwd,
+            "checks": {"remote_cwd_exists": True, "wandb_cli": True, "python": True},
+        }
+
+    def pull_results(self, *, host, remote_cwd, sweep_id, run_ids, budget_seconds, max_runs, metric_keys, group_keys):
+        assert run_ids == ["run-a", "run-b"]
+        return {
+            "source": "remote_local_files",
+            "sweep_id": sweep_id,
+            "rows": [
+                {"run_id": "run-a", "metrics": {"semantic_token_dim": 256, "rwse_token_steps": 0}, "has_scientific_result": True},
+                {"run_id": "run-b", "metrics": {"final_test_auc": 0.9}, "has_scientific_result": True},
+            ],
+            "valid_results": 2,
+            "missing_results": 0,
+            "failed_results": 0,
+            "partial": False,
+        }
 
 
 def make_service(tmp_path):
@@ -147,3 +175,122 @@ def test_audit_redacts_secret_values(tmp_path, monkeypatch):
     text = service.settings.audit_path.read_text(encoding="utf-8")
     assert dummy_key not in text
     assert "<redacted>" in text
+
+
+def test_redaction_keeps_scientific_token_metric_names():
+    cleaned = redact_value({"semantic_token_dim": 256, "rwse_token_steps": 0, "token": "secret"})
+    assert cleaned["semantic_token_dim"] == 256
+    assert cleaned["rwse_token_steps"] == 0
+    assert cleaned["token"] == "<redacted>"
+
+
+def test_status_for_missing_job_is_not_ok(tmp_path):
+    service = make_service(tmp_path)
+    response = service.runner_command(IntentType.status_query, {"job_id": "missing_job"})
+    assert response.classification == "job_not_found"
+    assert response.result["job"] is None
+    assert response.result["state"]["job_status"] is None
+
+
+def test_status_returns_compact_sweep_without_run_payloads(tmp_path):
+    class VerboseWandB(FakeWandB):
+        def get_sweep_state(self, entity, project, sweep_id):
+            return {
+                "id": sweep_id,
+                "entity": entity,
+                "project": project,
+                "state": "FINISHED",
+                "runCount": 1,
+                "expectedRunCount": 1,
+                "runs": [{
+                    "name": "run-a",
+                    "state": "finished",
+                    "summary_metrics": "{\"final_test_auc\": 0.9}",
+                    "config": "{\"seed\": {\"value\": 0}}",
+                }],
+            }
+
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=VerboseWandB(), ssh=FakeSSH())
+    service.store.upsert_job(JobRecord(
+        job_id="job_status",
+        name="status",
+        status=JobStatus.running,
+        entity="my-team",
+        project="my-project",
+        sweep_id="abc123",
+        remote_host="gpu-host-1",
+        remote_cwd="/tmp/demo",
+    ))
+    response = service.runner_command(IntentType.status_query, {"job_id": "job_status"})
+    run = response.result["sweep"]["runs"][0]
+    cached_run = response.result["job"]["monitor"]["last_wandb_status"]["runs"][0]
+    assert "summary_metrics" not in run
+    assert "config" not in run
+    assert "summary_metrics" not in cached_run
+    assert "config" not in cached_run
+    assert "operation_log" not in response.result["job"]
+
+
+def test_pull_results_uses_target_sweep_run_ids(tmp_path):
+    class RunWandB(FakeWandB):
+        def get_sweep_state(self, entity, project, sweep_id):
+            return {
+                "id": sweep_id,
+                "entity": entity,
+                "project": project,
+                "state": "FINISHED",
+                "runCount": 2,
+                "expectedRunCount": 2,
+                "runs": [{"name": "run-a"}, {"name": "run-b"}],
+            }
+
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=RunWandB(), ssh=FakeSSH())
+    job = JobRecord(
+        job_id="job_results",
+        name="results",
+        status=JobStatus.finished,
+        entity="my-team",
+        project="my-project",
+        sweep_id="abc123",
+        remote_host="gpu-host-1",
+        remote_cwd="/tmp/demo",
+    )
+    service.store.upsert_job(job)
+    result = service._pull_results(PullResultsPayload(job_id="job_results", max_runs=2))
+    assert result["valid_results"] == 2
+    assert [row["run_id"] for row in result["rows"]] == ["run-a", "run-b"]
+    assert result["rows"][0]["metrics"]["semantic_token_dim"] == 256
+
+
+def test_pull_results_without_explicit_key_does_not_replay_stale_result(tmp_path):
+    class RunWandB(FakeWandB):
+        def get_sweep_state(self, entity, project, sweep_id):
+            return {
+                "id": sweep_id,
+                "entity": entity,
+                "project": project,
+                "state": "FINISHED",
+                "runCount": 2,
+                "expectedRunCount": 2,
+                "runs": [{"name": "run-a"}, {"name": "run-b"}],
+            }
+
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=RunWandB(), ssh=FakeSSH())
+    service.store.upsert_job(JobRecord(
+        job_id="job_results",
+        name="results",
+        status=JobStatus.finished,
+        entity="my-team",
+        project="my-project",
+        sweep_id="abc123",
+        remote_host="gpu-host-1",
+        remote_cwd="/tmp/demo",
+    ))
+    first = service.runner_command(IntentType.pull_results, {"job_id": "job_results", "max_runs": 2})
+    second = service.runner_command(IntentType.pull_results, {"job_id": "job_results", "max_runs": 2})
+    assert first.operation_id != second.operation_id
+    assert first.provenance.get("replayed") is None
+    assert second.provenance.get("replayed") is None

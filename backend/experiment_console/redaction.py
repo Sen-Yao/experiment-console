@@ -33,10 +33,17 @@ def redact_value(value: Any) -> Any:
     if isinstance(value, dict):
         cleaned = {}
         for key, item in value.items():
-            if any(word in str(key).lower() for word in ("secret", "password", "token", "api_key", "apikey")):
+            key_text = str(key).lower()
+            sensitive_key = (
+                "secret" in key_text
+                or "password" in key_text
+                or "api_key" in key_text
+                or "apikey" in key_text
+                or key_text in {"token", "access_token", "refresh_token", "auth_token", "bearer_token"}
+            )
+            if sensitive_key:
                 cleaned[key] = "<redacted>"
             else:
                 cleaned[key] = redact_value(item)
         return cleaned
     return value
-
