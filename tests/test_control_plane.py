@@ -445,6 +445,71 @@ def test_watchdog_includes_failure_diagnostics_from_status(tmp_path):
     assert diagnostics["error_signals"]
 
 
+def test_running_sweep_with_failed_runs_and_no_results_needs_attention(tmp_path):
+    class FailedRunsWandB(FakeWandB):
+        def get_sweep_state(self, entity, project, sweep_id):
+            return {
+                "id": sweep_id,
+                "entity": entity,
+                "project": project,
+                "state": "RUNNING",
+                "runCount": 15,
+                "expectedRunCount": 25,
+                "runs": [
+                    {"name": f"run-{index}", "state": "failed", "summary_metrics": "{}", "config": "{}"}
+                    for index in range(15)
+                ],
+            }
+
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = FakeSSH()
+    ssh.failure_logs = [{
+        "gpu_index": 0,
+        "pid": "1000",
+        "path": "/tmp/demo/console_wandb_agent_my-team_my-project_abc123_gpu0.log",
+        "exists": True,
+        "tail": "ModuleNotFoundError: No module named 'VecGAD'\n",
+    }]
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FailedRunsWandB(), ssh=ssh)
+    service.store.upsert_job(JobRecord(
+        job_id="job_failed_runs",
+        name="failed-runs",
+        status=JobStatus.running,
+        entity="my-team",
+        project="my-project",
+        sweep_id="abc123",
+        remote_host="gpu-host-1",
+        remote_cwd="/tmp/demo",
+        agent_pids=["1000"],
+        monitor={
+            "agent_launches": [{
+                "host": "gpu-host-1",
+                "gpu_index": 0,
+                "pid": "1000",
+                "log": "/tmp/demo/console_wandb_agent_my-team_my-project_abc123_gpu0.log",
+            }],
+            "last_result_pull": {"valid_results": 0, "partial": True},
+            "sweep_path": "my-team/my-project/abc123",
+        },
+    ))
+
+    status = service.runner_command(IntentType.status_query, {"job_id": "job_failed_runs"})
+
+    assert status.classification == "attention"
+    assert status.result["state"]["sweep_attention"] is True
+    assert status.result["job"]["status"] == "attention"
+    assert status.result["sweep"]["failed_runs"] == 15
+    diagnostics = status.result["failure_diagnostics"]
+    assert diagnostics["classification"] == "failure_signals_found"
+    assert diagnostics["error_signals"][0]["kind"] == "import_error"
+    assert "VecGAD" in diagnostics["error_signals"][0]["excerpt"]
+
+    watchdog = service.runner_command(IntentType.watchdog_once, {"job_id": "job_failed_runs"})
+    assert watchdog.result["classification"] == "attention"
+    assert watchdog.result["silent"] is False
+    assert "run 级失败" in watchdog.result["message"] or "失败" in watchdog.result["message"]
+
+
 def test_recover_agents_does_not_create_new_sweep(tmp_path):
     service = make_service(tmp_path)
     job = JobRecord(

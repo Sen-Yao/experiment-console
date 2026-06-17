@@ -938,6 +938,7 @@ class ConsoleService:
         entity = (job.entity if job else None) or self.settings.default_entity
         project = (job.project if job else None) or self.settings.default_project
         sweep_id = payload.sweep_id or (job.sweep_id if job else None)
+        result_pull = job.monitor.get("last_result_pull") if job else None
         run_status = None
         if job and job.monitor.get("kind") == "single_run":
             run_meta = job.monitor.get("run") if isinstance(job.monitor.get("run"), dict) else {}
@@ -1019,8 +1020,19 @@ class ConsoleService:
             agent_health = "running" if agent_launches else "missing"
         elif job and job.status in TERMINAL_JOB_STATUSES:
             agent_health = "terminal"
+        sweep_attention = False
+        sweep_attention_reasons: list[str] = []
+        if job and job.monitor.get("kind") != "single_run" and sweep:
+            sweep_attention, sweep_attention_reasons = sweep_requires_attention(sweep, result_pull)
+            if sweep_attention and job.status == JobStatus.running:
+                try:
+                    job = self.store.update_job_status(job.job_id, JobStatus.attention, {"sweep_attention_reasons": sweep_attention_reasons})
+                except Exception:
+                    job.status = JobStatus.attention
+                    job.monitor["sweep_attention_reasons"] = sweep_attention_reasons
+                    self.store.upsert_job(job)
         failure_diagnostics = None
-        if should_collect_failure_diagnostics(job, sweep, agent_health, degraded):
+        if should_collect_failure_diagnostics(job, sweep, agent_health, degraded, sweep_attention=sweep_attention):
             failure_diagnostics = self._collect_failure_diagnostics(
                 job=job,
                 agent_launches=agent_launches,
@@ -1031,7 +1043,6 @@ class ConsoleService:
                 self.store.upsert_job(job)
         elif job and isinstance(job.monitor.get("last_failure_diagnostics"), dict):
             failure_diagnostics = job.monitor["last_failure_diagnostics"]
-        result_pull = job.monitor.get("last_result_pull") if job else None
         result_readiness = "unknown"
         if isinstance(result_pull, dict):
             if result_pull.get("valid_results", 0):
@@ -1050,6 +1061,9 @@ class ConsoleService:
         elif degraded:
             classification = "degraded"
             next_actions = ["稍后重试 status；如持续 degraded，检查 W&B/API 网络与本地 WANDB_API_KEY。"]
+        elif sweep_attention:
+            classification = "attention"
+            next_actions = sweep_attention_reasons or ["检查 run 级失败诊断；如需要，修复远端代码/路径后重新 launch 或 recover-agents。"]
         return {
             "stage": "done",
             "classification": classification,
@@ -1074,6 +1088,8 @@ class ConsoleService:
                 "run_status": run_status,
                 "agent_health": agent_health,
                 "result_readiness": result_readiness,
+                "sweep_attention": sweep_attention,
+                "sweep_attention_reasons": sweep_attention_reasons,
             },
             "degraded": degraded,
             "next_actions": next_actions,
@@ -1505,10 +1521,12 @@ class ConsoleService:
         job_status = str(job.get("status") or "unknown").lower()
         sweep_state = str(sweep.get("state") or "").lower()
         agent_health = str(state.get("agent_health") or "unknown").lower()
+        sweep_attention = bool(state.get("sweep_attention"))
+        sweep_attention_reasons = state.get("sweep_attention_reasons") or []
         run_count = sweep.get("runCount")
         expected = sweep.get("expectedRunCount")
         is_terminal = job_status in {"finished", "failed", "cancelled"} or sweep_state in {"finished", "failed", "cancelled"}
-        is_attention = bool(degraded) or job_status in {"attention", "failed"} or sweep_state in {"failed", "crashed", "killed"} or agent_health in {"missing", "degraded"}
+        is_attention = bool(degraded) or sweep_attention or job_status in {"attention", "failed"} or sweep_state in {"failed", "crashed", "killed"} or agent_health in {"missing", "degraded"}
         is_running = job_status == "running" or sweep_state == "running"
         classification = "healthy_running"
         silent = True
@@ -1523,7 +1541,8 @@ class ConsoleService:
             classification = "attention"
             event = "attention"
             silent = False
-            message = f"job {payload.job_id} needs attention: job={job_status}, sweep={sweep_state or '-'}, degraded={degraded or '-'}"
+            reason_text = "; ".join(str(item) for item in sweep_attention_reasons) if sweep_attention_reasons else degraded or "-"
+            message = f"job {payload.job_id} needs attention: job={job_status}, sweep={sweep_state or '-'}, degraded={reason_text}"
         elif not is_running:
             classification = "unknown"
             event = "unknown"
@@ -1541,6 +1560,8 @@ class ConsoleService:
             "run_count": run_count,
             "expected_run_count": expected,
             "agent_health": agent_health,
+            "sweep_attention": sweep_attention,
+            "sweep_attention_reasons": sweep_attention_reasons,
             "terminal_disable_requested": payload.terminal_disable,
             "operation": status_result.get("operation"),
             "operation_history": status_result.get("operation_history"),
@@ -1964,11 +1985,15 @@ def should_collect_failure_diagnostics(
     sweep: dict[str, Any] | None,
     agent_health: str,
     degraded: str | None,
+    *,
+    sweep_attention: bool = False,
 ) -> bool:
     if not job:
         return False
     if degraded:
         return False
+    if sweep_attention:
+        return True
     if job.monitor.get("kind") == "single_run":
         return agent_health in {"failed", "missing"}
     sweep_state = str((sweep or {}).get("state") or "").lower()
@@ -1977,6 +2002,40 @@ def should_collect_failure_diagnostics(
     if sweep_state in {"failed", "crashed", "killed"}:
         return True
     return agent_health in {"missing", "failed", "degraded"}
+
+
+def sweep_requires_attention(sweep: dict[str, Any], result_pull: dict[str, Any] | None = None) -> tuple[bool, list[str]]:
+    state = str(sweep.get("state") or "").lower()
+    finished = to_non_negative_int(sweep.get("finished_runs"))
+    failed = to_non_negative_int(sweep.get("failed_runs"))
+    running = to_non_negative_int(sweep.get("running_runs"))
+    expected = to_non_negative_int(sweep.get("expectedRunCount"))
+    if state not in {"running", "pending"}:
+        return False, []
+    if failed <= 0:
+        return False, []
+    if running <= 0 and failed >= max(1, finished):
+        return True, [
+            "W&B sweep 仍显示 running，但 run 级失败已占主导；检查远端训练脚本/导入路径。",
+            "先修复 VecGAD/依赖/路径问题，再重新 launch 或 recover-agents。",
+        ]
+    if result_pull and result_pull.get("valid_results", 0) == 0 and failed >= 1:
+        return True, [
+            "W&B sweep 仍显示 running，但当前没有任何有效结果而且已有失败 run。",
+            "修复远端代码/环境后再继续。",
+        ]
+    if expected > 0 and failed >= max(3, expected // 2) and result_pull and result_pull.get("valid_results", 0) == 0:
+        return True, [
+            "W&B sweep 连续失败且没有有效结果，建议停止当前 sweep。",
+        ]
+    return False, []
+
+
+def to_non_negative_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except Exception:
+        return 0
 
 
 def compact_agent_probe(probe: dict[str, Any] | None) -> dict[str, Any] | None:
