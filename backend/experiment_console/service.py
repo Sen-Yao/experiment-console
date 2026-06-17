@@ -45,6 +45,12 @@ from .planner import build_plan, confirmation_phrase
 from .redaction import redact_value
 from .ssh import SSHExecutor
 from .store import ConsoleStore
+from .sweep_telemetry import (
+    enrich_sweeps_with_telemetry,
+    load_telemetry_cache,
+    save_telemetry_cache,
+    strip_runs,
+)
 from .validation import build_single_run_command, load_yaml_text, validate_experiment_config_text, validate_experiment_config
 from .wandb_client import WandBClient, WandBUnavailable
 
@@ -101,6 +107,16 @@ class ConsoleService:
         self.store = store or ConsoleStore(self.settings.sqlite_path, self.settings.audit_path)
         self.wandb = wandb or WandBClient(self.settings)
         self.ssh = ssh or SSHExecutor(self.settings)
+
+    def _enrich_sweeps_with_telemetry(self, sweeps: list[dict[str, Any]], *, observed_at: str | None = None) -> list[dict[str, Any]]:
+        cache = load_telemetry_cache(self.settings.sweep_telemetry_cache_path)
+        enriched, updated_cache = enrich_sweeps_with_telemetry(sweeps, cache=cache, observed_at=observed_at or utc_now())
+        save_telemetry_cache(self.settings.sweep_telemetry_cache_path, updated_cache)
+        return enriched
+
+    def _enrich_single_sweep_with_telemetry(self, sweep: dict[str, Any]) -> dict[str, Any]:
+        enriched = self._enrich_sweeps_with_telemetry([sweep])
+        return enriched[0] if enriched else sweep
 
     def _operation_identity(self, intent: IntentType, payload: dict[str, Any]) -> tuple[str, str]:
         raw_key = payload.get("idempotency_key")
@@ -946,6 +962,7 @@ class ConsoleService:
                 degraded = str(exc)
         if job and sweep:
             next_status = map_wandb_state_to_job_status(sweep.get("state"))
+            sweep = self._enrich_single_sweep_with_telemetry(sweep)
             cached_status = compact_sweep_status(sweep, include_runs=True)
             try:
                 job = self.store.update_job_status(job.job_id, next_status, {"last_wandb_status": cached_status})
@@ -1820,18 +1837,20 @@ class ConsoleService:
         sweeps = []
         degraded = None
         try:
-            sweeps = self.wandb.discover_sweeps(self.settings.default_entity, self.settings.default_project)
+            sweeps = self.wandb.discover_sweeps(self.settings.default_entity, self.settings.default_project, include_runs=True)
             self.settings.sweeps_cache_path.write_text(json.dumps(sweeps, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            sweeps = self._enrich_sweeps_with_telemetry(sweeps)
         except Exception as exc:
             degraded = str(exc)
             if self.settings.sweeps_cache_path.exists():
                 sweeps = json.loads(self.settings.sweeps_cache_path.read_text(encoding="utf-8"))
+                sweeps = self._enrich_sweeps_with_telemetry(sweeps)
         return {
             "status": "degraded" if degraded else "ok",
             "degraded": degraded,
             "job_counts": count_jobs(jobs),
             "jobs": [job.model_dump(mode="json") for job in jobs[:20]],
-            "sweeps": sweeps[:50],
+            "sweeps": [strip_runs(sweep) for sweep in sweeps[:50]],
             "active_sweeps": sum(1 for sweep in sweeps if sweep.get("state") == "RUNNING"),
             "stalled_sweeps": sum(1 for sweep in sweeps if sweep.get("state") == "STALLED"),
             "finished_sweeps": sum(1 for sweep in sweeps if sweep.get("state") == "FINISHED"),
@@ -2127,6 +2146,12 @@ def compact_sweep_status(sweep: dict[str, Any], *, include_runs: bool = False) -
         "createdAt": sweep.get("createdAt"),
         "runCount": sweep.get("runCount"),
         "expectedRunCount": sweep.get("expectedRunCount"),
+        "finished_runs": sweep.get("finished_runs"),
+        "running_runs": sweep.get("running_runs"),
+        "failed_runs": sweep.get("failed_runs"),
+        "last_sync_at": sweep.get("last_sync_at"),
+        "speed_per_hour": sweep.get("speed_per_hour"),
+        "eta_seconds": sweep.get("eta_seconds"),
     }
     if include_runs:
         runs = []

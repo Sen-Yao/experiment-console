@@ -111,18 +111,19 @@ class WandBClient:
             "runs": runs,
         }
 
-    def discover_sweeps(self, entity: str, project: str | None = None, days: int = 7) -> list[dict[str, Any]]:
+    def discover_sweeps(self, entity: str, project: str | None = None, days: int = 7, *, include_runs: bool = False) -> list[dict[str, Any]]:
         threshold = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
         if project:
-            return self._project_sweeps(entity, project, threshold)
-        query = """
-        query EntityProjectsSweeps($entity: String!) {
-          entity(name: $entity) {
-            projects(first: 50) {
-              edges { node { name sweeps(first: 100) { edges { node { name state createdAt runCount config } } } } }
-            }
-          }
-        }
+            return self._project_sweeps(entity, project, threshold, include_runs=include_runs)
+        run_fields = "runs(first: 200) { edges { node { name state createdAt heartbeatAt } } }" if include_runs else ""
+        query = f"""
+        query EntityProjectsSweeps($entity: String!) {{
+          entity(name: $entity) {{
+            projects(first: 50) {{
+              edges {{ node {{ name sweeps(first: 100) {{ edges {{ node {{ name state createdAt runCount config {run_fields} }} }} }} }} }}
+            }}
+          }}
+        }}
         """
         data = self.graphql(query, {"entity": entity})
         out = []
@@ -131,23 +132,24 @@ class WandBClient:
             for sweep_edge in ((((project_edge.get("node") or {}).get("sweeps") or {}).get("edges")) or []):
                 node = sweep_edge.get("node") or {}
                 if (node.get("createdAt") or "") >= threshold:
-                    out.append(format_sweep(entity, project_name, node))
+                    out.append(format_sweep(entity, project_name, node, include_runs=include_runs))
         return sorted(out, key=lambda item: item.get("createdAt") or "", reverse=True)
 
-    def _project_sweeps(self, entity: str, project: str, threshold: str) -> list[dict[str, Any]]:
-        query = """
-        query ProjectSweeps($entity: String!, $project: String!) {
-          project(name: $project, entityName: $entity) {
-            sweeps(first: 100) { edges { node { name state createdAt runCount config } } }
-          }
-        }
+    def _project_sweeps(self, entity: str, project: str, threshold: str, *, include_runs: bool = False) -> list[dict[str, Any]]:
+        run_fields = "runs(first: 200) { edges { node { name state createdAt heartbeatAt } } }" if include_runs else ""
+        query = f"""
+        query ProjectSweeps($entity: String!, $project: String!) {{
+          project(name: $project, entityName: $entity) {{
+            sweeps(first: 100) {{ edges {{ node {{ name state createdAt runCount config {run_fields} }} }} }}
+          }}
+        }}
         """
         data = self.graphql(query, {"entity": entity, "project": project})
         out = []
         for edge in ((((data.get("project") or {}).get("sweeps") or {}).get("edges")) or []):
             node = edge.get("node") or {}
             if (node.get("createdAt") or "") >= threshold:
-                out.append(format_sweep(entity, project, node))
+                out.append(format_sweep(entity, project, node, include_runs=include_runs))
         return sorted(out, key=lambda item: item.get("createdAt") or "", reverse=True)
 
 
@@ -167,12 +169,12 @@ def expected_run_count_from_wandb_config(config: Any) -> int:
         return 0
 
 
-def format_sweep(entity: str, project: str, node: dict[str, Any]) -> dict[str, Any]:
+def format_sweep(entity: str, project: str, node: dict[str, Any], *, include_runs: bool = False) -> dict[str, Any]:
     run_count = int(node.get("runCount") or 0)
     expected = expected_run_count_from_wandb_config(node.get("config")) or run_count
     state = node.get("state") or "UNKNOWN"
     progress = 1.0 if state == "FINISHED" and expected else min(run_count / expected, 0.999) if expected else 0.0
-    return {
+    sweep = {
         "id": node.get("name"),
         "entity": entity,
         "project": project,
@@ -184,4 +186,15 @@ def format_sweep(entity: str, project: str, node: dict[str, Any]) -> dict[str, A
         "progress": progress,
         "run_state_counts_source": "wandb_sweep_runCount",
     }
-
+    if include_runs:
+        runs = []
+        for edge in ((node.get("runs") or {}).get("edges") or []):
+            run = edge.get("node") or {}
+            runs.append({
+                "name": run.get("name"),
+                "state": run.get("state"),
+                "created_at": run.get("createdAt"),
+                "heartbeat_at": run.get("heartbeatAt"),
+            })
+        sweep["runs"] = runs
+    return sweep

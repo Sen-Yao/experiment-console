@@ -196,7 +196,7 @@ function HeroSweepPanel({ sweep, loading }: { sweep?: Sweep; loading?: boolean }
   }
   const expected = Math.max(0, sweep.expectedRunCount || 0)
   const finished = Math.max(0, sweep.finished_runs ?? (sweep.state === 'FINISHED' ? expected : sweep.runCount || 0))
-  const running = Math.max(0, sweep.running_runs ?? (sweep.state === 'RUNNING' ? 1 : 0))
+  const running = Math.max(0, sweep.running_runs ?? 0)
   const failed = Math.max(0, sweep.failed_runs ?? 0)
   const progress = expected > 0 ? Math.min(finished / expected, 1) : Math.min(sweep.progress || 0, 1)
 

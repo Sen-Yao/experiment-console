@@ -25,8 +25,11 @@ class FakeWandB:
             "runs": [],
         }
 
-    def discover_sweeps(self, entity, project=None, days=7):
-        return [{"id": "abc123", "entity": entity, "project": project or "P", "state": "RUNNING", "runCount": 1, "expectedRunCount": 10}]
+    def discover_sweeps(self, entity, project=None, days=7, include_runs=False):
+        sweep = {"id": "abc123", "entity": entity, "project": project or "P", "state": "RUNNING", "runCount": 1, "expectedRunCount": 10}
+        if include_runs:
+            sweep["runs"] = [{"name": "run-a", "state": "finished"}]
+        return [sweep]
 
 
 class FakeSSH:
@@ -501,6 +504,45 @@ def test_status_for_missing_job_is_not_ok(tmp_path):
     assert response.classification == "job_not_found"
     assert response.result["job"] is None
     assert response.result["state"]["job_status"] is None
+
+
+def test_overview_returns_sweep_telemetry_without_run_payloads(tmp_path):
+    service = make_service(tmp_path)
+
+    overview = service.overview()
+    sweep = overview["sweeps"][0]
+
+    assert "runs" not in sweep
+    assert sweep["finished_runs"] == 0
+    assert sweep["running_runs"] == 0
+    assert sweep["failed_runs"] == 0
+    assert sweep["last_sync_at"]
+    assert sweep["speed_per_hour"] is None
+    assert sweep["eta_seconds"] is None
+
+
+def test_status_returns_sweep_telemetry(tmp_path):
+    service = make_service(tmp_path)
+    service.store.upsert_job(JobRecord(
+        job_id="job_telemetry",
+        name="telemetry",
+        status=JobStatus.running,
+        entity="my-team",
+        project="my-project",
+        sweep_id="abc123",
+        remote_host="gpu-host-1",
+        remote_cwd="/tmp/demo",
+    ))
+
+    response = service.runner_command(IntentType.status_query, {"job_id": "job_telemetry"})
+    sweep = response.result["sweep"]
+
+    assert sweep["finished_runs"] == 0
+    assert sweep["running_runs"] == 0
+    assert sweep["failed_runs"] == 0
+    assert sweep["last_sync_at"]
+    assert sweep["speed_per_hour"] is None
+    assert sweep["eta_seconds"] is None
 
 
 def test_status_returns_compact_sweep_without_run_payloads(tmp_path):
