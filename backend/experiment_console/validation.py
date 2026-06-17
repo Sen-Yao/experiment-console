@@ -12,7 +12,11 @@ class ConfigValidationError(ValueError):
 
 def load_yaml(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as handle:
-        data = yaml.safe_load(handle) or {}
+        return load_yaml_text(handle.read())
+
+
+def load_yaml_text(text: str) -> dict[str, Any]:
+    data = yaml.safe_load(text) or {}
     if not isinstance(data, dict):
         raise ConfigValidationError("config must be a YAML mapping")
     return data
@@ -41,8 +45,7 @@ def expected_run_count(config: dict[str, Any]) -> int:
     return total if seen else 0
 
 
-def validate_experiment_config(path: Path, profile: str = "sweep") -> dict[str, Any]:
-    cfg = load_yaml(path)
+def validate_config_data(cfg: dict[str, Any], profile: str = "sweep", *, path_label: str | None = None) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
 
@@ -69,7 +72,7 @@ def validate_experiment_config(path: Path, profile: str = "sweep") -> dict[str, 
 
     return {
         "valid": True,
-        "path": str(path),
+        "path": path_label,
         "profile": profile,
         "method": method or None,
         "program": cfg.get("program"),
@@ -78,3 +81,11 @@ def validate_experiment_config(path: Path, profile: str = "sweep") -> dict[str, 
         "warnings": warnings,
     }
 
+
+
+def validate_experiment_config(path: Path, profile: str = "sweep") -> dict[str, Any]:
+    return validate_config_data(load_yaml(path), profile, path_label=str(path))
+
+
+def validate_experiment_config_text(text: str, profile: str = "sweep", *, path_label: str | None = None) -> dict[str, Any]:
+    return validate_config_data(load_yaml_text(text), profile, path_label=path_label)

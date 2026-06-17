@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +53,7 @@ migrate_legacy_state()
 
 
 app = FastAPI(title="Experiment Console Runtime", version="runtime-2026-06-15")
+app.state.started_at = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(timespec="seconds")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://127.0.0.1:5174", "http://localhost:5174"],
@@ -62,11 +64,20 @@ app.add_middleware(
 
 @app.get("/health")
 def health() -> dict[str, Any]:
+    try:
+        git_sha = subprocess.run(["git", "-C", str(ROOT_DIR), "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=2).stdout.strip()
+    except Exception:
+        git_sha = None
     return {
         "status": "ok",
         "runtime": "experiment_console_runtime",
+        "cwd": str(ROOT_DIR),
+        "repo_root": str(ROOT_DIR),
+        "git_sha": git_sha,
         "state_dir": str(STATE_DIR),
         "contract": "runner_console_agent_v1",
+        "contract_version": "runner_console_agent_v1",
+        "started_at": getattr(app.state, "started_at", None),
         "wandb_api_key_present": bool(os.environ.get("WANDB_API_KEY")),
     }
 

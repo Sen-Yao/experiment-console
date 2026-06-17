@@ -13,14 +13,18 @@ class Settings(BaseModel):
         "EXPERIMENT_CONSOLE_STATE_DIR",
         str(REPO_ROOT / ".state"),
     )))
-    default_entity: str = Field(default_factory=lambda: os.environ.get("EXPERIMENT_CONSOLE_DEFAULT_ENTITY", "my-team"))
-    default_project: str = Field(default_factory=lambda: os.environ.get("EXPERIMENT_CONSOLE_DEFAULT_PROJECT", "my-project"))
+    default_entity: str = Field(default_factory=lambda: os.environ.get("EXPERIMENT_CONSOLE_DEFAULT_ENTITY", "HCCS"))
+    default_project: str = Field(default_factory=lambda: os.environ.get("EXPERIMENT_CONSOLE_DEFAULT_PROJECT", "DualRefGAD"))
     wandb_api_key_env: str = "WANDB_API_KEY"
     ssh_timeout_seconds: int = int(os.environ.get("EXPERIMENT_CONSOLE_SSH_TIMEOUT", "20"))
     command_timeout_seconds: int = int(os.environ.get("EXPERIMENT_CONSOLE_COMMAND_TIMEOUT", "120"))
     gpu_min_free_gb: float = float(os.environ.get("EXPERIMENT_CONSOLE_GPU_MIN_FREE_GB", "2.0"))
     gpu_max_util: int = int(os.environ.get("EXPERIMENT_CONSOLE_GPU_MAX_UTIL", "85"))
-    default_conda_env: str | None = Field(default_factory=lambda: os.environ.get("EXPERIMENT_CONSOLE_DEFAULT_CONDA_ENV"))
+    default_remote_host: str = Field(default_factory=lambda: os.environ.get("EXPERIMENT_CONSOLE_DEFAULT_REMOTE_HOST", "HCCS-25"))
+    default_remote_cwd: str = Field(default_factory=lambda: os.environ.get("EXPERIMENT_CONSOLE_DEFAULT_REMOTE_CWD", "/home/linziyao/DualRefGAD"))
+    default_conda_env: str | None = Field(default_factory=lambda: os.environ.get("EXPERIMENT_CONSOLE_DEFAULT_CONDA_ENV", "DualRefGAD"))
+    default_conda_sh: str = Field(default_factory=lambda: os.environ.get("EXPERIMENT_CONSOLE_DEFAULT_CONDA_SH", "/opt/anaconda3/etc/profile.d/conda.sh"))
+    contract_version: str = "runner_console_agent_v1"
 
     @property
     def sqlite_path(self) -> Path:

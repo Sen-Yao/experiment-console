@@ -44,12 +44,18 @@ from .planner import build_plan, confirmation_phrase
 from .redaction import redact_value
 from .ssh import SSHExecutor
 from .store import ConsoleStore
-from .validation import validate_experiment_config
+from .validation import validate_experiment_config_text, validate_experiment_config
 from .wandb_client import WandBClient, WandBUnavailable
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _default_remote_config_path(remote_cwd: str, config_path: str | None) -> str:
+    if config_path:
+        return config_path
+    return f"{remote_cwd.rstrip('/')}/.experiment-console/configs/sweep.yaml"
 
 
 MUTATING_INTENTS = {
@@ -455,15 +461,20 @@ class ConsoleService:
     def _launch_sweep(self, payload: LaunchSweepPayload, *, requested_by: str = "experiment-runner", operation_id: str | None = None, idempotency_key: str | None = None) -> tuple[dict[str, Any], JobRecord]:
         entity = payload.entity or self.settings.default_entity
         project = payload.project or self.settings.default_project
+        remote_host = payload.remote_host or self.settings.default_remote_host
+        remote_cwd = payload.remote_cwd or self.settings.default_remote_cwd
+        conda_env = payload.conda_env or self.settings.default_conda_env
+        conda_sh = payload.conda_sh or self.settings.default_conda_sh
+        remote_config = payload.remote_config or payload.config_path
+        if not remote_config:
+            raise ValueError("remote_config is required")
         operation_id = operation_id or self._operation_identity(IntentType.launch_sweep, payload.model_dump(mode="json"))[0]
         idempotency_key = idempotency_key or self._operation_identity(IntentType.launch_sweep, payload.model_dump(mode="json"))[1]
-        path = Path(payload.config_path).expanduser()
-        conda_env = payload.conda_env or self.settings.default_conda_env
         existing = self.store.find_job_by_launch_identity(
             name=payload.job_name,
-            config_path=str(path),
-            remote_host=payload.remote_host,
-            remote_cwd=payload.remote_cwd,
+            config_path=str(remote_config),
+            remote_host=remote_host,
+            remote_cwd=remote_cwd,
         )
         if existing:
             if not self._current_operation(existing):
@@ -499,9 +510,9 @@ class ConsoleService:
             idempotency_key=idempotency_key,
             entity=entity,
             project=project,
-            config_path=str(path),
-            remote_host=payload.remote_host,
-            remote_cwd=payload.remote_cwd,
+            config_path=str(remote_config),
+            remote_host=remote_host,
+            remote_cwd=remote_cwd,
             conda_env=conda_env,
             monitor={"stage": "validating"},
         )
@@ -524,7 +535,8 @@ class ConsoleService:
             retry_after_seconds=2,
         )
         try:
-            validation = validate_experiment_config(assert_local_config_path(payload.config_path), payload.profile)
+            remote_snapshot = self.ssh.read_remote_file(host=remote_host, remote_path=remote_config)
+            validation = validate_experiment_config_text(remote_snapshot["text"], payload.profile, path_label=remote_config)
         except Exception as exc:
             job.status = JobStatus.failed
             job.monitor.update({
@@ -536,11 +548,11 @@ class ConsoleService:
         job.monitor.update({"validation": validation, "stage": "validating"})
         self.store.upsert_job(job)
         preflight = self.ssh.preflight(
-            host=payload.remote_host,
-            remote_cwd=payload.remote_cwd,
+            host=remote_host,
+            remote_cwd=remote_cwd,
             conda_env=conda_env,
-            conda_sh=payload.conda_sh,
-            config_path=None,
+            conda_sh=conda_sh,
+            config_path=remote_config,
         )
         job.monitor.update({"preflight": preflight, "stage": "creating_sweep"})
         self.store.upsert_job(job)
@@ -561,7 +573,7 @@ class ConsoleService:
             },
             retry_after_seconds=2,
         )
-        sweep = self._create_sweep(path, entity=entity, project=project, payload=payload)
+        sweep = self._create_sweep(Path(remote_config), entity=entity, project=project, payload=payload)
         job.sweep_id = sweep["sweep_id"]
         existing_sweep_job = self.store.find_job_by_sweep(entity, project, job.sweep_id)
         if existing_sweep_job and existing_sweep_job.job_id != job.job_id:
@@ -589,7 +601,7 @@ class ConsoleService:
                 "sweep": sweep,
                 "next_actions": ["既有 job 已登记该 sweep；如需 agent 请 recover-agents。"],
             }, existing_sweep_job
-        gpu_probe = self.ssh.probe_gpus(payload.remote_host)
+        gpu_probe = self.ssh.probe_gpus(remote_host)
         eligible = [gpu for gpu in gpu_probe["gpus"] if gpu["eligible"]]
         if payload.max_agents is not None:
             eligible = eligible[:payload.max_agents]
@@ -597,19 +609,19 @@ class ConsoleService:
         sweep_path = f"{entity}/{project}/{job.sweep_id}"
         wandb_api_key = self._wandb_api_key()
         auth = self.ssh.auth_check(
-            host=payload.remote_host,
-            remote_cwd=payload.remote_cwd,
+            host=remote_host,
+            remote_cwd=remote_cwd,
             sweep_path=sweep_path,
             wandb_api_key=wandb_api_key,
         )
         for gpu in eligible:
             launches.append(self.ssh.launch_agent(
-                host=payload.remote_host,
-                remote_cwd=payload.remote_cwd,
+                host=remote_host,
+                remote_cwd=remote_cwd,
                 sweep_path=sweep_path,
                 gpu_index=gpu["index"],
                 conda_env=conda_env,
-                conda_sh=payload.conda_sh,
+                conda_sh=conda_sh,
                 wandb_api_key=wandb_api_key,
             ))
         job.agent_pids = [item["pid"] for item in launches if item.get("pid")]
@@ -650,22 +662,17 @@ class ConsoleService:
             "sweep": sweep,
             "gpu_probe": gpu_probe,
             "agent_launches": launches,
+            "remote_config": remote_config,
             "next_actions": next_actions_for_classification(classification),
         }, job
 
-    def _create_sweep(self, path: Path, *, entity: str, project: str, payload: LaunchSweepPayload) -> dict[str, Any]:
-        try:
-            return self.wandb.create_sweep(path, entity=entity, project=project)
-        except FileNotFoundError:
-            pass
-        except CommandFailed as exc:
-            argv0 = exc.result.argv[0] if exc.result.argv else ""
-            if argv0 != "wandb":
-                raise
+    def _create_sweep(self, remote_config: Path, *, entity: str, project: str, payload: LaunchSweepPayload) -> dict[str, Any]:
+        remote_host = payload.remote_host or self.settings.default_remote_host
+        remote_cwd = payload.remote_cwd or self.settings.default_remote_cwd
         return self.ssh.create_sweep(
-            host=payload.remote_host,
-            remote_cwd=payload.remote_cwd,
-            config_path=path,
+            host=remote_host,
+            remote_cwd=remote_cwd,
+            remote_config=str(remote_config),
             entity=entity,
             project=project,
             wandb_api_key=self._wandb_api_key(),
@@ -849,7 +856,7 @@ class ConsoleService:
         )
         result = {"cancel_wandb_requested": payload.cancel_wandb, "cancel_wandb_implemented": False}
         if payload.kill_agents:
-            result["stop_agents"] = self.ssh.stop_agents(host=job.remote_host, sweep_path=f"{job.entity}/{job.project}/{job.sweep_id}")
+            result["stop_agents"] = self.ssh.stop_agents(host=job.remote_host, sweep_path=f"{job.entity}/{job.project}/{job.sweep_id}", pids=job.agent_pids)
         job = self.store.update_job_status(job.job_id, JobStatus.cancelled, {"stop_result": result})
         self._record_operation(
             job,
@@ -1284,13 +1291,20 @@ class ConsoleService:
 
     def _preflight(self, payload: PreflightPayload) -> dict[str, Any]:
         conda_env = payload.conda_env or self.settings.default_conda_env
+        conda_sh = payload.conda_sh or self.settings.default_conda_sh
+        remote_config = payload.remote_config or payload.config_path
         result = self.ssh.preflight(
             host=payload.remote_host,
             remote_cwd=payload.remote_cwd,
             conda_env=conda_env,
-            conda_sh=payload.conda_sh,
-            config_path=payload.config_path,
+            conda_sh=conda_sh,
+            config_path=remote_config,
         )
+        if remote_config:
+            try:
+                result["remote_config_snapshot"] = self.ssh.read_remote_file(host=payload.remote_host, remote_path=remote_config)
+            except Exception as exc:
+                result["remote_config_snapshot_error"] = compact_error(exc)
         return {**result, "provenance": {"source": "ssh_remote_preflight"}}
 
     def _auth_check(self, payload: AuthCheckPayload) -> dict[str, Any]:
@@ -1298,10 +1312,10 @@ class ConsoleService:
         entity = payload.entity or (job.entity if job else None) or self.settings.default_entity
         project = payload.project or (job.project if job else None) or self.settings.default_project
         sweep_id = payload.sweep_id or (job.sweep_id if job else None)
-        remote_host = payload.remote_host or (job.remote_host if job else None)
-        remote_cwd = payload.remote_cwd or (job.remote_cwd if job else None)
+        remote_host = payload.remote_host or (job.remote_host if job else None) or self.settings.default_remote_host
+        remote_cwd = payload.remote_cwd or (job.remote_cwd if job else None) or self.settings.default_remote_cwd
         if not remote_host:
-            raise ValueError("remote_host is required for auth-check")
+            remote_host = self.settings.default_remote_host
         sweep_path = f"{entity}/{project}/{sweep_id}" if sweep_id else None
         return self.ssh.auth_check(
             host=remote_host,
@@ -1315,8 +1329,8 @@ class ConsoleService:
         entity = payload.entity or (job.entity if job else None) or self.settings.default_entity
         project = payload.project or (job.project if job else None) or self.settings.default_project
         sweep_id = payload.sweep_id or (job.sweep_id if job else None)
-        remote_host = payload.remote_host or (job.remote_host if job else None)
-        remote_cwd = payload.remote_cwd or (job.remote_cwd if job else None)
+        remote_host = payload.remote_host or (job.remote_host if job else None) or self.settings.default_remote_host
+        remote_cwd = payload.remote_cwd or (job.remote_cwd if job else None) or self.settings.default_remote_cwd
         if not sweep_id:
             raise ValueError("sweep_id is required for pull-results")
         operation_id = operation_id or self._operation_identity(IntentType.pull_results, payload.model_dump(mode="json"))[0]

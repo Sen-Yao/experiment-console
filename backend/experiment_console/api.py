@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from pathlib import Path
+import subprocess
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -30,6 +33,7 @@ settings = Settings()
 service = ConsoleService(settings)
 
 app = FastAPI(title="Experiment Console", version="0.1.0")
+app.state.started_at = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(timespec="seconds")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
@@ -41,7 +45,23 @@ app.add_middleware(
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "state_dir": str(settings.state_dir), "real_execution_enabled": True}
+    repo_root = Path(__file__).resolve().parents[2]
+    try:
+        git_sha = subprocess.run(["git", "-C", str(repo_root), "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=2).stdout.strip()
+    except Exception:
+        git_sha = None
+    return {
+        "status": "ok",
+        "runtime": "experiment_console_fastapi",
+        "cwd": str(repo_root),
+        "repo_root": str(repo_root),
+        "git_sha": git_sha,
+        "state_dir": str(settings.state_dir),
+        "contract": settings.contract_version,
+        "contract_version": settings.contract_version,
+        "real_execution_enabled": True,
+        "started_at": getattr(app.state, "started_at", None),
+    }
 
 
 @app.get("/api/overview")

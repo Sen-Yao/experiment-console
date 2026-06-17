@@ -51,6 +51,23 @@ class SSHExecutor:
         wrapped = "read -r WANDB_API_KEY; export WANDB_API_KEY; " + remote_command
         return self.run(host, wrapped, timeout=timeout, input_text=wandb_api_key + "\n")
 
+
+    def read_remote_file(
+        self,
+        *,
+        host: str,
+        remote_path: str,
+        timeout: int | None = None,
+    ) -> dict[str, Any]:
+        remote = f"python3 - <<'PY'\nfrom pathlib import Path\npath = Path({remote_path!r})\nprint(path.read_text(encoding=\"utf-8\"))\nPY"
+        result = self.run(host, remote, timeout=timeout or self.settings.command_timeout_seconds)
+        return {
+            "host": host,
+            "remote_path": remote_path,
+            "text": result.stdout,
+            "command": result.summary(),
+        }
+
     def preflight(
         self,
         *,
@@ -61,7 +78,7 @@ class SSHExecutor:
         config_path: str | None = None,
     ) -> dict[str, Any]:
         script = """
-import json, os, shutil
+import json, os, shutil, subprocess
 cwd = __CWD__
 config_path = __CONFIG__
 conda_env = __CONDA_ENV__
@@ -70,12 +87,18 @@ checks = {
     "remote_cwd_exists": os.path.isdir(cwd),
     "python3_available": shutil.which("python3") is not None,
     "wandb_available": shutil.which("wandb") is not None,
+    "conda_sh_exists": os.path.isfile(conda_sh) if conda_sh else False,
+    "conda_env": conda_env,
 }
+python = shutil.which("python3") or "python3"
+if conda_sh and conda_env:
+    probe = f"source {conda_sh} && conda activate {conda_env} && python - <<'PY'\nimport json, shutil, torch\nprint(json.dumps({'ok': True, 'python': shutil.which('python'), 'torch': getattr(torch, '__version__', None)}))\nPY"
+    result = subprocess.run(['bash', '-lc', probe], capture_output=True, text=True)
+    checks['conda_activate_ok'] = result.returncode == 0
+    checks['torch_import_ok'] = result.returncode == 0
 if config_path:
     checks["config_path_exists"] = os.path.isfile(config_path)
-if conda_env:
-    checks["conda_sh_exists"] = os.path.isfile(conda_sh) if conda_sh else False
-print(json.dumps({"ok": all(checks.values()), "checks": checks}))
+print(json.dumps({"ok": all(v for v in checks.values() if isinstance(v, bool)), "checks": checks}))
 """
         script = (
             script.replace("__CWD__", repr(remote_cwd))
@@ -169,16 +192,15 @@ except Exception as exc:
         conda_sh: str,
         wandb_api_key: str | None = None,
     ) -> dict[str, Any]:
-        agent_cmd = ["wandb", "agent", sweep_path]
-        prefix = ""
         if conda_env:
-            agent_cmd = ["conda", "run", "-n", conda_env, "--no-capture-output", *agent_cmd]
-            prefix = f"source {shlex.quote(conda_sh)} && "
+            launch_prefix = f"source {shlex.quote(conda_sh)} && conda activate {shlex.quote(conda_env)} && "
+        else:
+            launch_prefix = ""
         inner = (
             f"cd {shlex.quote(remote_cwd)} && "
             f"export CUDA_VISIBLE_DEVICES={shlex.quote(str(gpu_index))} && "
-            f"{prefix}"
-            + " ".join(shlex.quote(part) for part in agent_cmd)
+            f"{launch_prefix}"
+            f"wandb agent {shlex.quote(sweep_path)}"
         )
         log_name = f"console_wandb_agent_{sweep_path.replace('/', '_')}_gpu{gpu_index}.log"
         remote = (
@@ -196,38 +218,60 @@ except Exception as exc:
             "command": result.summary(),
         }
 
-    def stop_agents(self, *, host: str, sweep_path: str) -> dict[str, Any]:
-        pattern = f"wandb agent {sweep_path}"
-        quoted_pattern = shlex.quote(pattern)
-        remote = (
-            f"pattern={quoted_pattern}; "
-            f"pids=$(pgrep -af -- \"$pattern\" | awk '{{print $1}}'); "
-            f"if [ -n \"$pids\" ]; then kill -TERM $pids; fi; "
-            f"printf '%s\\n' $pids"
-        )
-        result = self.run(host, remote, timeout=self.settings.command_timeout_seconds)
-        pids = []
-        for line in result.stdout.splitlines():
-            parts = line.strip().split(None, 1)
-            if parts and parts[0].isdigit():
-                pids.append(parts[0])
-        return {"host": host, "stopped_pids": pids, "command": result.summary()}
+    def stop_agents(self, *, host: str, sweep_path: str, pids: list[str] | None = None) -> dict[str, Any]:
+        pid_list = [str(pid) for pid in (pids or []) if str(pid).strip()]
+        pid_json = json.dumps(pid_list)
+        script = """
+import json, os, signal, subprocess, time
+target_pids = [int(pid) for pid in json.loads(__PIDS__) if str(pid).isdigit()]
+sweep_path = __SWEEP_PATH__
+stopped = []
+missing = []
+still_running = []
+for pid in target_pids:
+    try:
+        os.kill(pid, signal.SIGTERM)
+        stopped.append(str(pid))
+    except ProcessLookupError:
+        missing.append(str(pid))
+    except Exception:
+        still_running.append(str(pid))
+try:
+    out = subprocess.run(["pgrep", "-af", "wandb agent " + sweep_path], capture_output=True, text=True)
+    for line in out.stdout.splitlines():
+        parts = line.split(None, 1)
+        if not parts or not parts[0].isdigit():
+            continue
+        pid = int(parts[0])
+        if str(pid) in stopped:
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+            stopped.append(str(pid))
+        except ProcessLookupError:
+            missing.append(str(pid))
+        except Exception:
+            still_running.append(str(pid))
+except Exception as exc:
+    still_running.append("fallback_error:" + str(exc))
+print(json.dumps({"stopped_pids": sorted(set(stopped)), "missing_pids": sorted(set(missing)), "still_running_pids": sorted(set(still_running))}))
+"""
+        script = script.replace("__PIDS__", repr(pid_json)).replace("__SWEEP_PATH__", repr(sweep_path))
+        result = self.run(host, "python3 -c " + shlex.quote(script), timeout=self.settings.command_timeout_seconds)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        payload.update({"host": host, "sweep_path": sweep_path, "command": result.summary()})
+        return payload
 
     def create_sweep(
         self,
         *,
         host: str,
         remote_cwd: str,
-        config_path: Path,
+        remote_config: str,
         entity: str,
         project: str,
         wandb_api_key: str | None,
     ) -> dict[str, Any]:
-        remote_config = str(config_path)
-        if config_path.exists():
-            remote_dir = f"{remote_cwd.rstrip('/')}/.experiment-console/configs"
-            remote_config = f"{remote_dir}/{config_path.name}"
-            self.run(host, f"mkdir -p {shlex.quote(remote_dir)} && cat > {shlex.quote(remote_config)}", input_text=config_path.read_text(encoding="utf-8"))
         remote = f"cd {shlex.quote(remote_cwd)} && wandb sweep --entity {shlex.quote(entity)} --project {shlex.quote(project)} {shlex.quote(remote_config)}"
         result = self.run_with_wandb_key(host, remote, wandb_api_key=wandb_api_key, timeout=self.settings.command_timeout_seconds)
         sweep_id = parse_sweep_id(result.stdout + "\n" + result.stderr)

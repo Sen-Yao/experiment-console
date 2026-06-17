@@ -94,13 +94,14 @@ class ValidateConfigPayload(BaseModel):
 
 class LaunchSweepPayload(BaseModel):
     job_name: str
-    config_path: str
+    remote_config: str | None = None
+    config_path: str | None = None
     entity: str | None = None
     project: str | None = None
-    remote_host: str
-    remote_cwd: str
+    remote_host: str | None = None
+    remote_cwd: str | None = None
     conda_env: str | None = None
-    conda_sh: str = "/opt/anaconda3/etc/profile.d/conda.sh"
+    conda_sh: str | None = None
     gpu_mode: Literal["auto", "strict"] = "auto"
     max_agents: int | None = None
     profile: Literal["sweep", "mini"] = "sweep"
@@ -112,6 +113,12 @@ class LaunchSweepPayload(BaseModel):
         if value is not None and value <= 0:
             raise ValueError("max_agents must be positive")
         return value
+
+    @model_validator(mode="after")
+    def require_remote_or_local_config(self) -> "LaunchSweepPayload":
+        if not self.remote_config and not self.config_path:
+            raise ValueError("remote_config is required for production launch; config_path is only a local debug fallback")
+        return self
 
 
 class StatusQueryPayload(BaseModel):
@@ -212,9 +219,10 @@ class AuthCheckPayload(BaseModel):
 class PreflightPayload(BaseModel):
     remote_host: str
     remote_cwd: str
+    remote_config: str | None = None
     config_path: str | None = None
     conda_env: str | None = None
-    conda_sh: str = "/opt/anaconda3/etc/profile.d/conda.sh"
+    conda_sh: str | None = None
 
 
 class PullResultsPayload(BaseModel):
