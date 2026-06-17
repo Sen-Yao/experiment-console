@@ -869,7 +869,7 @@ class ConsoleService:
             status=OperationStatus.succeeded.value,
             result={"stage": "done", "classification": "job_cancelled", "job_id": job.job_id, **result},
         )
-        return result, job
+        return {"stage": "done", "classification": "job_cancelled", "job_id": job.job_id, **result}, job
 
     def _cancel_sweep(self, payload: CancelSweepPayload, *, requested_by: str = "experiment-runner", operation_id: str | None = None, idempotency_key: str | None = None) -> dict[str, Any]:
         entity = payload.entity or self.settings.default_entity
