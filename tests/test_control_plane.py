@@ -32,6 +32,18 @@ class FakeWandB:
 class FakeSSH:
     def __init__(self):
         self.launches = []
+        self.run_launches = []
+        self.agent_probe = None
+        self.failure_logs = []
+        self.run_status = {
+            "job_id": "job_run",
+            "pid": "2000",
+            "child_pid": "2001",
+            "exit_code": None,
+            "alive_pids": ["2000", "2001"],
+            "status_path": "/tmp/demo/.experiment_console/runs/job_run.status.json",
+            "result_path": "/tmp/demo/.experiment_console/runs/job_run.result.json",
+        }
 
     def probe_gpus(self, host):
         return {
@@ -55,8 +67,104 @@ class FakeSSH:
         })
         return {"host": host, "gpu_index": gpu_index, "pid": str(1000 + gpu_index), "sweep_path": sweep_path}
 
-    def stop_agents(self, *, host, sweep_path):
-        return {"host": host, "stopped_pids": ["1000"], "sweep_path": sweep_path}
+    def create_sweep(self, *, host, remote_cwd, remote_config, entity, project, wandb_api_key):
+        return {"sweep_id": "abc123", "entity": entity, "project": project, "remote_config_path": remote_config}
+
+    def read_remote_file(self, *, host, remote_path):
+        from pathlib import Path
+
+        local_path = Path(remote_path)
+        if local_path.exists():
+            return {
+                "host": host,
+                "remote_path": remote_path,
+                "text": local_path.read_text(encoding="utf-8"),
+            }
+        return {
+            "host": host,
+            "remote_path": remote_path,
+            "text": (
+                "name: single\n"
+                "program: train.py\n"
+                "parameters:\n"
+                "  dataset:\n"
+                "    value: Cora\n"
+                "  seed:\n"
+                "    value: 0\n"
+            ),
+        }
+
+    def launch_run(self, *, host, remote_cwd, job_id, argv, gpu_index, conda_env, conda_sh, wandb_api_key=None, result_path=None):
+        launch = {
+            "host": host,
+            "remote_cwd": remote_cwd,
+            "job_id": job_id,
+            "argv": argv,
+            "gpu_index": gpu_index,
+            "conda_env": conda_env,
+            "conda_sh": conda_sh,
+            "wandb_api_key": wandb_api_key,
+            "pid": "2000",
+            "log": f"{remote_cwd}/.experiment_console/runs/{job_id}.log",
+            "status_path": f"{remote_cwd}/.experiment_console/runs/{job_id}.status.json",
+            "result_path": result_path or f"{remote_cwd}/.experiment_console/runs/{job_id}.result.json",
+        }
+        self.run_launches.append(launch)
+        self.run_status = {
+            **self.run_status,
+            "job_id": job_id,
+            "pid": "2000",
+            "status_path": launch["status_path"],
+            "result_path": launch["result_path"],
+        }
+        return launch
+
+    def check_run_status(self, *, host, status_path, pids=None):
+        return {**self.run_status, "host": host, "status_path": status_path, "alive_pids": list(self.run_status.get("alive_pids") or [])}
+
+    def check_agent_processes(self, *, host, sweep_path=None, pids=None):
+        if self.agent_probe is not None:
+            return {**self.agent_probe, "host": host, "sweep_path": sweep_path}
+        return {
+            "host": host,
+            "sweep_path": sweep_path,
+            "tracked_pids": list(pids or []),
+            "alive_pids": list(pids or []),
+            "pgrep": [],
+        }
+
+    def diagnose_agent_failure(self, *, host, remote_cwd, launches, pids=None, sweep_path=None, tail_lines=200):
+        from experiment_console.ssh import build_failure_diagnostics
+
+        logs = self.failure_logs or [
+            {
+                "gpu_index": launch.get("gpu_index"),
+                "pid": launch.get("pid"),
+                "path": launch.get("log"),
+                "exists": True,
+                "tail": "Traceback (most recent call last):\n  File \"train.py\", line 7, in <module>\nRuntimeError: shape mismatch\n",
+            }
+            for launch in launches
+        ]
+        return build_failure_diagnostics(
+            host=host,
+            remote_cwd=remote_cwd,
+            sweep_path=sweep_path,
+            launches=launches,
+            pid_state={
+                "tracked_pids": list(pids or []),
+                "alive_pids": [],
+                "pgrep": [],
+            },
+            logs=logs,
+            command={"stdout": "ok"},
+        )
+
+    def stop_pids(self, *, host, pids):
+        return {"host": host, "stopped_pids": list(pids), "missing_pids": [], "still_running_pids": []}
+
+    def stop_agents(self, *, host, sweep_path, pids=None):
+        return {"host": host, "stopped_pids": list(pids or ["1000"]), "sweep_path": sweep_path}
 
     def auth_check(self, *, host, remote_cwd, sweep_path, wandb_api_key):
         return {"ok": bool(wandb_api_key), "classification": "auth_ok" if wandb_api_key else "wandb_auth_missing"}
@@ -80,6 +188,19 @@ class FakeSSH:
                 {"run_id": "run-b", "metrics": {"final_test_auc": 0.9}, "has_scientific_result": True},
             ],
             "valid_results": 2,
+            "missing_results": 0,
+            "failed_results": 0,
+            "partial": False,
+        }
+
+    def pull_single_run_result(self, *, host, status_path, result_path, metric_keys, group_keys):
+        return {
+            "source": "remote_single_run_files",
+            "status": {**self.run_status, "status_path": status_path, "result_path": result_path},
+            "rows": [
+                {"run_id": self.run_status["job_id"], "state": "finished", "metrics": {"final_test_auc": 0.91}, "config": {}, "has_scientific_result": True}
+            ],
+            "valid_results": 1,
             "missing_results": 0,
             "failed_results": 0,
             "partial": False,
@@ -170,6 +291,155 @@ def test_launch_sweep_uses_console_default_conda_env(tmp_path):
     assert result.job is not None
     assert result.job.conda_env == "DualRefGAD"
     assert ssh.launches[0]["conda_env"] == "DualRefGAD"
+
+
+def test_launch_run_creates_managed_single_run_job(tmp_path):
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project", default_conda_env="DualRefGAD")
+    ssh = FakeSSH()
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
+
+    result = service.runner_command(IntentType.launch_run, {
+        "job_name": "single",
+        "remote_config": "/tmp/demo/single.yaml",
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "idempotency_key": "single-run-test",
+    })
+
+    assert result.job is not None
+    assert result.job.status == JobStatus.running
+    assert result.job.monitor["kind"] == "single_run"
+    assert result.job.agent_pids == ["2000"]
+    assert ssh.run_launches[0]["gpu_index"] == 0
+    assert ssh.run_launches[0]["argv"] == ["python", "train.py", "--dataset", "Cora", "--seed", "0"]
+    assert result.result["run"]["status_path"].endswith(".status.json")
+
+
+def test_launch_run_rejects_multi_value_config(tmp_path):
+    class MultiValueSSH(FakeSSH):
+        def read_remote_file(self, *, host, remote_path):
+            return {
+                "host": host,
+                "remote_path": remote_path,
+                "text": "program: train.py\nparameters:\n  seed:\n    values: [0, 1]\n",
+            }
+
+    service = ConsoleService(settings=Settings(state_dir=tmp_path), store=ConsoleStore(Settings(state_dir=tmp_path).sqlite_path, Settings(state_dir=tmp_path).audit_path), wandb=FakeWandB(), ssh=MultiValueSSH())
+    with pytest.raises(Exception, match="exactly one value"):
+        service.runner_command(IntentType.launch_run, {
+            "job_name": "bad_single",
+            "remote_config": "/tmp/demo/single.yaml",
+            "remote_host": "gpu-host-1",
+            "remote_cwd": "/tmp/demo",
+        })
+
+
+def test_single_run_status_stop_and_pull_results(tmp_path):
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = FakeSSH()
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
+    launch = service.runner_command(IntentType.launch_run, {
+        "job_name": "single_status",
+        "remote_config": "/tmp/demo/single.yaml",
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "idempotency_key": "single-status-test",
+    })
+    job_id = launch.job_id
+    assert job_id
+
+    running = service.runner_command(IntentType.status_query, {"job_id": job_id})
+    assert running.result["state"]["agent_health"] == "running"
+
+    ssh.run_status = {**ssh.run_status, "exit_code": 0, "alive_pids": [], "finished_at": "2026-06-17T00:00:00+00:00"}
+    finished = service.runner_command(IntentType.status_query, {"job_id": job_id})
+    assert finished.result["state"]["job_status"] == "finished"
+
+    pulled = service.runner_command(IntentType.pull_results, {"job_id": job_id, "metric_keys": ["final_test_auc"]})
+    assert pulled.result["valid_results"] == 1
+    assert pulled.result["rows"][0]["metrics"]["final_test_auc"] == 0.91
+
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=FakeSSH())
+    stopped_launch = service.runner_command(IntentType.launch_run, {
+        "job_name": "single_stop",
+        "remote_config": "/tmp/demo/single.yaml",
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "idempotency_key": "single-stop-test",
+    })
+    assert stopped_launch.job_id
+    stopped = service.runner_command(IntentType.stop_job, {"job_id": stopped_launch.job_id})
+    assert stopped.result["stop_run"]["stopped_pids"] == ["2000"]
+
+
+def test_status_collects_failure_diagnostics_for_missing_sweep_agent(tmp_path):
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = FakeSSH()
+    ssh.agent_probe = {"tracked_pids": ["1000"], "alive_pids": [], "pgrep": []}
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
+    service.store.upsert_job(JobRecord(
+        job_id="job_failed_agent",
+        name="failed-agent",
+        status=JobStatus.running,
+        entity="my-team",
+        project="my-project",
+        sweep_id="abc123",
+        remote_host="gpu-host-1",
+        remote_cwd="/tmp/demo",
+        agent_pids=["1000"],
+        monitor={
+            "agent_launches": [{
+                "host": "gpu-host-1",
+                "gpu_index": 0,
+                "pid": "1000",
+                "log": "/tmp/demo/console_wandb_agent_my-team_my-project_abc123_gpu0.log",
+            }],
+            "sweep_path": "my-team/my-project/abc123",
+        },
+    ))
+
+    response = service.runner_command(IntentType.status_query, {"job_id": "job_failed_agent"})
+
+    assert response.result["state"]["agent_health"] == "missing"
+    diagnostics = response.result["failure_diagnostics"]
+    assert diagnostics["classification"] == "failure_signals_found"
+    assert diagnostics["error_signals"][0]["kind"] == "traceback"
+    assert "shape mismatch" in diagnostics["error_signals"][1]["excerpt"]
+    assert service.store.get_job("job_failed_agent").monitor["last_failure_diagnostics"]["summary"]
+
+
+def test_watchdog_includes_failure_diagnostics_from_status(tmp_path):
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = FakeSSH()
+    ssh.agent_probe = {"tracked_pids": ["1000"], "alive_pids": [], "pgrep": []}
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
+    service.store.upsert_job(JobRecord(
+        job_id="job_watchdog_failed_agent",
+        name="watchdog-failed-agent",
+        status=JobStatus.running,
+        entity="my-team",
+        project="my-project",
+        sweep_id="abc123",
+        remote_host="gpu-host-1",
+        remote_cwd="/tmp/demo",
+        agent_pids=["1000"],
+        monitor={
+            "agent_launches": [{
+                "host": "gpu-host-1",
+                "gpu_index": 0,
+                "pid": "1000",
+                "log": "/tmp/demo/console_wandb_agent_my-team_my-project_abc123_gpu0.log",
+            }],
+            "sweep_path": "my-team/my-project/abc123",
+        },
+    ))
+
+    response = service.runner_command(IntentType.watchdog_once, {"job_id": "job_watchdog_failed_agent"})
+
+    assert response.result["classification"] == "attention"
+    diagnostics = response.result["status_result"]["failure_diagnostics"]
+    assert diagnostics["classification"] == "failure_signals_found"
+    assert diagnostics["error_signals"]
 
 
 def test_recover_agents_does_not_create_new_sweep(tmp_path):

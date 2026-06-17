@@ -22,6 +22,13 @@ type Job = {
   sweep_id?: string | null
   remote_host?: string | null
   remote_cwd?: string | null
+  monitor?: {
+    kind?: string
+    run?: {
+      log?: string
+      status_path?: string
+    }
+  }
   created_at?: string
   updated_at?: string
 }
@@ -279,17 +286,20 @@ function JobList({ jobs }: { jobs: Job[] }) {
   if (!jobs.length) return <div className="emptyLine">暂无 Runner 作业</div>
   return (
     <div className="jobList">
-      {jobs.map((job) => (
-        <div className="jobRow" key={job.job_id}>
-          <div>
-            <strong>{job.name || job.job_id}</strong>
-            <span>{job.job_id}</span>
+      {jobs.map((job) => {
+        const target = job.sweep_id || (job.monitor?.kind === 'single_run' ? 'single-run' : '-')
+        return (
+          <div className="jobRow" key={job.job_id}>
+            <div>
+              <strong>{job.name || job.job_id}</strong>
+              <span>{job.job_id}</span>
+            </div>
+            <span className={`smallBadge tone-${toneForStatus(job.status)}`}>{statusText(job.status)}</span>
+            <code title={job.monitor?.run?.log || undefined}>{target}</code>
+            <span>{job.remote_host || '-'}</span>
           </div>
-          <span className={`smallBadge tone-${toneForStatus(job.status)}`}>{statusText(job.status)}</span>
-          <code>{job.sweep_id || '-'}</code>
-          <span>{job.remote_host || '-'}</span>
-        </div>
-      ))}
+        )
+      })}
     </div>
   )
 }

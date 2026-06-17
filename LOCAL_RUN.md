@@ -17,6 +17,7 @@ The local Console is intentionally a lightweight control-plane runtime:
 - exposes the runner-facing API on `http://127.0.0.1:5174`
 - reads W&B auth from a repo-external secret file
 - can register/query/launch W&B sweeps through SSH on HCCS-25
+- can launch managed single-run jobs from single-run configs
 - keeps local runtime state in `/private/tmp/experiment-console-runtime`
 - defaults remote W&B agent execution to the `DualRefGAD` conda environment
 
@@ -152,6 +153,21 @@ Expected classification is `ok`, with split state fields:
 job_status=finished
 wandb_sweep_status=FINISHED
 agent_health=terminal
+```
+
+Managed single-run smoke shape:
+
+```bash
+EXPERIMENT_CONSOLE_URL=http://127.0.0.1:5174 \
+PYTHONPATH="/Users/oliver/Developer/experiment-console/.local_deps:/private/tmp/experiment-console-deps:/Users/oliver/.agents/skills/experiment-runner/scripts" \
+/opt/homebrew/bin/python3 /Users/oliver/.agents/skills/experiment-runner/scripts/experiment.py \
+  launch-run \
+  --profile single-run \
+  --name demo_single_run \
+  --remote-config /absolute/remote/single-run.yaml \
+  --remote-host HCCS-25 \
+  --remote-cwd /absolute/remote/project \
+  --json
 ```
 
 Current bounded result smoke:

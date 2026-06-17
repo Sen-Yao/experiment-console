@@ -13,6 +13,7 @@ from .models import (
     CancelSweepPayload,
     IntentPreviewRequest,
     IntentType,
+    LaunchRunPayload,
     LaunchSweepPayload,
     PreflightPayload,
     PullResultsPayload,
@@ -144,6 +145,14 @@ def runner_validate_config(payload: ValidateConfigPayload, requested_by: str = "
 def runner_launch_sweep(payload: LaunchSweepPayload, requested_by: str = "experiment-runner"):
     try:
         return service.runner_command(IntentType.launch_sweep, payload.model_dump(mode="json"), requested_by=requested_by).model_dump(mode="json", exclude_none=True)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/runner/launch-run")
+def runner_launch_run(payload: LaunchRunPayload, requested_by: str = "experiment-runner"):
+    try:
+        return service.runner_command(IntentType.launch_run, payload.model_dump(mode="json"), requested_by=requested_by).model_dump(mode="json", exclude_none=True)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 

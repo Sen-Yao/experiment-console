@@ -8,6 +8,7 @@ from typing import Any
 
 from .command import CommandRunner
 from .config import Settings
+from .redaction import redact_text
 
 
 def quote_remote(command: str) -> str:
@@ -78,7 +79,7 @@ class SSHExecutor:
         config_path: str | None = None,
     ) -> dict[str, Any]:
         script = """
-import json, os, shutil, subprocess
+import json, os, shlex, shutil, subprocess
 cwd = __CWD__
 config_path = __CONFIG__
 conda_env = __CONDA_ENV__
@@ -92,10 +93,20 @@ checks = {
 }
 python = shutil.which("python3") or "python3"
 if conda_sh and conda_env:
-    probe = f"source {conda_sh} && conda activate {conda_env} && python - <<'PY'\nimport json, shutil, torch\nprint(json.dumps({'ok': True, 'python': shutil.which('python'), 'torch': getattr(torch, '__version__', None)}))\nPY"
+    probe = (
+        "source " + shlex.quote(conda_sh)
+        + " && conda activate " + shlex.quote(conda_env)
+        + " && python - <<'PY'\\n"
+        "import json, shutil, torch\\n"
+        "print(json.dumps({'ok': True, 'python': shutil.which('python'), 'torch': getattr(torch, '__version__', None)}))\\n"
+        "PY"
+    )
     result = subprocess.run(['bash', '-lc', probe], capture_output=True, text=True)
     checks['conda_activate_ok'] = result.returncode == 0
     checks['torch_import_ok'] = result.returncode == 0
+    if result.returncode != 0:
+        checks['conda_probe_stdout'] = result.stdout[-1000:]
+        checks['conda_probe_stderr'] = result.stderr[-1000:]
 if config_path:
     checks["config_path_exists"] = os.path.isfile(config_path)
 print(json.dumps({"ok": all(v for v in checks.values() if isinstance(v, bool)), "checks": checks}))
@@ -193,7 +204,7 @@ except Exception as exc:
         wandb_api_key: str | None = None,
     ) -> dict[str, Any]:
         if conda_env:
-            launch_prefix = f"source {shlex.quote(conda_sh)} && conda activate {shlex.quote(conda_env)} && "
+            launch_prefix = f"source {shlex.quote(conda_sh)} && conda run -n {shlex.quote(conda_env)} "
         else:
             launch_prefix = ""
         inner = (
@@ -203,28 +214,338 @@ except Exception as exc:
             f"wandb agent {shlex.quote(sweep_path)}"
         )
         log_name = f"console_wandb_agent_{sweep_path.replace('/', '_')}_gpu{gpu_index}.log"
-        remote = (
-            f"cd {shlex.quote(remote_cwd)} && "
-            f"nohup bash -lc {shlex.quote(inner)} > {shlex.quote(log_name)} 2>&1 < /dev/null & echo $!"
+        log_path = f"{remote_cwd.rstrip('/')}/{log_name}"
+        script = """
+import json, os, subprocess
+cwd = __CWD__
+inner = __INNER__
+log_path = __LOG_PATH__
+os.makedirs(os.path.dirname(log_path), exist_ok=True)
+with open(log_path, "ab", buffering=0) as log:
+    proc = subprocess.Popen(
+        ["bash", "-lc", inner],
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        env=os.environ.copy(),
+        start_new_session=True,
+    )
+print(json.dumps({"ok": True, "pid": proc.pid, "log": log_path}))
+"""
+        script = (
+            script.replace("__CWD__", repr(remote_cwd))
+            .replace("__INNER__", repr(inner))
+            .replace("__LOG_PATH__", repr(log_path))
         )
+        remote = f"cd {shlex.quote(remote_cwd)} && python3 -c {shlex.quote(script)}"
         result = self.run_with_wandb_key(host, remote, wandb_api_key=wandb_api_key, timeout=self.settings.command_timeout_seconds)
-        pid = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        pid = str(payload.get("pid") or "").strip()
         return {
             "host": host,
             "gpu_index": gpu_index,
             "pid": pid,
-            "log": f"{remote_cwd.rstrip('/')}/{log_name}",
+            "log": log_path,
             "conda_env": conda_env,
             "command": result.summary(),
+            "launcher": payload,
         }
 
-    def stop_agents(self, *, host: str, sweep_path: str, pids: list[str] | None = None) -> dict[str, Any]:
-        pid_list = [str(pid) for pid in (pids or []) if str(pid).strip()]
-        pid_json = json.dumps(pid_list)
+    def launch_run(
+        self,
+        *,
+        host: str,
+        remote_cwd: str,
+        job_id: str,
+        argv: list[str],
+        gpu_index: int,
+        conda_env: str | None,
+        conda_sh: str,
+        wandb_api_key: str | None = None,
+        result_path: str | None = None,
+    ) -> dict[str, Any]:
+        runs_dir = f"{remote_cwd.rstrip('/')}/.experiment_console/runs"
+        log_path = f"{runs_dir}/{job_id}.log"
+        status_path = f"{runs_dir}/{job_id}.status.json"
+        result_path = result_path or f"{runs_dir}/{job_id}.result.json"
+        command_json = json.dumps([str(item) for item in argv])
         script = """
-import json, os, signal, subprocess, time
-target_pids = [int(pid) for pid in json.loads(__PIDS__) if str(pid).isdigit()]
+import json, os, subprocess, sys
+from datetime import datetime, timezone
+
+job_id = __JOB_ID__
+cwd = __CWD__
+argv = __ARGV__
+log_path = __LOG_PATH__
+status_path = __STATUS_PATH__
+result_path = __RESULT_PATH__
+gpu_index = __GPU_INDEX__
+os.makedirs(os.path.dirname(status_path), exist_ok=True)
+env = os.environ.copy()
+env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+status = {
+    "job_id": job_id,
+    "pid": os.getpid(),
+    "started_at": now(),
+    "finished_at": None,
+    "exit_code": None,
+    "command": argv,
+    "log_path": log_path,
+    "status_path": status_path,
+    "result_path": result_path,
+}
+with open(status_path, "w", encoding="utf-8") as handle:
+    json.dump(status, handle, ensure_ascii=False)
+with open(log_path, "ab", buffering=0) as log:
+    proc = subprocess.Popen(argv, cwd=cwd, stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+    status["child_pid"] = proc.pid
+    with open(status_path, "w", encoding="utf-8") as handle:
+        json.dump(status, handle, ensure_ascii=False)
+    exit_code = proc.wait()
+status["finished_at"] = now()
+status["exit_code"] = exit_code
+with open(status_path, "w", encoding="utf-8") as handle:
+    json.dump(status, handle, ensure_ascii=False)
+"""
+        script = (
+            script.replace("__JOB_ID__", repr(job_id))
+            .replace("__CWD__", repr(remote_cwd))
+            .replace("__ARGV__", command_json)
+            .replace("__LOG_PATH__", repr(log_path))
+            .replace("__STATUS_PATH__", repr(status_path))
+            .replace("__RESULT_PATH__", repr(result_path))
+            .replace("__GPU_INDEX__", repr(gpu_index))
+        )
+        if conda_env:
+            launch_prefix = f"source {shlex.quote(conda_sh)} && conda activate {shlex.quote(conda_env)} && "
+        else:
+            launch_prefix = ""
+        status_probe = """
+import json, os, time
+status_path = __STATUS_PATH__
+launcher_pid = os.environ.get("LAUNCHER_PID", "")
+deadline = time.time() + 30
+payload = {}
+while time.time() < deadline:
+    try:
+        with open(status_path, encoding="utf-8") as handle:
+            loaded = json.load(handle)
+        if isinstance(loaded, dict) and loaded.get("child_pid"):
+            payload = loaded
+            break
+    except Exception:
+        time.sleep(1)
+payload["ok"] = bool(payload.get("child_pid"))
+payload["launcher_pid"] = launcher_pid
+payload.setdefault("status_path", status_path)
+print(json.dumps(payload))
+"""
+        status_probe = (
+            status_probe
+            .replace("__STATUS_PATH__", repr(status_path))
+        )
+        remote = (
+            f"mkdir -p {shlex.quote(runs_dir)} && cd {shlex.quote(remote_cwd)} && "
+            f"nohup bash -lc {shlex.quote(launch_prefix + 'python -c ' + shlex.quote(script))} "
+            f"> {shlex.quote(log_path)}.launcher 2>&1 < /dev/null & launcher_pid=$!; "
+            f"LAUNCHER_PID=$launcher_pid python3 -c {shlex.quote(status_probe)}"
+        )
+        result = self.run_with_wandb_key(host, remote, wandb_api_key=wandb_api_key, timeout=self.settings.command_timeout_seconds)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        pid = str(payload.get("child_pid") or "").strip()
+        return {
+            "host": host,
+            "gpu_index": gpu_index,
+            "pid": pid,
+            "log": log_path,
+            "status_path": status_path,
+            "result_path": result_path,
+            "conda_env": conda_env,
+            "argv": argv,
+            "command": result.summary(),
+            "launcher": payload,
+        }
+
+    def check_run_status(self, *, host: str, status_path: str, pids: list[str] | None = None) -> dict[str, Any]:
+        pid_json = json.dumps([str(pid) for pid in (pids or []) if str(pid).strip()])
+        script = """
+import json, os, signal
+status_path = __STATUS_PATH__
+pids = [int(pid) for pid in json.loads(__PIDS__) if str(pid).isdigit()]
+status = {}
+try:
+    with open(status_path, encoding="utf-8") as handle:
+        loaded = json.load(handle)
+        if isinstance(loaded, dict):
+            status = loaded
+except FileNotFoundError:
+    status = {"status_path": status_path, "missing": True}
+alive = []
+for pid in pids:
+    try:
+        os.kill(pid, 0)
+        alive.append(str(pid))
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        alive.append(str(pid))
+child_pid = status.get("child_pid")
+if child_pid:
+    try:
+        os.kill(int(child_pid), 0)
+        alive.append(str(child_pid))
+    except Exception:
+        pass
+status["alive_pids"] = sorted(set(alive))
+print(json.dumps(status))
+"""
+        script = script.replace("__STATUS_PATH__", repr(status_path)).replace("__PIDS__", repr(pid_json))
+        result = self.run(host, "python3 -c " + shlex.quote(script), timeout=self.settings.command_timeout_seconds)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        payload["host"] = host
+        payload["command"] = result.summary()
+        return payload
+
+    def check_agent_processes(
+        self,
+        *,
+        host: str,
+        sweep_path: str | None = None,
+        pids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        pid_json = json.dumps([str(pid) for pid in (pids or []) if str(pid).strip()])
+        script = """
+import json, os, subprocess
+pids = [int(pid) for pid in json.loads(__PIDS__) if str(pid).isdigit()]
 sweep_path = __SWEEP_PATH__
+alive_pids = []
+for pid in pids:
+    try:
+        os.kill(pid, 0)
+        alive_pids.append(str(pid))
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        alive_pids.append(str(pid))
+pgrep = []
+if sweep_path:
+    try:
+        out = subprocess.run(["pgrep", "-af", "wandb agent " + sweep_path], capture_output=True, text=True)
+        for line in out.stdout.splitlines():
+            parts = line.split(None, 1)
+            if parts and parts[0].isdigit():
+                pgrep.append({"pid": parts[0], "command": parts[1] if len(parts) > 1 else ""})
+    except Exception as exc:
+        pgrep.append({"error": str(exc)})
+print(json.dumps({
+    "tracked_pids": [str(pid) for pid in pids],
+    "alive_pids": sorted(set(alive_pids)),
+    "pgrep": pgrep,
+}))
+"""
+        script = script.replace("__PIDS__", repr(pid_json)).replace("__SWEEP_PATH__", repr(sweep_path))
+        result = self.run(host, "python3 -c " + shlex.quote(script), timeout=self.settings.command_timeout_seconds)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        payload.update({"host": host, "sweep_path": sweep_path, "command": result.summary()})
+        return payload
+
+    def diagnose_agent_failure(
+        self,
+        *,
+        host: str,
+        remote_cwd: str,
+        launches: list[dict[str, Any]],
+        pids: list[str] | None = None,
+        sweep_path: str | None = None,
+        tail_lines: int = 200,
+    ) -> dict[str, Any]:
+        payload = {
+            "launches": launches,
+            "pids": [str(pid) for pid in (pids or []) if str(pid).strip()],
+            "sweep_path": sweep_path,
+            "tail_lines": tail_lines,
+        }
+        script = """
+import json, os, subprocess
+payload = json.loads(__PAYLOAD__)
+remote_cwd = __REMOTE_CWD__
+tail_lines = int(payload.get("tail_lines") or 200)
+
+def tail_text(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            lines = handle.readlines()
+        return "".join(lines[-tail_lines:])
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        return "failed to read log: " + str(exc)
+
+def alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except Exception:
+        return False
+
+pid_state = {
+    "tracked_pids": payload.get("pids") or [],
+    "alive_pids": [pid for pid in payload.get("pids") or [] if str(pid).isdigit() and alive(pid)],
+    "pgrep": [],
+}
+sweep_path = payload.get("sweep_path")
+if sweep_path:
+    try:
+        out = subprocess.run(["pgrep", "-af", "wandb agent " + sweep_path], capture_output=True, text=True)
+        for line in out.stdout.splitlines():
+            parts = line.split(None, 1)
+            if parts and parts[0].isdigit():
+                pid_state["pgrep"].append({"pid": parts[0], "command": parts[1] if len(parts) > 1 else ""})
+    except Exception as exc:
+        pid_state["pgrep"].append({"error": str(exc)})
+
+logs = []
+for launch in payload.get("launches") or []:
+    if not isinstance(launch, dict):
+        continue
+    path = launch.get("log")
+    if not path:
+        continue
+    if not os.path.isabs(path):
+        path = os.path.join(remote_cwd, path)
+    text = tail_text(path)
+    logs.append({
+        "gpu_index": launch.get("gpu_index"),
+        "pid": launch.get("pid"),
+        "path": path,
+        "exists": text is not None,
+        "tail": text or "",
+    })
+print(json.dumps({"pid_state": pid_state, "logs": logs}))
+"""
+        script = script.replace("__PAYLOAD__", repr(json.dumps(payload))).replace("__REMOTE_CWD__", repr(remote_cwd))
+        result = self.run(host, "python3 -c " + shlex.quote(script), timeout=self.settings.command_timeout_seconds)
+        remote_payload = json.loads(result.stdout.strip().splitlines()[-1])
+        return build_failure_diagnostics(
+            host=host,
+            remote_cwd=remote_cwd,
+            sweep_path=sweep_path,
+            launches=launches,
+            pid_state=remote_payload.get("pid_state") or {},
+            logs=remote_payload.get("logs") or [],
+            command=result.summary(),
+        )
+
+    def stop_pids(self, *, host: str, pids: list[str]) -> dict[str, Any]:
+        pid_json = json.dumps([str(pid) for pid in pids if str(pid).strip()])
+        script = """
+import json, os, signal
+target_pids = [int(pid) for pid in json.loads(__PIDS__) if str(pid).isdigit()]
 stopped = []
 missing = []
 still_running = []
@@ -236,30 +557,85 @@ for pid in target_pids:
         missing.append(str(pid))
     except Exception:
         still_running.append(str(pid))
-try:
-    out = subprocess.run(["pgrep", "-af", "wandb agent " + sweep_path], capture_output=True, text=True)
-    for line in out.stdout.splitlines():
-        parts = line.split(None, 1)
-        if not parts or not parts[0].isdigit():
-            continue
-        pid = int(parts[0])
-        if str(pid) in stopped:
-            continue
-        try:
-            os.kill(pid, signal.SIGTERM)
-            stopped.append(str(pid))
-        except ProcessLookupError:
-            missing.append(str(pid))
-        except Exception:
-            still_running.append(str(pid))
-except Exception as exc:
-    still_running.append("fallback_error:" + str(exc))
 print(json.dumps({"stopped_pids": sorted(set(stopped)), "missing_pids": sorted(set(missing)), "still_running_pids": sorted(set(still_running))}))
 """
-        script = script.replace("__PIDS__", repr(pid_json)).replace("__SWEEP_PATH__", repr(sweep_path))
+        script = script.replace("__PIDS__", repr(pid_json))
         result = self.run(host, "python3 -c " + shlex.quote(script), timeout=self.settings.command_timeout_seconds)
         payload = json.loads(result.stdout.strip().splitlines()[-1])
-        payload.update({"host": host, "sweep_path": sweep_path, "command": result.summary()})
+        payload.update({"host": host, "command": result.summary()})
+        return payload
+
+    def stop_agents(self, *, host: str, sweep_path: str, pids: list[str] | None = None) -> dict[str, Any]:
+        pid_terms = " ".join(shlex.quote(str(pid)) for pid in (pids or []) if str(pid).strip())
+        pid_kill = f"kill -TERM {pid_terms} 2>/dev/null || true; " if pid_terms else ""
+        remote = (
+            pid_kill
+            + f"pgrep -af {shlex.quote('wandb agent ' + sweep_path)} "
+            + "| awk '{print $1}' | xargs -r kill -TERM"
+        )
+        result = self.run(host, remote, timeout=self.settings.command_timeout_seconds)
+        return {"host": host, "sweep_path": sweep_path, "command": result.summary()}
+
+    def pull_single_run_result(
+        self,
+        *,
+        host: str,
+        status_path: str,
+        result_path: str | None,
+        metric_keys: list[str],
+        group_keys: list[str],
+    ) -> dict[str, Any]:
+        script = """
+import json, os
+status_path = __STATUS_PATH__
+result_path = __RESULT_PATH__
+metric_keys = __METRIC_KEYS__
+group_keys = __GROUP_KEYS__
+
+def load(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+status = load(status_path)
+data = load(result_path) if result_path else {}
+flat = {key: value for key, value in data.items() if isinstance(value, (str, int, float, bool)) or value is None}
+metrics = {key: flat.get(key) for key in metric_keys if key in flat} if metric_keys else {
+    key: value for key, value in flat.items()
+    if isinstance(value, (int, float, bool)) and not key.startswith("_")
+}
+config = {key: flat.get(key) for key in group_keys if key in flat} if group_keys else {}
+row = {
+    "run_id": status.get("job_id"),
+    "state": "finished" if status.get("exit_code") == 0 else "failed" if status.get("exit_code") is not None else "running",
+    "config": config,
+    "metrics": metrics,
+    "has_scientific_result": bool(metrics),
+    "status": status,
+}
+print(json.dumps({
+    "source": "remote_single_run_files",
+    "status": status,
+    "rows": [row],
+    "valid_results": 1 if row["has_scientific_result"] else 0,
+    "missing_results": 0 if row["has_scientific_result"] else 1,
+    "failed_results": 1 if row["state"] == "failed" else 0,
+    "partial": row["state"] == "running",
+}))
+"""
+        script = (
+            script.replace("__STATUS_PATH__", repr(status_path))
+            .replace("__RESULT_PATH__", repr(result_path))
+            .replace("__METRIC_KEYS__", repr(metric_keys))
+            .replace("__GROUP_KEYS__", repr(group_keys))
+        )
+        result = self.run(host, "python3 -c " + shlex.quote(script), timeout=self.settings.command_timeout_seconds)
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        payload["host"] = host
+        payload["command"] = result.summary()
         return payload
 
     def create_sweep(
@@ -410,3 +786,124 @@ def is_transient_ssh_error(exc: Exception) -> bool:
             "Connection timed out",
         )
     )
+
+
+ERROR_SIGNAL_PATTERNS = [
+    ("traceback", re.compile(r"Traceback \(most recent call last\):[\s\S]*?(?=\n\S|\Z)", re.MULTILINE)),
+    ("cuda_oom", re.compile(r"(?:CUDA out of memory|out of memory)", re.IGNORECASE)),
+    ("import_error", re.compile(r"(?:ModuleNotFoundError|ImportError):[^\n]+")),
+    ("file_error", re.compile(r"(?:FileNotFoundError|No such file or directory):[^\n]+")),
+    ("runtime_error", re.compile(r"RuntimeError:[^\n]+")),
+    ("wandb_error", re.compile(r"(?:wandb:[^\n]*(?:ERROR|error)[^\n]*|CommError:[^\n]+|Authentication failed[^\n]*)", re.IGNORECASE)),
+    ("command_error", re.compile(r"(?:command not found|No such file or directory|conda:|CondaError)[^\n]*", re.IGNORECASE)),
+]
+
+
+def build_failure_diagnostics(
+    *,
+    host: str,
+    remote_cwd: str,
+    sweep_path: str | None,
+    launches: list[dict[str, Any]],
+    pid_state: dict[str, Any],
+    logs: list[dict[str, Any]],
+    command: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    log_tails = []
+    signals = []
+    for item in logs:
+        if not isinstance(item, dict):
+            continue
+        tail = str(item.get("tail") or "")
+        log_tails.append({
+            "gpu_index": item.get("gpu_index"),
+            "pid": item.get("pid"),
+            "path": item.get("path"),
+            "exists": bool(item.get("exists")),
+            "tail": redact_text(tail),
+        })
+        if not item.get("exists"):
+            signals.append({
+                "kind": "missing_log",
+                "source": item.get("path"),
+                "excerpt": "agent log was not found",
+            })
+            continue
+        signals.extend(extract_error_signals(redact_text(tail), source=str(item.get("path") or "")))
+    alive = pid_state.get("alive_pids") or []
+    pgrep = pid_state.get("pgrep") or []
+    if not alive and not pgrep:
+        signals.append({
+            "kind": "agent_process_missing",
+            "source": "pid_state",
+            "excerpt": "no tracked or pgrep-matched wandb agent process is alive",
+        })
+    classification = "failure_signals_found" if signals else "no_failure_signal_found"
+    summary = summarize_failure_signals(signals)
+    return {
+        "classification": classification,
+        "summary": summary,
+        "host": host,
+        "remote_cwd": remote_cwd,
+        "sweep_path": sweep_path,
+        "sources": [item.get("path") for item in log_tails if item.get("path")],
+        "pid_state": pid_state,
+        "error_signals": signals[:20],
+        "log_tails": log_tails,
+        "launches": launches,
+        "command": command,
+        "next_actions": next_actions_for_diagnostics(signals),
+    }
+
+
+def extract_error_signals(text: str, *, source: str = "") -> list[dict[str, Any]]:
+    signals: list[dict[str, Any]] = []
+    for kind, pattern in ERROR_SIGNAL_PATTERNS:
+        for match in pattern.finditer(text):
+            excerpt = compact_excerpt(redact_text(match.group(0)))
+            if excerpt:
+                signals.append({"kind": kind, "source": source, "excerpt": excerpt})
+            if len(signals) >= 20:
+                return signals
+    return signals
+
+
+def compact_excerpt(text: str, max_chars: int = 1200) -> str:
+    cleaned = redact_text(text).strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[-max_chars:].lstrip() + "...<truncated>"
+
+
+def summarize_failure_signals(signals: list[dict[str, Any]]) -> str:
+    kinds = [str(item.get("kind")) for item in signals if item.get("kind")]
+    if not kinds:
+        return "No recognizable failure signal found in available agent log tails."
+    priority = [
+        "cuda_oom",
+        "traceback",
+        "runtime_error",
+        "import_error",
+        "file_error",
+        "wandb_error",
+        "command_error",
+        "agent_process_missing",
+        "missing_log",
+    ]
+    ordered = [kind for kind in priority if kind in kinds]
+    return redact_text("Detected " + ", ".join(ordered[:4]) + ".")
+
+
+def next_actions_for_diagnostics(signals: list[dict[str, Any]]) -> list[str]:
+    kinds = {str(item.get("kind")) for item in signals}
+    if "cuda_oom" in kinds:
+        return ["降低 batch/model 尺寸或选择更空闲 GPU；修复后对既有 sweep/job 先 stop/cancel 再重新 launch。"]
+    if {"traceback", "runtime_error", "import_error", "file_error"} & kinds:
+        return ["根据 error_signals 中的 traceback/excerpt 在本地修复代码，走 GitHub 同步后再创建新的验证 run/sweep。"]
+    if "wandb_error" in kinds:
+        return ["检查 WANDB_API_KEY、entity/project/sweep 权限与网络；修复后对同一 job 执行 recover-agents。"]
+    if "command_error" in kinds:
+        return ["检查远端 conda/env/path/program 配置；修复环境后对同一 job 执行 recover-agents。"]
+    if "agent_process_missing" in kinds:
+        return ["agent 进程已消失；查看 log_tails/error_signals 后决定修复代码或 recover-agents。"]
+    return ["没有提取到明确错误；必要时 SSH 到远端查看 sources 中的完整日志。"]

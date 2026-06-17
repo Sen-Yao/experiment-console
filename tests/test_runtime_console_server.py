@@ -49,6 +49,7 @@ def test_runtime_mounts_runner_contract(monkeypatch):
     client = TestClient(runtime.app)
     endpoints = [
         ("/api/runner/status", {"job_id": "job1"}),
+        ("/api/runner/launch-run", {"job_name": "single", "remote_config": "/project/single.yaml", "remote_host": "HCCS-25", "remote_cwd": "/project"}),
         ("/api/runner/preflight", {"remote_host": "HCCS-25", "remote_cwd": "/project"}),
         ("/api/runner/auth-check", {"job_id": "job1"}),
         ("/api/runner/pull-results", {"job_id": "job1"}),
@@ -65,6 +66,7 @@ def test_runtime_mounts_runner_contract(monkeypatch):
         assert response.json()["status"] == "ok"
     assert [call[0] for call in calls] == [
         "status_query",
+        "launch_run",
         "preflight",
         "auth_check",
         "pull_results",

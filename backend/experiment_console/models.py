@@ -27,6 +27,7 @@ def new_id(prefix: str, name: str = "") -> str:
 class IntentType(str, Enum):
     validate_config = "validate_config"
     launch_sweep = "launch_sweep"
+    launch_run = "launch_run"
     register_existing_sweep = "register_existing_sweep"
     status_query = "status_query"
     stop_job = "stop_job"
@@ -116,6 +117,36 @@ class LaunchSweepPayload(BaseModel):
 
     @model_validator(mode="after")
     def require_remote_or_local_config(self) -> "LaunchSweepPayload":
+        if not self.remote_config and not self.config_path:
+            raise ValueError("remote_config is required for production launch; config_path is only a local debug fallback")
+        return self
+
+
+class LaunchRunPayload(BaseModel):
+    job_name: str
+    remote_config: str | None = None
+    config_path: str | None = None
+    entity: str | None = None
+    project: str | None = None
+    remote_host: str | None = None
+    remote_cwd: str | None = None
+    conda_env: str | None = None
+    conda_sh: str | None = None
+    gpu_mode: Literal["auto", "strict"] = "auto"
+    gpu_index: int | None = None
+    profile: Literal["single-run"] = "single-run"
+    result_path: str | None = None
+    idempotency_key: str | None = None
+
+    @field_validator("gpu_index")
+    @classmethod
+    def non_negative_gpu_index(cls, value: int | None) -> int | None:
+        if value is not None and value < 0:
+            raise ValueError("gpu_index must be non-negative")
+        return value
+
+    @model_validator(mode="after")
+    def require_remote_or_local_config(self) -> "LaunchRunPayload":
         if not self.remote_config and not self.config_path:
             raise ValueError("remote_config is required for production launch; config_path is only a local debug fallback")
         return self
@@ -337,6 +368,8 @@ def parse_payload(intent: IntentType, payload: dict[str, Any]) -> BaseModel:
         return ValidateConfigPayload.model_validate(payload)
     if intent is IntentType.launch_sweep:
         return LaunchSweepPayload.model_validate(payload)
+    if intent is IntentType.launch_run:
+        return LaunchRunPayload.model_validate(payload)
     if intent is IntentType.register_existing_sweep:
         return RegisterExistingSweepPayload.model_validate(payload)
     if intent is IntentType.status_query:

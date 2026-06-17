@@ -19,6 +19,7 @@ from .models import (
     IntentType,
     JobRecord,
     JobStatus,
+    LaunchRunPayload,
     OperationStatus,
     TERMINAL_JOB_STATUSES,
     AuthCheckPayload,
@@ -44,7 +45,7 @@ from .planner import build_plan, confirmation_phrase
 from .redaction import redact_value
 from .ssh import SSHExecutor
 from .store import ConsoleStore
-from .validation import validate_experiment_config_text, validate_experiment_config
+from .validation import build_single_run_command, load_yaml_text, validate_experiment_config_text, validate_experiment_config
 from .wandb_client import WandBClient, WandBUnavailable
 
 
@@ -60,6 +61,7 @@ def _default_remote_config_path(remote_cwd: str, config_path: str | None) -> str
 
 MUTATING_INTENTS = {
     IntentType.launch_sweep,
+    IntentType.launch_run,
     IntentType.register_existing_sweep,
     IntentType.stop_job,
     IntentType.cancel_sweep,
@@ -322,6 +324,8 @@ class ConsoleService:
             return validate_experiment_config(path, payload.profile), None
         if isinstance(payload, LaunchSweepPayload):
             return self._launch_sweep(payload)
+        if isinstance(payload, LaunchRunPayload):
+            return self._launch_run(payload)
         if isinstance(payload, RegisterExistingSweepPayload):
             return self._register_existing_sweep(payload)
         if isinstance(payload, StatusQueryPayload):
@@ -432,6 +436,8 @@ class ConsoleService:
             return validate_experiment_config(path, parsed.profile), None
         if isinstance(parsed, LaunchSweepPayload):
             return self._launch_sweep(parsed, requested_by=requested_by, operation_id=operation_id, idempotency_key=idempotency_key)
+        if isinstance(parsed, LaunchRunPayload):
+            return self._launch_run(parsed, requested_by=requested_by, operation_id=operation_id, idempotency_key=idempotency_key)
         if isinstance(parsed, RegisterExistingSweepPayload):
             return self._register_existing_sweep(parsed, requested_by=requested_by, operation_id=operation_id, idempotency_key=idempotency_key)
         if isinstance(parsed, StatusQueryPayload):
@@ -678,6 +684,159 @@ class ConsoleService:
             wandb_api_key=self._wandb_api_key(),
         )
 
+    def _launch_run(self, payload: LaunchRunPayload, *, requested_by: str = "experiment-runner", operation_id: str | None = None, idempotency_key: str | None = None) -> tuple[dict[str, Any], JobRecord]:
+        entity = payload.entity or self.settings.default_entity
+        project = payload.project or self.settings.default_project
+        remote_host = payload.remote_host or self.settings.default_remote_host
+        remote_cwd = payload.remote_cwd or self.settings.default_remote_cwd
+        conda_env = payload.conda_env or self.settings.default_conda_env
+        conda_sh = payload.conda_sh or self.settings.default_conda_sh
+        remote_config = payload.remote_config or payload.config_path
+        if not remote_config:
+            raise ValueError("remote_config is required")
+        operation_id = operation_id or self._operation_identity(IntentType.launch_run, payload.model_dump(mode="json"))[0]
+        idempotency_key = idempotency_key or self._operation_identity(IntentType.launch_run, payload.model_dump(mode="json"))[1]
+        job = JobRecord(
+            job_id=new_id("job", payload.job_name),
+            name=payload.job_name,
+            status=JobStatus.validating,
+            operation_id=operation_id,
+            idempotency_key=idempotency_key,
+            entity=entity,
+            project=project,
+            config_path=str(remote_config),
+            remote_host=remote_host,
+            remote_cwd=remote_cwd,
+            conda_env=conda_env,
+            monitor={"kind": "single_run", "stage": "validating"},
+        )
+        self.store.upsert_job(job)
+        self._record_operation(
+            job,
+            operation_id=operation_id,
+            intent=IntentType.launch_run,
+            requested_by=requested_by,
+            idempotency_key=idempotency_key,
+            stage="accepted",
+            classification="accepted",
+            status=OperationStatus.accepted.value,
+            result={"stage": "accepted", "classification": "accepted", "created_new_sweep": False, "job_id": job.job_id},
+            retry_after_seconds=2,
+        )
+        remote_snapshot = self.ssh.read_remote_file(host=remote_host, remote_path=remote_config)
+        validation = validate_experiment_config_text(remote_snapshot["text"], "single-run", path_label=remote_config)
+        command_spec = build_single_run_command(load_yaml_text(remote_snapshot["text"]))
+        job.monitor.update({"validation": validation, "run_command": command_spec, "stage": "validating"})
+        self.store.upsert_job(job)
+        preflight = self.ssh.preflight(
+            host=remote_host,
+            remote_cwd=remote_cwd,
+            conda_env=conda_env,
+            conda_sh=conda_sh,
+            config_path=remote_config,
+        )
+        gpu_probe = self.ssh.probe_gpus(remote_host)
+        eligible = [gpu for gpu in gpu_probe.get("gpus", []) if gpu.get("eligible")]
+        selected_gpu = None
+        if payload.gpu_index is not None:
+            selected_gpu = next((gpu for gpu in gpu_probe.get("gpus", []) if int(gpu.get("index")) == payload.gpu_index), None)
+            if selected_gpu is None:
+                raise ValueError(f"gpu_index {payload.gpu_index} not found on {remote_host}")
+            if payload.gpu_mode == "strict" and not selected_gpu.get("eligible"):
+                raise ValueError(f"gpu_index {payload.gpu_index} is not eligible")
+        elif eligible:
+            selected_gpu = eligible[0]
+        elif payload.gpu_mode == "strict":
+            raise ValueError("no eligible GPU for single-run launch")
+        else:
+            raise ValueError("no eligible GPU for single-run launch")
+        auth = self.ssh.auth_check(
+            host=remote_host,
+            remote_cwd=remote_cwd,
+            sweep_path=None,
+            wandb_api_key=self._wandb_api_key(),
+        )
+        self._record_operation(
+            job,
+            operation_id=operation_id,
+            intent=IntentType.launch_run,
+            requested_by=requested_by,
+            idempotency_key=idempotency_key,
+            stage="preflight",
+            classification="accepted",
+            status=OperationStatus.executing.value,
+            result={
+                "stage": "preflight",
+                "classification": "accepted",
+                "validation": validation,
+                "preflight": preflight,
+                "gpu_probe": gpu_probe,
+                "selected_gpu": selected_gpu.get("index"),
+                "created_new_sweep": False,
+            },
+            retry_after_seconds=2,
+        )
+        launch = self.ssh.launch_run(
+            host=remote_host,
+            remote_cwd=remote_cwd,
+            job_id=job.job_id,
+            argv=command_spec["argv"],
+            gpu_index=int(selected_gpu["index"]),
+            conda_env=conda_env,
+            conda_sh=conda_sh,
+            wandb_api_key=self._wandb_api_key(),
+            result_path=payload.result_path,
+        )
+        job.agent_pids = [launch["pid"]] if launch.get("pid") else []
+        job.status = JobStatus.running if job.agent_pids else JobStatus.attention
+        classification = "run_running" if job.agent_pids else "run_started_unverified"
+        job.monitor.update({
+            "kind": "single_run",
+            "validation": validation,
+            "preflight": preflight,
+            "auth": auth,
+            "gpu_probe": gpu_probe,
+            "run": launch,
+            "stage": "done",
+            "classification": classification,
+        })
+        self.store.upsert_job(job)
+        self._record_operation(
+            job,
+            operation_id=operation_id,
+            intent=IntentType.launch_run,
+            requested_by=requested_by,
+            idempotency_key=idempotency_key,
+            stage="done",
+            classification=classification,
+            status=OperationStatus.succeeded.value if job.agent_pids else OperationStatus.executing.value,
+            result={
+                "stage": "done",
+                "classification": classification,
+                "created_new_sweep": False,
+                "job_id": job.job_id,
+                "validation": validation,
+                "preflight": preflight,
+                "auth": auth,
+                "gpu_probe": gpu_probe,
+                "run": launch,
+                "next_actions": ["使用 status/watchdog-once 监控单次运行；完成后用 pull-results 拉取结果。"],
+            },
+            retry_after_seconds=2,
+        )
+        return {
+            "stage": "done",
+            "classification": classification,
+            "created_new_sweep": False,
+            "job_id": job.job_id,
+            "validation": validation,
+            "preflight": preflight,
+            "auth": auth,
+            "gpu_probe": gpu_probe,
+            "run": launch,
+            "next_actions": ["使用 status/watchdog-once 监控单次运行；完成后用 pull-results 拉取结果。"],
+        }, job
+
     def _register_existing_sweep(self, payload: RegisterExistingSweepPayload, *, requested_by: str = "experiment-runner", operation_id: str | None = None, idempotency_key: str | None = None) -> tuple[dict[str, Any], JobRecord]:
         entity = payload.entity or self.settings.default_entity
         project = payload.project or self.settings.default_project
@@ -763,6 +922,21 @@ class ConsoleService:
         entity = (job.entity if job else None) or self.settings.default_entity
         project = (job.project if job else None) or self.settings.default_project
         sweep_id = payload.sweep_id or (job.sweep_id if job else None)
+        run_status = None
+        if job and job.monitor.get("kind") == "single_run":
+            run_meta = job.monitor.get("run") if isinstance(job.monitor.get("run"), dict) else {}
+            status_path = run_meta.get("status_path")
+            if status_path and job.remote_host:
+                try:
+                    run_status = self.ssh.check_run_status(host=job.remote_host, status_path=status_path, pids=job.agent_pids)
+                    next_status = map_single_run_state_to_job_status(run_status)
+                    try:
+                        job = self.store.update_job_status(job.job_id, next_status, {"last_run_status": compact_single_run_status(run_status)})
+                    except Exception:
+                        job.monitor["last_run_status"] = compact_single_run_status(run_status)
+                        self.store.upsert_job(job)
+                except Exception as exc:
+                    run_status = {"classification": "run_status_unavailable", "error": compact_error(exc)}
         sweep = None
         degraded = None
         if sweep_id:
@@ -783,13 +957,63 @@ class ConsoleService:
         agent_launches = []
         if job:
             agent_launches = list(job.monitor.get("agent_launches") or job.monitor.get("recover_agent_launches") or [])
+            if job.monitor.get("kind") == "single_run" and isinstance(job.monitor.get("run"), dict):
+                agent_launches = [job.monitor["run"]]
         if not agent_launches and job and job.agent_pids:
             agent_launches = [{"pid": pid, "state": "unknown"} for pid in job.agent_pids]
+        sweep_path = None
+        if job and job.entity and job.project and job.sweep_id:
+            sweep_path = str(job.monitor.get("sweep_path") or f"{job.entity}/{job.project}/{job.sweep_id}")
+        agent_probe = None
+        if job and job.monitor.get("kind") != "single_run" and job.remote_host and (job.agent_pids or sweep_path):
+            try:
+                agent_probe = self.ssh.check_agent_processes(
+                    host=job.remote_host,
+                    sweep_path=sweep_path,
+                    pids=job.agent_pids,
+                )
+                job.monitor["last_agent_probe"] = compact_agent_probe(agent_probe)
+                self.store.upsert_job(job)
+            except Exception as exc:
+                agent_probe = {"classification": "agent_probe_unavailable", "error": compact_error(exc)}
         agent_health = "unknown"
-        if job and job.status == JobStatus.running:
+        if job and job.monitor.get("kind") == "single_run" and isinstance(run_status, dict):
+            alive = run_status.get("alive_pids") or []
+            if run_status.get("exit_code") == 0:
+                agent_health = "terminal"
+            elif run_status.get("exit_code") is not None:
+                agent_health = "failed"
+            elif alive:
+                agent_health = "running"
+            elif run_status.get("missing"):
+                agent_health = "missing"
+            else:
+                agent_health = "unknown"
+        elif job and isinstance(agent_probe, dict) and not agent_probe.get("classification"):
+            if agent_probe.get("alive_pids") or agent_probe.get("pgrep"):
+                agent_health = "running"
+            elif job.status == JobStatus.running and agent_launches:
+                agent_health = "missing"
+            elif job.status in TERMINAL_JOB_STATUSES:
+                agent_health = "terminal"
+            else:
+                agent_health = "unknown"
+        elif job and job.status == JobStatus.running:
             agent_health = "running" if agent_launches else "missing"
         elif job and job.status in TERMINAL_JOB_STATUSES:
             agent_health = "terminal"
+        failure_diagnostics = None
+        if should_collect_failure_diagnostics(job, sweep, agent_health, degraded):
+            failure_diagnostics = self._collect_failure_diagnostics(
+                job=job,
+                agent_launches=agent_launches,
+                sweep_path=sweep_path,
+            )
+            if failure_diagnostics:
+                job.monitor["last_failure_diagnostics"] = compact_failure_diagnostics(failure_diagnostics)
+                self.store.upsert_job(job)
+        elif job and isinstance(job.monitor.get("last_failure_diagnostics"), dict):
+            failure_diagnostics = job.monitor["last_failure_diagnostics"]
         result_pull = job.monitor.get("last_result_pull") if job else None
         result_readiness = "unknown"
         if isinstance(result_pull, dict):
@@ -820,14 +1044,17 @@ class ConsoleService:
                 "health": agent_health,
                 "launches": agent_launches,
                 "pids": list(job.agent_pids) if job else [],
+                "probe": compact_agent_probe(agent_probe) if isinstance(agent_probe, dict) else None,
             },
             "results": {
                 "readiness": result_readiness,
                 "last_pull": result_pull,
             },
+            "failure_diagnostics": failure_diagnostics,
             "state": {
                 "job_status": job.status.value if job else None,
                 "wandb_sweep_status": sweep.get("state") if sweep else None,
+                "run_status": run_status,
                 "agent_health": agent_health,
                 "result_readiness": result_readiness,
             },
@@ -838,8 +1065,11 @@ class ConsoleService:
 
     def _stop(self, payload: StopJobPayload, *, requested_by: str = "experiment-runner", operation_id: str | None = None, idempotency_key: str | None = None) -> tuple[dict[str, Any], JobRecord]:
         job = self._require_job(payload.job_id)
-        if not job.sweep_id or not job.entity or not job.project or not job.remote_host:
+        is_single_run = job.monitor.get("kind") == "single_run"
+        if not is_single_run and (not job.sweep_id or not job.entity or not job.project or not job.remote_host):
             raise ValueError("job lacks sweep/remote metadata required for stop")
+        if is_single_run and not job.remote_host:
+            raise ValueError("job lacks remote metadata required for stop")
         operation_id = operation_id or self._operation_identity(IntentType.stop_job, payload.model_dump(mode="json"))[0]
         idempotency_key = idempotency_key or self._operation_identity(IntentType.stop_job, payload.model_dump(mode="json"))[1]
         self._record_operation(
@@ -856,7 +1086,10 @@ class ConsoleService:
         )
         result = {"cancel_wandb_requested": payload.cancel_wandb, "cancel_wandb_implemented": False}
         if payload.kill_agents:
-            result["stop_agents"] = self.ssh.stop_agents(host=job.remote_host, sweep_path=f"{job.entity}/{job.project}/{job.sweep_id}", pids=job.agent_pids)
+            if is_single_run:
+                result["stop_run"] = self.ssh.stop_pids(host=job.remote_host, pids=job.agent_pids)
+            else:
+                result["stop_agents"] = self.ssh.stop_agents(host=job.remote_host, sweep_path=f"{job.entity}/{job.project}/{job.sweep_id}", pids=job.agent_pids)
         job = self.store.update_job_status(job.job_id, JobStatus.cancelled, {"stop_result": result})
         self._record_operation(
             job,
@@ -870,6 +1103,37 @@ class ConsoleService:
             result={"stage": "done", "classification": "job_cancelled", "job_id": job.job_id, **result},
         )
         return {"stage": "done", "classification": "job_cancelled", "job_id": job.job_id, **result}, job
+
+    def _collect_failure_diagnostics(
+        self,
+        *,
+        job: JobRecord | None,
+        agent_launches: list[dict[str, Any]],
+        sweep_path: str | None,
+    ) -> dict[str, Any] | None:
+        if not job or not job.remote_host or not job.remote_cwd:
+            return None
+        if not agent_launches and not job.agent_pids:
+            return None
+        try:
+            diagnostics = self.ssh.diagnose_agent_failure(
+                host=job.remote_host,
+                remote_cwd=job.remote_cwd,
+                launches=agent_launches,
+                pids=job.agent_pids,
+                sweep_path=sweep_path,
+                tail_lines=200,
+            )
+            diagnostics["collected_at"] = utc_now()
+            return diagnostics
+        except Exception as exc:
+            return {
+                "classification": "diagnostics_unavailable",
+                "summary": "Failed to collect remote agent diagnostics.",
+                "error": compact_error(exc),
+                "collected_at": utc_now(),
+                "next_actions": ["确认远端 host/cwd 可达后重试 status/watchdog-once。"],
+            }
 
     def _cancel_sweep(self, payload: CancelSweepPayload, *, requested_by: str = "experiment-runner", operation_id: str | None = None, idempotency_key: str | None = None) -> dict[str, Any]:
         entity = payload.entity or self.settings.default_entity
@@ -1263,6 +1527,7 @@ class ConsoleService:
             "terminal_disable_requested": payload.terminal_disable,
             "operation": status_result.get("operation"),
             "operation_history": status_result.get("operation_history"),
+            "failure_diagnostics": status_result.get("failure_diagnostics"),
             "status_result": status_result,
         }
         job_record = self.store.get_job(payload.job_id)
@@ -1331,8 +1596,11 @@ class ConsoleService:
         sweep_id = payload.sweep_id or (job.sweep_id if job else None)
         remote_host = payload.remote_host or (job.remote_host if job else None) or self.settings.default_remote_host
         remote_cwd = payload.remote_cwd or (job.remote_cwd if job else None) or self.settings.default_remote_cwd
+        is_single_run = bool(job and job.monitor.get("kind") == "single_run")
+        run_meta = job.monitor.get("run") if job and isinstance(job.monitor.get("run"), dict) else {}
         if not sweep_id:
-            raise ValueError("sweep_id is required for pull-results")
+            if not is_single_run:
+                raise ValueError("sweep_id is required for pull-results")
         operation_id = operation_id or self._operation_identity(IntentType.pull_results, payload.model_dump(mode="json"))[0]
         idempotency_key = idempotency_key or self._operation_identity(IntentType.pull_results, payload.model_dump(mode="json"))[1]
         if job:
@@ -1354,6 +1622,34 @@ class ConsoleService:
                 },
                 retry_after_seconds=2,
             )
+        if is_single_run:
+            if not remote_host:
+                raise ValueError("remote_host is required for single-run pull-results")
+            status_path = run_meta.get("status_path")
+            result_path = run_meta.get("result_path")
+            if not status_path:
+                raise ValueError("single-run status_path is missing")
+            result = self.ssh.pull_single_run_result(
+                host=remote_host,
+                status_path=status_path,
+                result_path=result_path,
+                metric_keys=payload.metric_keys,
+                group_keys=payload.group_keys,
+            )
+            if job:
+                job.monitor["last_result_pull"] = summarize_result_pull(result)
+                self._record_operation(
+                    job,
+                    operation_id=operation_id,
+                    intent=IntentType.pull_results,
+                    requested_by=requested_by,
+                    idempotency_key=idempotency_key,
+                    stage="done",
+                    classification="ok" if result.get("valid_results", 0) else "no_scientific_results_yet",
+                    status=OperationStatus.succeeded.value,
+                    result={"stage": "done", "classification": "ok" if result.get("valid_results", 0) else "no_scientific_results_yet", "entity": entity, "project": project, **result},
+                )
+            return {"stage": "done", "classification": "ok" if result.get("valid_results", 0) else "no_scientific_results_yet", "entity": entity, "project": project, **result}
         if not remote_host or not remote_cwd:
             if payload.allow_partial:
                 result = self._pull_results_from_wandb(entity, project, sweep_id, payload)
@@ -1579,6 +1875,20 @@ def map_wandb_state_to_job_status(state: str | None) -> JobStatus:
     return JobStatus.unknown
 
 
+def map_single_run_state_to_job_status(status: dict[str, Any] | None) -> JobStatus:
+    if not isinstance(status, dict):
+        return JobStatus.unknown
+    if status.get("exit_code") == 0:
+        return JobStatus.finished
+    if status.get("exit_code") is not None:
+        return JobStatus.failed
+    if status.get("alive_pids"):
+        return JobStatus.running
+    if status.get("missing"):
+        return JobStatus.attention
+    return JobStatus.unknown
+
+
 def count_jobs(jobs: list[JobRecord]) -> dict[str, int]:
     counts = {status.value: 0 for status in JobStatus}
     for job in jobs:
@@ -1613,11 +1923,81 @@ def summarize_result_pull(result: dict[str, Any]) -> dict[str, Any]:
     return {
         "source": result.get("source"),
         "sweep_id": result.get("sweep_id"),
+        "run_id": result.get("status", {}).get("job_id") if isinstance(result.get("status"), dict) else None,
         "valid_results": result.get("valid_results"),
         "missing_results": result.get("missing_results"),
         "failed_results": result.get("failed_results"),
         "partial": result.get("partial"),
         "generated_at": utc_now(),
+    }
+
+
+def compact_single_run_status(status: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: status.get(key)
+        for key in ["job_id", "pid", "child_pid", "started_at", "finished_at", "exit_code", "log_path", "status_path", "result_path", "alive_pids", "missing"]
+        if key in status
+    }
+
+
+def should_collect_failure_diagnostics(
+    job: JobRecord | None,
+    sweep: dict[str, Any] | None,
+    agent_health: str,
+    degraded: str | None,
+) -> bool:
+    if not job:
+        return False
+    if degraded:
+        return False
+    if job.monitor.get("kind") == "single_run":
+        return agent_health in {"failed", "missing"}
+    sweep_state = str((sweep or {}).get("state") or "").lower()
+    if job.status in {JobStatus.attention, JobStatus.failed}:
+        return True
+    if sweep_state in {"failed", "crashed", "killed"}:
+        return True
+    return agent_health in {"missing", "failed", "degraded"}
+
+
+def compact_agent_probe(probe: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(probe, dict):
+        return None
+    return {
+        key: probe.get(key)
+        for key in ["host", "sweep_path", "tracked_pids", "alive_pids", "pgrep", "classification", "error"]
+        if key in probe
+    }
+
+
+def compact_failure_diagnostics(diagnostics: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(diagnostics, dict):
+        return None
+    log_tails = []
+    for item in diagnostics.get("log_tails") or []:
+        if not isinstance(item, dict):
+            continue
+        tail = str(item.get("tail") or "")
+        log_tails.append({
+            "gpu_index": item.get("gpu_index"),
+            "pid": item.get("pid"),
+            "path": item.get("path"),
+            "exists": item.get("exists"),
+            "tail": tail[-12000:],
+        })
+    return {
+        "classification": diagnostics.get("classification"),
+        "summary": diagnostics.get("summary"),
+        "host": diagnostics.get("host"),
+        "remote_cwd": diagnostics.get("remote_cwd"),
+        "sweep_path": diagnostics.get("sweep_path"),
+        "sources": list(diagnostics.get("sources") or []),
+        "pid_state": diagnostics.get("pid_state"),
+        "error_signals": list(diagnostics.get("error_signals") or [])[:20],
+        "log_tails": log_tails[:8],
+        "collected_at": diagnostics.get("collected_at"),
+        "error": diagnostics.get("error"),
+        "next_actions": list(diagnostics.get("next_actions") or []),
     }
 
 
@@ -1634,9 +2014,19 @@ def compact_job_record(job: JobRecord) -> dict[str, Any]:
         "last_watchdog",
         "cron",
         "watchdog",
+        "kind",
+        "run",
+        "last_run_status",
+        "last_agent_probe",
+        "last_failure_diagnostics",
     ]:
         if key in monitor:
-            compact_monitor[key] = monitor[key]
+            if key == "last_failure_diagnostics":
+                compact_monitor[key] = compact_failure_diagnostics(monitor[key])
+            elif key == "last_agent_probe":
+                compact_monitor[key] = compact_agent_probe(monitor[key])
+            else:
+                compact_monitor[key] = monitor[key]
     last_status = monitor.get("last_wandb_status")
     if isinstance(last_status, dict):
         compact_monitor["last_wandb_status"] = compact_sweep_status(last_status, include_runs=True)
@@ -1681,13 +2071,16 @@ def compact_operation(operation: dict[str, Any] | None) -> dict[str, Any] | None
         "run_count",
         "expected_run_count",
         "agent_health",
+        "run",
+        "status",
         "silent",
         "event",
         "message",
         "success",
+        "failure_diagnostics",
     ]:
         if key in result:
-            compact_result[key] = result[key]
+            compact_result[key] = compact_failure_diagnostics(result[key]) if key == "failure_diagnostics" else result[key]
     if "sweep" in result and isinstance(result["sweep"], dict):
         compact_result["sweep"] = compact_sweep_status(result["sweep"], include_runs=True)
     if "auth" in result and isinstance(result["auth"], dict):

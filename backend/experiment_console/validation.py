@@ -31,6 +31,37 @@ def _values_for(spec: Any) -> list[Any]:
     return []
 
 
+def _single_value_for(spec: Any, key: str) -> Any:
+    values = _values_for(spec)
+    if not values:
+        raise ConfigValidationError(f"single-run parameter {key} must use value or single-element values")
+    if len(values) != 1:
+        raise ConfigValidationError(f"single-run parameter {key} must have exactly one value, got {values}")
+    return values[0]
+
+
+def build_single_run_command(config: dict[str, Any]) -> dict[str, Any]:
+    program = config.get("program")
+    if not program:
+        raise ConfigValidationError("single-run config requires program")
+    params = config.get("parameters") or {}
+    if not isinstance(params, dict):
+        raise ConfigValidationError("parameters must be a mapping")
+    argv = ["python", str(program)]
+    values: dict[str, Any] = {}
+    for key in sorted(params.keys()):
+        value = _single_value_for(params[key], str(key))
+        values[str(key)] = value
+        if isinstance(value, bool):
+            if value:
+                argv.append(f"--{str(key).replace('_', '-')}")
+            continue
+        if value is None:
+            continue
+        argv.extend([f"--{str(key).replace('_', '-')}", str(value)])
+    return {"program": str(program), "parameters": values, "argv": argv}
+
+
 def expected_run_count(config: dict[str, Any]) -> int:
     params = config.get("parameters") or {}
     if not isinstance(params, dict):
@@ -62,6 +93,11 @@ def validate_config_data(cfg: dict[str, Any], profile: str = "sweep", *, path_la
         dataset_values = _values_for(params.get("dataset")) if isinstance(params, dict) else []
         if len(dataset_values) > 1:
             errors.append("formal sweep profile requires a single dataset")
+    if profile == "single-run":
+        try:
+            run_command = build_single_run_command(cfg)
+        except ConfigValidationError as exc:
+            errors.append(str(exc))
     if not cfg.get("program"):
         warnings.append("config has no program field; remote agent will rely on W&B defaults")
     if not cfg.get("name"):
@@ -78,6 +114,7 @@ def validate_config_data(cfg: dict[str, Any], profile: str = "sweep", *, path_la
         "program": cfg.get("program"),
         "name": cfg.get("name"),
         "expected_run_count": expected_run_count(cfg),
+        "run_command": run_command if profile == "single-run" and "run_command" in locals() else None,
         "warnings": warnings,
     }
 

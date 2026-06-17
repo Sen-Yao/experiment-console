@@ -116,6 +116,7 @@ Environment variables:
 - `GET /api/hosts/gpus?host=gpu-host-1`
 - `POST /api/runner/validate-config`
 - `POST /api/runner/launch-sweep`
+- `POST /api/runner/launch-run`
 - `POST /api/runner/register-existing-sweep`
 - `POST /api/runner/status`
 - `POST /api/runner/recover-agents`

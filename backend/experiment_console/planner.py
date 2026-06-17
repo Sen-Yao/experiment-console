@@ -7,6 +7,7 @@ from .models import (
     AuthCheckPayload,
     CancelSweepPayload,
     IntentType,
+    LaunchRunPayload,
     LaunchSweepPayload,
     PreflightPayload,
     PullResultsPayload,
@@ -72,6 +73,33 @@ def build_plan(intent: IntentType, payload: dict, settings: Settings) -> Executi
             commands=commands,
             warnings=["P0 does not schedule cron/watchdog or aggregate results."],
             expected_side_effects=["Create a W&B sweep", "Start remote wandb agent processes", "Write local job/audit state"],
+        )
+    if isinstance(parsed, LaunchRunPayload):
+        commands = [
+            CommandPreview(
+                label="validate_single_run_config",
+                argv=["local-validator", "--profile", "single-run", "--config", parsed.config_path or parsed.remote_config or "<remote_config>"],
+                reason="Validate that the config expands to exactly one training command.",
+            ),
+            CommandPreview(
+                label="remote_preflight",
+                argv=["ssh", parsed.remote_host or settings.default_remote_host, "check cwd/python/wandb/nvidia-smi/conda"],
+                host=parsed.remote_host or settings.default_remote_host,
+                reason="Verify the target host before starting a managed run.",
+            ),
+            CommandPreview(
+                label="launch_single_run",
+                argv=["ssh", parsed.remote_host or settings.default_remote_host, "cd <remote_cwd> && nohup <single-run command> ..."],
+                host=parsed.remote_host or settings.default_remote_host,
+                reason="Start one background training process and record pid/log/status metadata.",
+                side_effect=True,
+            ),
+        ]
+        return ExecutionPlan(
+            summary=f"Launch single run {parsed.job_name} on {parsed.remote_host or settings.default_remote_host}.",
+            risk_level="remote_side_effect",
+            commands=commands,
+            expected_side_effects=["Start one remote training process", "Write local job/audit state"],
         )
     if isinstance(parsed, RegisterExistingSweepPayload):
         return ExecutionPlan(
