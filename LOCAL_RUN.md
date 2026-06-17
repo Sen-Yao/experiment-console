@@ -1,6 +1,6 @@
 # Experiment Console Local Run
 
-Last verified: 2026-06-16 on Oliver's MacBook Pro via Codex.
+Last verified: 2026-06-17 on Oliver's MacBook Pro via Codex.
 
 ## Scope
 
@@ -129,6 +129,12 @@ job_20260616_072248_prod_matguardgt_best_vega_block_spmm_repro_5seed_b9950df0
 ```
 
 This job is a registered existing sweep for the completed best-Vega 5-seed reproduction. It should be used for status and pull-results smoke tests; do not launch a new production sweep for local runtime verification.
+
+Current deployed console commit:
+
+```text
+d38eb99
+```
 
 Console-owned agent health check:
 
