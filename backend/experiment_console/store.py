@@ -181,18 +181,36 @@ class ConsoleStore:
         config_path: str,
         remote_host: str,
         remote_cwd: str,
+        kind: str | None = None,
     ) -> JobRecord | None:
+        jobs = self.find_jobs_by_launch_identity(
+            name=name,
+            config_path=config_path,
+            remote_host=remote_host,
+            remote_cwd=remote_cwd,
+        )
+        if kind:
+            return next((job for job in jobs if infer_job_kind(job) == kind), None)
+        return jobs[0] if jobs else None
+
+    def find_jobs_by_launch_identity(
+        self,
+        *,
+        name: str,
+        config_path: str,
+        remote_host: str,
+        remote_cwd: str,
+    ) -> list[JobRecord]:
         with self._connect() as conn:
-            row = conn.execute(
+            rows = conn.execute(
                 """
                 SELECT * FROM jobs
                 WHERE name = ? AND config_path = ? AND remote_host = ? AND remote_cwd = ?
                 ORDER BY created_at DESC
-                LIMIT 1
                 """,
                 (name, config_path, remote_host, remote_cwd),
-            ).fetchone()
-        return self._job_from_row(row) if row else None
+            ).fetchall()
+        return [self._job_from_row(row) for row in rows]
 
     def find_job_by_sweep(self, entity: str, project: str, sweep_id: str) -> JobRecord | None:
         with self._connect() as conn:
@@ -284,3 +302,14 @@ class ConsoleStore:
         if monitor:
             job.monitor.update(monitor)
         return self.upsert_job(job)
+
+
+def infer_job_kind(job: JobRecord) -> str:
+    monitor_kind = str((job.monitor or {}).get("kind") or "")
+    if monitor_kind == "single_run":
+        return "single_run"
+    if monitor_kind in {"sweep", "wandb_sweep"}:
+        return "sweep"
+    if job.sweep_id:
+        return "sweep"
+    return "unknown"

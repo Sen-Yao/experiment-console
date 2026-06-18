@@ -4,7 +4,6 @@ import json
 import hashlib
 import os
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 from .command import CommandFailed
@@ -44,7 +43,7 @@ from .models import (
 from .planner import build_plan, confirmation_phrase
 from .redaction import redact_value
 from .ssh import SSHExecutor
-from .store import ConsoleStore
+from .store import ConsoleStore, infer_job_kind
 from .sweep_telemetry import (
     enrich_sweeps_with_telemetry,
     load_telemetry_cache,
@@ -57,12 +56,6 @@ from .wandb_client import WandBClient, WandBUnavailable
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def _default_remote_config_path(remote_cwd: str, config_path: str | None) -> str:
-    if config_path:
-        return config_path
-    return f"{remote_cwd.rstrip('/')}/.experiment-console/configs/sweep.yaml"
 
 
 MUTATING_INTENTS = {
@@ -93,6 +86,11 @@ REPLAY_SAFE_INTENTS = {
 
 
 OPEN_OPERATION_STATUSES = {OperationStatus.accepted.value, OperationStatus.executing.value}
+
+
+SINGLE_RUN_BOUNDARY_NEXT_ACTIONS = [
+    "launch-run 只接受所有参数均为单值的 single-run 配置；这个配置会展开成多次运行，请改用 launch-sweep。",
+]
 
 
 class ConsoleService:
@@ -246,6 +244,52 @@ class ConsoleService:
                 "next_actions": ["使用 status 查询 ledger；修复环境后用相同 idempotency_key 重试会回放该 operation。"],
             },
         )
+
+    def _fail_launch_job(
+        self,
+        job: JobRecord,
+        *,
+        intent: IntentType,
+        operation_id: str,
+        requested_by: str,
+        idempotency_key: str,
+        stage: str,
+        classification: str,
+        exc: Exception,
+        next_actions: list[str],
+        status: JobStatus = JobStatus.failed,
+        extra_result: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], JobRecord]:
+        error = compact_error(exc)
+        job.status = status
+        job.monitor.update({
+            "stage": stage,
+            "classification": classification,
+            "error": error,
+        })
+        self.store.upsert_job(job)
+        result = {
+            "stage": stage,
+            "classification": classification,
+            "created_new_sweep": False,
+            "job_id": job.job_id,
+            "error": error,
+            "next_actions": next_actions,
+        }
+        if extra_result:
+            result.update(extra_result)
+        self._record_operation(
+            job,
+            operation_id=operation_id,
+            intent=intent,
+            requested_by=requested_by,
+            idempotency_key=idempotency_key,
+            stage=stage,
+            classification=classification,
+            status=OperationStatus.failed.value,
+            result=result,
+        )
+        return result, job
 
     def preview(self, request: IntentPreviewRequest) -> tuple[IntentRecord, bool]:
         parse_payload(request.intent, request.payload)
@@ -487,17 +531,17 @@ class ConsoleService:
         remote_cwd = payload.remote_cwd or self.settings.default_remote_cwd
         conda_env = payload.conda_env or self.settings.default_conda_env
         conda_sh = payload.conda_sh or self.settings.default_conda_sh
-        remote_config = payload.remote_config or payload.config_path
-        if not remote_config:
-            raise ValueError("remote_config is required")
+        remote_config_path = payload.config_path
         operation_id = operation_id or self._operation_identity(IntentType.launch_sweep, payload.model_dump(mode="json"))[0]
         idempotency_key = idempotency_key or self._operation_identity(IntentType.launch_sweep, payload.model_dump(mode="json"))[1]
-        existing = self.store.find_job_by_launch_identity(
+        matching_jobs = self.store.find_jobs_by_launch_identity(
             name=payload.job_name,
-            config_path=str(remote_config),
+            config_path=str(remote_config_path),
             remote_host=remote_host,
             remote_cwd=remote_cwd,
         )
+        conflicting_jobs = [job for job in matching_jobs if infer_job_kind(job) not in {"sweep"}]
+        existing = next((job for job in matching_jobs if infer_job_kind(job) == "sweep"), None)
         if existing:
             if not self._current_operation(existing):
                 self._record_operation(
@@ -532,11 +576,22 @@ class ConsoleService:
             idempotency_key=idempotency_key,
             entity=entity,
             project=project,
-            config_path=str(remote_config),
+            config_path=str(remote_config_path),
             remote_host=remote_host,
             remote_cwd=remote_cwd,
             conda_env=conda_env,
-            monitor={"stage": "validating"},
+            monitor={
+                "kind": "sweep",
+                "stage": "validating",
+                "launch_identity_conflicts": [
+                    {
+                        "job_id": conflict.job_id,
+                        "kind": infer_job_kind(conflict),
+                        "status": conflict.status.value,
+                    }
+                    for conflict in conflicting_jobs[:5]
+                ],
+            },
         )
         self.store.upsert_job(job)
         self._record_operation(
@@ -552,30 +607,49 @@ class ConsoleService:
                 "stage": "accepted",
                 "classification": "accepted",
                 "created_new_sweep": False,
+                "launch_identity_conflicts": job.monitor.get("launch_identity_conflicts") or [],
                 "next_actions": ["Console 正在执行 launch-sweep，稍后再用 status 查询进度。"],
             },
             retry_after_seconds=2,
         )
         try:
-            remote_snapshot = self.ssh.read_remote_file(host=remote_host, remote_path=remote_config)
-            validation = validate_experiment_config_text(remote_snapshot["text"], payload.profile, path_label=remote_config)
+            remote_snapshot = self.ssh.read_remote_file(host=remote_host, remote_path=remote_config_path)
+            validation = validate_experiment_config_text(remote_snapshot["text"], payload.profile, path_label=remote_config_path)
         except Exception as exc:
-            job.status = JobStatus.failed
-            job.monitor.update({
-                "stage": "validation_failed",
-                "validation_error": compact_error(exc),
-            })
-            self.store.upsert_job(job)
-            raise
+            return self._fail_launch_job(
+                job,
+                intent=IntentType.launch_sweep,
+                operation_id=operation_id,
+                requested_by=requested_by,
+                idempotency_key=idempotency_key,
+                stage="validation_failed",
+                classification="validation_failed",
+                exc=exc,
+                next_actions=["修复 sweep 配置或远端 config 路径后，再重新 launch-sweep。"],
+            )
         job.monitor.update({"validation": validation, "stage": "validating"})
         self.store.upsert_job(job)
-        preflight = self.ssh.preflight(
-            host=remote_host,
-            remote_cwd=remote_cwd,
-            conda_env=conda_env,
-            conda_sh=conda_sh,
-            config_path=remote_config,
-        )
+        try:
+            preflight = self.ssh.preflight(
+                host=remote_host,
+                remote_cwd=remote_cwd,
+                conda_env=conda_env,
+                conda_sh=conda_sh,
+                config_path=remote_config_path,
+            )
+        except Exception as exc:
+            return self._fail_launch_job(
+                job,
+                intent=IntentType.launch_sweep,
+                operation_id=operation_id,
+                requested_by=requested_by,
+                idempotency_key=idempotency_key,
+                stage="preflight_failed",
+                classification="preflight_incomplete",
+                exc=exc,
+                next_actions=["修复远端环境、路径或依赖后，再重新 launch-sweep。"],
+                extra_result={"validation": validation},
+            )
         job.monitor.update({"preflight": preflight, "stage": "creating_sweep"})
         self.store.upsert_job(job)
         self._record_operation(
@@ -595,7 +669,21 @@ class ConsoleService:
             },
             retry_after_seconds=2,
         )
-        sweep = self._create_sweep(Path(remote_config), entity=entity, project=project, payload=payload)
+        try:
+            sweep = self._create_sweep(remote_config_path, entity=entity, project=project, payload=payload)
+        except Exception as exc:
+            return self._fail_launch_job(
+                job,
+                intent=IntentType.launch_sweep,
+                operation_id=operation_id,
+                requested_by=requested_by,
+                idempotency_key=idempotency_key,
+                stage="create_sweep_failed",
+                classification="control_plane_error",
+                exc=exc,
+                next_actions=["检查 W&B sweep 创建错误和远端 config 后，再重新 launch-sweep。"],
+                extra_result={"validation": validation, "preflight": preflight},
+            )
         job.sweep_id = sweep["sweep_id"]
         existing_sweep_job = self.store.find_job_by_sweep(entity, project, job.sweep_id)
         if existing_sweep_job and existing_sweep_job.job_id != job.job_id:
@@ -623,29 +711,44 @@ class ConsoleService:
                 "sweep": sweep,
                 "next_actions": ["既有 job 已登记该 sweep；如需 agent 请 recover-agents。"],
             }, existing_sweep_job
-        gpu_probe = self.ssh.probe_gpus(remote_host)
-        eligible = [gpu for gpu in gpu_probe["gpus"] if gpu["eligible"]]
-        if payload.max_agents is not None:
-            eligible = eligible[:payload.max_agents]
-        launches = []
-        sweep_path = f"{entity}/{project}/{job.sweep_id}"
-        wandb_api_key = self._wandb_api_key()
-        auth = self.ssh.auth_check(
-            host=remote_host,
-            remote_cwd=remote_cwd,
-            sweep_path=sweep_path,
-            wandb_api_key=wandb_api_key,
-        )
-        for gpu in eligible:
-            launches.append(self.ssh.launch_agent(
+        try:
+            gpu_probe = self.ssh.probe_gpus(remote_host)
+            eligible = [gpu for gpu in gpu_probe["gpus"] if gpu["eligible"]]
+            if payload.max_agents is not None:
+                eligible = eligible[:payload.max_agents]
+            launches = []
+            sweep_path = f"{entity}/{project}/{job.sweep_id}"
+            wandb_api_key = self._wandb_api_key()
+            auth = self.ssh.auth_check(
                 host=remote_host,
                 remote_cwd=remote_cwd,
                 sweep_path=sweep_path,
-                gpu_index=gpu["index"],
-                conda_env=conda_env,
-                conda_sh=conda_sh,
                 wandb_api_key=wandb_api_key,
-            ))
+            )
+            for gpu in eligible:
+                launches.append(self.ssh.launch_agent(
+                    host=remote_host,
+                    remote_cwd=remote_cwd,
+                    sweep_path=sweep_path,
+                    gpu_index=gpu["index"],
+                    conda_env=conda_env,
+                    conda_sh=conda_sh,
+                    wandb_api_key=wandb_api_key,
+                ))
+        except Exception as exc:
+            return self._fail_launch_job(
+                job,
+                intent=IntentType.launch_sweep,
+                operation_id=operation_id,
+                requested_by=requested_by,
+                idempotency_key=idempotency_key,
+                stage="agent_launch_failed",
+                classification="control_plane_error",
+                exc=exc,
+                next_actions=["检查 GPU 探测、W&B auth 或 agent 启动错误；修复后使用 recover-agents 或重新 launch-sweep。"],
+                status=JobStatus.attention,
+                extra_result={"validation": validation, "preflight": preflight, "sweep": sweep},
+            )
         job.agent_pids = [item["pid"] for item in launches if item.get("pid")]
         job.status = JobStatus.running if launches else JobStatus.attention
         classification = classify_launch(auth, launches)
@@ -670,6 +773,7 @@ class ConsoleService:
                 "sweep": sweep,
                 "gpu_probe": gpu_probe,
                 "agent_launches": launches,
+                "launch_identity_conflicts": job.monitor.get("launch_identity_conflicts") or [],
                 "next_actions": next_actions_for_classification(classification),
             },
             retry_after_seconds=2,
@@ -684,17 +788,18 @@ class ConsoleService:
             "sweep": sweep,
             "gpu_probe": gpu_probe,
             "agent_launches": launches,
-            "remote_config": remote_config,
+            "config_path": remote_config_path,
+            "launch_identity_conflicts": job.monitor.get("launch_identity_conflicts") or [],
             "next_actions": next_actions_for_classification(classification),
         }, job
 
-    def _create_sweep(self, remote_config: Path, *, entity: str, project: str, payload: LaunchSweepPayload) -> dict[str, Any]:
+    def _create_sweep(self, remote_config_path: str, *, entity: str, project: str, payload: LaunchSweepPayload) -> dict[str, Any]:
         remote_host = payload.remote_host or self.settings.default_remote_host
         remote_cwd = payload.remote_cwd or self.settings.default_remote_cwd
         return self.ssh.create_sweep(
             host=remote_host,
             remote_cwd=remote_cwd,
-            remote_config=str(remote_config),
+            remote_config=remote_config_path,
             entity=entity,
             project=project,
             wandb_api_key=self._wandb_api_key(),
@@ -707,9 +812,7 @@ class ConsoleService:
         remote_cwd = payload.remote_cwd or self.settings.default_remote_cwd
         conda_env = payload.conda_env or self.settings.default_conda_env
         conda_sh = payload.conda_sh or self.settings.default_conda_sh
-        remote_config = payload.remote_config or payload.config_path
-        if not remote_config:
-            raise ValueError("remote_config is required")
+        remote_config_path = payload.config_path
         operation_id = operation_id or self._operation_identity(IntentType.launch_run, payload.model_dump(mode="json"))[0]
         idempotency_key = idempotency_key or self._operation_identity(IntentType.launch_run, payload.model_dump(mode="json"))[1]
         job = JobRecord(
@@ -720,7 +823,7 @@ class ConsoleService:
             idempotency_key=idempotency_key,
             entity=entity,
             project=project,
-            config_path=str(remote_config),
+            config_path=str(remote_config_path),
             remote_host=remote_host,
             remote_cwd=remote_cwd,
             conda_env=conda_env,
@@ -739,39 +842,128 @@ class ConsoleService:
             result={"stage": "accepted", "classification": "accepted", "created_new_sweep": False, "job_id": job.job_id},
             retry_after_seconds=2,
         )
-        remote_snapshot = self.ssh.read_remote_file(host=remote_host, remote_path=remote_config)
-        validation = validate_experiment_config_text(remote_snapshot["text"], "single-run", path_label=remote_config)
-        command_spec = build_single_run_command(load_yaml_text(remote_snapshot["text"]))
+        try:
+            remote_snapshot = self.ssh.read_remote_file(host=remote_host, remote_path=remote_config_path)
+            validation = validate_experiment_config_text(remote_snapshot["text"], "single-run", path_label=remote_config_path)
+            command_spec = build_single_run_command(load_yaml_text(remote_snapshot["text"]))
+        except Exception as exc:
+            message = str(exc)
+            classification = "run_sweep_boundary_error" if "single-run parameter" in message else "validation_failed"
+            next_actions = SINGLE_RUN_BOUNDARY_NEXT_ACTIONS if classification == "run_sweep_boundary_error" else ["修复 single-run 配置或远端 config 路径后，再重新 launch-run。"]
+            return self._fail_launch_job(
+                job,
+                intent=IntentType.launch_run,
+                operation_id=operation_id,
+                requested_by=requested_by,
+                idempotency_key=idempotency_key,
+                stage="validation_failed",
+                classification=classification,
+                exc=exc,
+                next_actions=next_actions,
+            )
         job.monitor.update({"validation": validation, "run_command": command_spec, "stage": "validating"})
         self.store.upsert_job(job)
-        preflight = self.ssh.preflight(
-            host=remote_host,
-            remote_cwd=remote_cwd,
-            conda_env=conda_env,
-            conda_sh=conda_sh,
-            config_path=remote_config,
-        )
-        gpu_probe = self.ssh.probe_gpus(remote_host)
-        eligible = [gpu for gpu in gpu_probe.get("gpus", []) if gpu.get("eligible")]
-        selected_gpu = None
-        if payload.gpu_index is not None:
-            selected_gpu = next((gpu for gpu in gpu_probe.get("gpus", []) if int(gpu.get("index")) == payload.gpu_index), None)
-            if selected_gpu is None:
-                raise ValueError(f"gpu_index {payload.gpu_index} not found on {remote_host}")
-            if payload.gpu_mode == "strict" and not selected_gpu.get("eligible"):
-                raise ValueError(f"gpu_index {payload.gpu_index} is not eligible")
-        elif eligible:
-            selected_gpu = eligible[0]
-        elif payload.gpu_mode == "strict":
-            raise ValueError("no eligible GPU for single-run launch")
-        else:
-            raise ValueError("no eligible GPU for single-run launch")
-        auth = self.ssh.auth_check(
-            host=remote_host,
-            remote_cwd=remote_cwd,
-            sweep_path=None,
-            wandb_api_key=self._wandb_api_key(),
-        )
+        try:
+            preflight = self._single_run_preflight(
+                remote_host=remote_host,
+                remote_cwd=remote_cwd,
+                remote_config_path=remote_config_path,
+                conda_env=conda_env,
+                conda_sh=conda_sh,
+                profile="single-run",
+                argv_probe=True,
+                command_spec=command_spec,
+                remote_snapshot=remote_snapshot,
+            )
+        except Exception as exc:
+            return self._fail_launch_job(
+                job,
+                intent=IntentType.launch_run,
+                operation_id=operation_id,
+                requested_by=requested_by,
+                idempotency_key=idempotency_key,
+                stage="preflight_failed",
+                classification="preflight_incomplete",
+                exc=exc,
+                next_actions=["修复 single-run 远端环境、路径或依赖后，再重新 launch-run。"],
+                extra_result={"validation": validation},
+            )
+        if preflight.get("classification") == "argv_incompatible":
+            classification = "argv_incompatible"
+            next_actions = ["修复 single-run 配置生成的 argv 或远端训练脚本 CLI 后，再重新 launch-run。"]
+            job.status = JobStatus.attention
+            job.monitor.update({
+                "kind": "single_run",
+                "validation": validation,
+                "preflight": preflight,
+                "stage": "preflight_failed",
+                "classification": classification,
+            })
+            self.store.upsert_job(job)
+            self._record_operation(
+                job,
+                operation_id=operation_id,
+                intent=IntentType.launch_run,
+                requested_by=requested_by,
+                idempotency_key=idempotency_key,
+                stage="failed",
+                classification=classification,
+                status=OperationStatus.failed.value,
+                result={
+                    "stage": "failed",
+                    "classification": classification,
+                    "created_new_sweep": False,
+                    "job_id": job.job_id,
+                    "validation": validation,
+                    "preflight": preflight,
+                    "next_actions": next_actions,
+                },
+            )
+            return {
+                "stage": "failed",
+                "classification": classification,
+                "created_new_sweep": False,
+                "job_id": job.job_id,
+                "validation": validation,
+                "preflight": preflight,
+                "next_actions": next_actions,
+            }, job
+        try:
+            gpu_probe = self.ssh.probe_gpus(remote_host)
+            eligible = [gpu for gpu in gpu_probe.get("gpus", []) if gpu.get("eligible")]
+            selected_gpu = None
+            if payload.gpu_index is not None:
+                selected_gpu = next((gpu for gpu in gpu_probe.get("gpus", []) if int(gpu.get("index")) == payload.gpu_index), None)
+                if selected_gpu is None:
+                    raise ValueError(f"gpu_index {payload.gpu_index} not found on {remote_host}")
+                if payload.gpu_mode == "strict" and not selected_gpu.get("eligible"):
+                    raise ValueError(f"gpu_index {payload.gpu_index} is not eligible")
+            elif eligible:
+                selected_gpu = eligible[0]
+            elif payload.gpu_mode == "strict":
+                raise ValueError("no eligible GPU for single-run launch")
+            else:
+                raise ValueError("no eligible GPU for single-run launch")
+            auth = self.ssh.auth_check(
+                host=remote_host,
+                remote_cwd=remote_cwd,
+                sweep_path=None,
+                wandb_api_key=self._wandb_api_key(),
+            )
+        except Exception as exc:
+            return self._fail_launch_job(
+                job,
+                intent=IntentType.launch_run,
+                operation_id=operation_id,
+                requested_by=requested_by,
+                idempotency_key=idempotency_key,
+                stage="preflight_failed",
+                classification="control_plane_error",
+                exc=exc,
+                next_actions=["检查 GPU 探测、W&B auth 或远端环境；修复后重新 launch-run。"],
+                status=JobStatus.attention,
+                extra_result={"validation": validation, "preflight": preflight},
+            )
         self._record_operation(
             job,
             operation_id=operation_id,
@@ -792,20 +984,37 @@ class ConsoleService:
             },
             retry_after_seconds=2,
         )
-        launch = self.ssh.launch_run(
-            host=remote_host,
-            remote_cwd=remote_cwd,
-            job_id=job.job_id,
-            argv=command_spec["argv"],
-            gpu_index=int(selected_gpu["index"]),
-            conda_env=conda_env,
-            conda_sh=conda_sh,
-            wandb_api_key=self._wandb_api_key(),
-            result_path=payload.result_path,
-        )
+        try:
+            launch = self.ssh.launch_run(
+                host=remote_host,
+                remote_cwd=remote_cwd,
+                job_id=job.job_id,
+                argv=command_spec["argv"],
+                gpu_index=int(selected_gpu["index"]),
+                conda_env=conda_env,
+                conda_sh=conda_sh,
+                wandb_api_key=self._wandb_api_key(),
+                result_path=payload.result_path,
+            )
+        except Exception as exc:
+            return self._fail_launch_job(
+                job,
+                intent=IntentType.launch_run,
+                operation_id=operation_id,
+                requested_by=requested_by,
+                idempotency_key=idempotency_key,
+                stage="launch_failed",
+                classification="control_plane_error",
+                exc=exc,
+                next_actions=["检查 single-run 远端启动日志和训练脚本 CLI；修复后重新 launch-run。"],
+                status=JobStatus.attention,
+                extra_result={"validation": validation, "preflight": preflight, "auth": auth, "gpu_probe": gpu_probe},
+            )
         job.agent_pids = [launch["pid"]] if launch.get("pid") else []
-        job.status = JobStatus.running if job.agent_pids else JobStatus.attention
-        classification = "run_running" if job.agent_pids else "run_started_unverified"
+        launch_status = single_run_status_from_launch(launch, job_id=job.job_id, alive_pids=job.agent_pids)
+        single_run_state = classify_single_run_state(launch_status)
+        job.status = single_run_state["job_status"]
+        classification = single_run_state["classification"]
         job.monitor.update({
             "kind": "single_run",
             "validation": validation,
@@ -813,6 +1022,7 @@ class ConsoleService:
             "auth": auth,
             "gpu_probe": gpu_probe,
             "run": launch,
+            "last_run_status": compact_single_run_status(launch_status),
             "stage": "done",
             "classification": classification,
         })
@@ -825,7 +1035,7 @@ class ConsoleService:
             idempotency_key=idempotency_key,
             stage="done",
             classification=classification,
-            status=OperationStatus.succeeded.value if job.agent_pids else OperationStatus.executing.value,
+            status=OperationStatus.failed.value if job.status == JobStatus.failed else OperationStatus.succeeded.value if job.agent_pids else OperationStatus.executing.value,
             result={
                 "stage": "done",
                 "classification": classification,
@@ -946,11 +1156,13 @@ class ConsoleService:
             if status_path and job.remote_host:
                 try:
                     run_status = self.ssh.check_run_status(host=job.remote_host, status_path=status_path, pids=job.agent_pids)
-                    next_status = map_single_run_state_to_job_status(run_status)
+                    single_run_state = classify_single_run_state(run_status)
+                    next_status = single_run_state["job_status"]
                     try:
-                        job = self.store.update_job_status(job.job_id, next_status, {"last_run_status": compact_single_run_status(run_status)})
+                        job = self.store.update_job_status(job.job_id, next_status, {"last_run_status": compact_single_run_status(run_status), "classification": single_run_state["classification"]})
                     except Exception:
                         job.monitor["last_run_status"] = compact_single_run_status(run_status)
+                        job.monitor["classification"] = single_run_state["classification"]
                         self.store.upsert_job(job)
                 except Exception as exc:
                     run_status = {"classification": "run_status_unavailable", "error": compact_error(exc)}
@@ -1061,6 +1273,12 @@ class ConsoleService:
         elif degraded:
             classification = "degraded"
             next_actions = ["稍后重试 status；如持续 degraded，检查 W&B/API 网络与本地 WANDB_API_KEY。"]
+        elif job and (job.status in {JobStatus.attention, JobStatus.failed} or agent_health in {"failed", "missing"}):
+            classification = "attention"
+            if job.monitor.get("kind") == "single_run":
+                next_actions = ["检查 single-run 的 last_run_status、failure_diagnostics 和远端日志；修复配置 argv 或训练脚本后重新 launch-run。"]
+            else:
+                next_actions = ["检查 agent 诊断；修复远端代码/路径后重新 launch 或 recover-agents。"]
         elif sweep_attention:
             classification = "attention"
             next_actions = sweep_attention_reasons or ["检查 run 级失败诊断；如需要，修复远端代码/路径后重新 launch 或 recover-agents。"]
@@ -1595,17 +1813,26 @@ class ConsoleService:
     def _preflight(self, payload: PreflightPayload) -> dict[str, Any]:
         conda_env = payload.conda_env or self.settings.default_conda_env
         conda_sh = payload.conda_sh or self.settings.default_conda_sh
-        remote_config = payload.remote_config or payload.config_path
+        if payload.profile == "single-run":
+            return self._single_run_preflight(
+                remote_host=payload.remote_host,
+                remote_cwd=payload.remote_cwd,
+                remote_config_path=payload.config_path,
+                conda_env=conda_env,
+                conda_sh=conda_sh,
+                profile=payload.profile,
+                argv_probe=payload.argv_probe,
+            )
         result = self.ssh.preflight(
             host=payload.remote_host,
             remote_cwd=payload.remote_cwd,
             conda_env=conda_env,
             conda_sh=conda_sh,
-            config_path=remote_config,
+            config_path=payload.config_path,
         )
-        if remote_config:
+        if payload.config_path:
             try:
-                result["remote_config_snapshot"] = self.ssh.read_remote_file(host=payload.remote_host, remote_path=remote_config)
+                result["remote_config_snapshot"] = self.ssh.read_remote_file(host=payload.remote_host, remote_path=payload.config_path)
             except Exception as exc:
                 result["remote_config_snapshot_error"] = compact_error(exc)
         return {**result, "provenance": {"source": "ssh_remote_preflight"}}
@@ -1665,8 +1892,14 @@ class ConsoleService:
                 raise ValueError("remote_host is required for single-run pull-results")
             status_path = run_meta.get("status_path")
             result_path = run_meta.get("result_path")
+            recovered_paths = {}
             if not status_path:
-                raise ValueError("single-run status_path is missing")
+                if job and job.remote_cwd and job.job_id:
+                    recovered_paths = single_run_default_paths(job.remote_cwd, job.job_id)
+                    status_path = recovered_paths["status_path"]
+                    result_path = result_path or recovered_paths["result_path"]
+                else:
+                    raise ValueError("single-run status_path is missing")
             result = self.ssh.pull_single_run_result(
                 host=remote_host,
                 status_path=status_path,
@@ -1675,6 +1908,17 @@ class ConsoleService:
                 group_keys=payload.group_keys,
             )
             if job:
+                if recovered_paths:
+                    run_meta = dict(run_meta)
+                    run_meta.update({
+                        "host": remote_host,
+                        "remote_cwd": job.remote_cwd,
+                        "job_id": job.job_id,
+                        "log": recovered_paths["log_path"],
+                        "status_path": status_path,
+                        "result_path": result_path,
+                    })
+                    job.monitor["run"] = run_meta
                 job.monitor["last_result_pull"] = summarize_result_pull(result)
                 self._record_operation(
                     job,
@@ -1903,6 +2147,60 @@ class ConsoleService:
             raise KeyError(f"job not found: {job_id}")
         return job
 
+    def _single_run_preflight(
+        self,
+        *,
+        remote_host: str,
+        remote_cwd: str,
+        remote_config_path: str | None,
+        conda_env: str | None,
+        conda_sh: str | None,
+        profile: str | None = None,
+        argv_probe: bool = True,
+        command_spec: dict[str, Any] | None = None,
+        remote_snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        result = self.ssh.preflight(
+            host=remote_host,
+            remote_cwd=remote_cwd,
+            conda_env=conda_env,
+            conda_sh=conda_sh,
+            config_path=remote_config_path,
+        )
+        snapshot = remote_snapshot
+        if remote_config_path and snapshot is None:
+            try:
+                snapshot = self.ssh.read_remote_file(host=remote_host, remote_path=remote_config_path)
+                result["remote_config_snapshot"] = snapshot
+            except Exception as exc:
+                result["remote_config_snapshot_error"] = compact_error(exc)
+        elif snapshot is not None:
+            result["remote_config_snapshot"] = snapshot
+        if profile == "single-run" and argv_probe and remote_config_path:
+            try:
+                spec = command_spec or build_single_run_command(load_yaml_text((snapshot or {}).get("text", "")))
+                probe = self.ssh.probe_argv_compat(
+                    host=remote_host,
+                    remote_cwd=remote_cwd,
+                    argv=spec["argv"],
+                    conda_env=conda_env,
+                    conda_sh=conda_sh,
+                )
+                result["argv_probe"] = probe
+                if probe.get("classification") == "argv_incompatible":
+                    result["classification"] = "argv_incompatible"
+                    result["ok"] = False
+                elif probe.get("classification") == "argv_probe_unavailable":
+                    result.setdefault("warnings", []).append("argv probe unavailable; launch is not blocked by this soft signal")
+            except Exception as exc:
+                result["argv_probe"] = {
+                    "classification": "argv_probe_unavailable",
+                    "error": compact_error(exc),
+                }
+                result.setdefault("warnings", []).append("argv probe unavailable; launch is not blocked by this soft signal")
+        result["provenance"] = {"source": "ssh_remote_preflight"}
+        return result
+
 
 def map_wandb_state_to_job_status(state: str | None) -> JobStatus:
     normalized = (state or "").lower()
@@ -1916,17 +2214,51 @@ def map_wandb_state_to_job_status(state: str | None) -> JobStatus:
 
 
 def map_single_run_state_to_job_status(status: dict[str, Any] | None) -> JobStatus:
+    return classify_single_run_state(status)["job_status"]
+
+
+def single_run_default_paths(remote_cwd: str, job_id: str) -> dict[str, str]:
+    runs_dir = f"{remote_cwd.rstrip('/')}/.experiment_console/runs"
+    return {
+        "log_path": f"{runs_dir}/{job_id}.log",
+        "status_path": f"{runs_dir}/{job_id}.status.json",
+        "result_path": f"{runs_dir}/{job_id}.result.json",
+    }
+
+
+def single_run_status_from_launch(launch: dict[str, Any], *, job_id: str, alive_pids: list[str] | None = None) -> dict[str, Any]:
+    status = dict(launch.get("launcher") or {})
+    status.setdefault("job_id", launch.get("job_id") or job_id)
+    if launch.get("pid"):
+        status.setdefault("child_pid", launch.get("pid"))
+    if launch.get("status_path"):
+        status.setdefault("status_path", launch.get("status_path"))
+    if launch.get("result_path"):
+        status.setdefault("result_path", launch.get("result_path"))
+    if launch.get("log"):
+        status.setdefault("log_path", launch.get("log"))
+    if launch.get("launcher_pid") and not status.get("launcher_pid"):
+        status["launcher_pid"] = launch.get("launcher_pid")
+    status["alive_pids"] = list(alive_pids or [])
+    return status
+
+
+def classify_single_run_state(status: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(status, dict):
-        return JobStatus.unknown
+        return {"job_status": JobStatus.unknown, "classification": "run_status_unknown"}
     if status.get("exit_code") == 0:
-        return JobStatus.finished
+        return {"job_status": JobStatus.finished, "classification": "run_finished"}
     if status.get("exit_code") is not None:
-        return JobStatus.failed
+        return {"job_status": JobStatus.failed, "classification": "run_failed"}
     if status.get("alive_pids"):
-        return JobStatus.running
+        return {"job_status": JobStatus.running, "classification": "run_running"}
     if status.get("missing"):
-        return JobStatus.attention
-    return JobStatus.unknown
+        return {"job_status": JobStatus.attention, "classification": "run_status_missing"}
+    if status.get("child_pid") or status.get("pid"):
+        return {"job_status": JobStatus.attention, "classification": "run_started_unverified"}
+    if status.get("launcher_pid") or status.get("status_path") or status.get("result_path"):
+        return {"job_status": JobStatus.attention, "classification": "run_started_unverified"}
+    return {"job_status": JobStatus.unknown, "classification": "run_status_unknown"}
 
 
 def count_jobs(jobs: list[JobRecord]) -> dict[str, int]:
@@ -1975,7 +2307,7 @@ def summarize_result_pull(result: dict[str, Any]) -> dict[str, Any]:
 def compact_single_run_status(status: dict[str, Any]) -> dict[str, Any]:
     return {
         key: status.get(key)
-        for key in ["job_id", "pid", "child_pid", "started_at", "finished_at", "exit_code", "log_path", "status_path", "result_path", "alive_pids", "missing"]
+        for key in ["job_id", "pid", "child_pid", "launcher_pid", "ok", "timed_out", "started_at", "finished_at", "exit_code", "log_path", "status_path", "result_path", "alive_pids", "missing"]
         if key in status
     }
 
@@ -2097,12 +2429,22 @@ def compact_job_record(job: JobRecord) -> dict[str, Any]:
         "last_run_status",
         "last_agent_probe",
         "last_failure_diagnostics",
+        "error",
+        "validation_error",
+        "preflight",
+        "launch_identity_conflicts",
     ]:
         if key in monitor:
             if key == "last_failure_diagnostics":
                 compact_monitor[key] = compact_failure_diagnostics(monitor[key])
             elif key == "last_agent_probe":
                 compact_monitor[key] = compact_agent_probe(monitor[key])
+            elif key == "preflight" and isinstance(monitor[key], dict):
+                compact_monitor[key] = {
+                    preflight_key: monitor[key].get(preflight_key)
+                    for preflight_key in ["ok", "classification", "checks", "argv_probe", "warnings", "remote_config_snapshot_error"]
+                    if preflight_key in monitor[key]
+                }
             else:
                 compact_monitor[key] = monitor[key]
     last_status = monitor.get("last_wandb_status")
@@ -2156,6 +2498,7 @@ def compact_operation(operation: dict[str, Any] | None) -> dict[str, Any] | None
         "message",
         "success",
         "failure_diagnostics",
+        "launch_identity_conflicts",
     ]:
         if key in result:
             compact_result[key] = compact_failure_diagnostics(result[key]) if key == "failure_diagnostics" else result[key]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,33 @@ def parse_sweep_id(text: str) -> str | None:
         if match:
             return match.group(1).rsplit("/", 1)[-1]
     return None
+
+
+ARGV_INCOMPATIBLE_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in [
+        r"(?:^|\n)\s*usage:",
+        r"unrecognized arguments?:",
+        r"unknown (?:option|argument)",
+        r"no such option",
+        r"expected one argument",
+        r"requires an argument",
+        r"invalid choice",
+        r"missing (?:option|argument|required)",
+        r"too few arguments",
+    ]
+]
+
+
+def classify_argv_probe(returncode: int | None, stdout: str, stderr: str, *, timed_out: bool = False) -> str:
+    if timed_out or returncode is None:
+        return "argv_probe_unavailable"
+    if returncode == 0:
+        return "argv_compatible"
+    combined = f"{stdout}\n{stderr}"
+    if any(pattern.search(combined) for pattern in ARGV_INCOMPATIBLE_PATTERNS):
+        return "argv_incompatible"
+    return "argv_probe_unavailable"
 
 
 class SSHExecutor:
@@ -127,6 +155,103 @@ print(json.dumps({"ok": all(v for v in checks.values() if isinstance(v, bool)), 
             "remote_cwd": remote_cwd,
             "command": result.summary(),
         }
+
+    def probe_argv_compat(
+        self,
+        *,
+        host: str,
+        remote_cwd: str,
+        argv: list[str],
+        conda_env: str | None = None,
+        conda_sh: str | None = None,
+        timeout_seconds: int = 20,
+    ) -> dict[str, Any]:
+        probe_argv = [str(item) for item in argv] + ["--help"]
+        script = """
+import json, os, shlex, subprocess
+cwd = __CWD__
+argv = __ARGV__
+conda_env = __CONDA_ENV__
+conda_sh = __CONDA_SH__
+timeout_seconds = __TIMEOUT__
+env = os.environ.copy()
+env["WANDB_MODE"] = "disabled"
+env["WANDB_DISABLED"] = "true"
+env["CUDA_VISIBLE_DEVICES"] = ""
+cmd = " ".join(shlex.quote(str(item)) for item in argv)
+if conda_env and conda_sh:
+    cmd = "source " + shlex.quote(conda_sh) + " && conda activate " + shlex.quote(conda_env) + " && " + cmd
+try:
+    result = subprocess.run(["bash", "-lc", cmd], cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout_seconds, check=False)
+    payload = {
+        "returncode": result.returncode,
+        "stdout_tail": result.stdout[-4000:],
+        "stderr_tail": result.stderr[-4000:],
+        "timed_out": False,
+    }
+except subprocess.TimeoutExpired as exc:
+    payload = {
+        "returncode": None,
+        "stdout_tail": (exc.stdout or "")[-4000:] if isinstance(exc.stdout, str) else "",
+        "stderr_tail": (exc.stderr or "")[-4000:] if isinstance(exc.stderr, str) else "",
+        "timed_out": True,
+    }
+print(json.dumps(payload))
+"""
+        script = (
+            script.replace("__CWD__", repr(remote_cwd))
+            .replace("__ARGV__", json.dumps(probe_argv))
+            .replace("__CONDA_ENV__", repr(conda_env))
+            .replace("__CONDA_SH__", repr(conda_sh))
+            .replace("__TIMEOUT__", repr(timeout_seconds))
+        )
+        try:
+            result = self.run(host, "python3 -c " + shlex.quote(script), timeout=timeout_seconds + 10)
+            payload = json.loads(result.stdout.strip().splitlines()[-1])
+            stdout_tail = redact_text(str(payload.get("stdout_tail") or ""))
+            stderr_tail = redact_text(str(payload.get("stderr_tail") or ""))
+            classification = classify_argv_probe(
+                payload.get("returncode"),
+                stdout_tail,
+                stderr_tail,
+                timed_out=bool(payload.get("timed_out")),
+            )
+            return {
+                "classification": classification,
+                "returncode": payload.get("returncode"),
+                "stdout_tail": stdout_tail,
+                "stderr_tail": stderr_tail,
+                "timed_out": bool(payload.get("timed_out")),
+                "probe_argv": probe_argv,
+                "timeout_seconds": timeout_seconds,
+                "host": host,
+                "remote_cwd": remote_cwd,
+                "command": result.summary(),
+            }
+        except subprocess.TimeoutExpired as exc:
+            return {
+                "classification": "argv_probe_unavailable",
+                "returncode": None,
+                "stdout_tail": "",
+                "stderr_tail": f"local ssh command timed out: {exc}",
+                "timed_out": True,
+                "probe_argv": probe_argv,
+                "timeout_seconds": timeout_seconds,
+                "host": host,
+                "remote_cwd": remote_cwd,
+            }
+        except Exception as exc:
+            return {
+                "classification": "argv_probe_unavailable",
+                "returncode": None,
+                "stdout_tail": "",
+                "stderr_tail": redact_text(str(exc)),
+                "timed_out": False,
+                "probe_argv": probe_argv,
+                "timeout_seconds": timeout_seconds,
+                "host": host,
+                "remote_cwd": remote_cwd,
+            }
 
     def probe_gpus(self, host: str, *, min_free_gb: float | None = None, max_util: int | None = None) -> dict[str, Any]:
         query = (
@@ -328,6 +453,8 @@ with open(status_path, "w", encoding="utf-8") as handle:
         status_probe = """
 import json, os, time
 status_path = __STATUS_PATH__
+result_path = __RESULT_PATH__
+log_path = __LOG_PATH__
 launcher_pid = os.environ.get("LAUNCHER_PID", "")
 deadline = time.time() + 30
 payload = {}
@@ -342,12 +469,17 @@ while time.time() < deadline:
         time.sleep(1)
 payload["ok"] = bool(payload.get("child_pid"))
 payload["launcher_pid"] = launcher_pid
+payload["timed_out"] = not payload["ok"]
 payload.setdefault("status_path", status_path)
+payload.setdefault("result_path", result_path)
+payload.setdefault("log_path", log_path)
 print(json.dumps(payload))
 """
         status_probe = (
             status_probe
             .replace("__STATUS_PATH__", repr(status_path))
+            .replace("__RESULT_PATH__", repr(result_path))
+            .replace("__LOG_PATH__", repr(log_path))
         )
         remote = (
             f"mkdir -p {shlex.quote(runs_dir)} && cd {shlex.quote(remote_cwd)} && "

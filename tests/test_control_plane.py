@@ -37,6 +37,15 @@ class FakeSSH:
         self.launches = []
         self.run_launches = []
         self.agent_probe = None
+        self.argv_probe = {
+            "classification": "argv_compatible",
+            "returncode": 0,
+            "stdout_tail": "usage: train.py [-h]\n",
+            "stderr_tail": "",
+            "timed_out": False,
+            "probe_argv": ["python", "train.py", "--help"],
+            "timeout_seconds": 20,
+        }
         self.failure_logs = []
         self.run_status = {
             "job_id": "job_run",
@@ -181,6 +190,15 @@ class FakeSSH:
             "checks": {"remote_cwd_exists": True, "wandb_cli": True, "python": True},
         }
 
+    def probe_argv_compat(self, *, host, remote_cwd, argv, conda_env=None, conda_sh=None, timeout_seconds=20):
+        return {
+            **self.argv_probe,
+            "host": host,
+            "remote_cwd": remote_cwd,
+            "probe_argv": [*argv, "--help"],
+            "timeout_seconds": timeout_seconds,
+        }
+
     def pull_results(self, *, host, remote_cwd, sweep_id, run_ids, budget_seconds, max_runs, metric_keys, group_keys):
         assert run_ids == ["run-a", "run-b"]
         return {
@@ -303,7 +321,7 @@ def test_launch_run_creates_managed_single_run_job(tmp_path):
 
     result = service.runner_command(IntentType.launch_run, {
         "job_name": "single",
-        "remote_config": "/tmp/demo/single.yaml",
+        "config_path": "/tmp/demo/single.yaml",
         "remote_host": "gpu-host-1",
         "remote_cwd": "/tmp/demo",
         "idempotency_key": "single-run-test",
@@ -316,6 +334,178 @@ def test_launch_run_creates_managed_single_run_job(tmp_path):
     assert ssh.run_launches[0]["gpu_index"] == 0
     assert ssh.run_launches[0]["argv"] == ["python", "train.py", "--dataset", "Cora", "--seed", "0"]
     assert result.result["run"]["status_path"].endswith(".status.json")
+    assert result.result["preflight"]["argv_probe"]["classification"] == "argv_compatible"
+
+
+def test_runner_payload_rejects_legacy_remote_config_field(tmp_path):
+    service = make_service(tmp_path)
+    with pytest.raises(Exception, match="remote_config"):
+        service.runner_command(IntentType.launch_run, {
+            "job_name": "legacy_remote_config",
+            "remote_config": "/tmp/demo/single.yaml",
+            "remote_host": "gpu-host-1",
+            "remote_cwd": "/tmp/demo",
+        })
+
+
+def test_launch_run_unverified_start_preserves_recoverable_run_metadata(tmp_path):
+    class UnverifiedStartSSH(FakeSSH):
+        def launch_run(self, **kwargs):
+            launch = super().launch_run(**kwargs)
+            launch["pid"] = ""
+            launch["launcher"] = {
+                "ok": False,
+                "timed_out": True,
+                "launcher_pid": "1999",
+                "status_path": launch["status_path"],
+                "result_path": launch["result_path"],
+                "log_path": launch["log"],
+            }
+            return launch
+
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = UnverifiedStartSSH()
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
+
+    response = service.runner_command(IntentType.launch_run, {
+        "job_name": "single_unverified",
+        "config_path": "/tmp/demo/single.yaml",
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "idempotency_key": "single-unverified-test",
+    })
+
+    assert response.classification == "run_started_unverified"
+    assert response.job is not None
+    assert response.job.status == JobStatus.attention
+    assert response.job.agent_pids == []
+    assert response.job.operation_log[-1]["status"] == "executing"
+    assert response.result["run"]["status_path"].endswith(".status.json")
+    assert response.result["run"]["result_path"].endswith(".result.json")
+    assert response.job.monitor["last_run_status"]["status_path"] == response.result["run"]["status_path"]
+
+
+def test_single_run_preflight_detects_incompatible_argv(tmp_path):
+    class WandbFlagSSH(FakeSSH):
+        def read_remote_file(self, *, host, remote_path):
+            return {
+                "host": host,
+                "remote_path": remote_path,
+                "text": (
+                    "name: single\n"
+                    "program: main.py\n"
+                    "parameters:\n"
+                    "  wandb:\n"
+                    "    value: true\n"
+                ),
+            }
+
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = WandbFlagSSH()
+    ssh.argv_probe = {
+        "classification": "argv_incompatible",
+        "returncode": 2,
+        "stdout_tail": "",
+        "stderr_tail": "main.py: error: argument --wandb: expected one argument\n",
+        "timed_out": False,
+    }
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
+
+    response = service.runner_command(IntentType.preflight, {
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "config_path": "/tmp/demo/single.yaml",
+        "profile": "single-run",
+    })
+
+    assert response.classification == "argv_incompatible"
+    assert response.result["argv_probe"]["returncode"] == 2
+
+
+def test_launch_run_blocks_incompatible_argv_before_remote_launch(tmp_path):
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = FakeSSH()
+    ssh.argv_probe = {
+        "classification": "argv_incompatible",
+        "returncode": 2,
+        "stdout_tail": "",
+        "stderr_tail": "main.py: error: argument --wandb: expected one argument\n",
+        "timed_out": False,
+    }
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
+
+    response = service.runner_command(IntentType.launch_run, {
+        "job_name": "single_bad_argv",
+        "config_path": "/tmp/demo/single.yaml",
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "idempotency_key": "single-bad-argv-test",
+    })
+
+    assert response.classification == "argv_incompatible"
+    assert response.job is not None
+    assert response.job.status == JobStatus.attention
+    assert response.job.monitor["classification"] == "argv_incompatible"
+    assert ssh.run_launches == []
+    assert response.job.operation_log[-1]["status"] == "failed"
+
+
+def test_launch_run_allows_unavailable_argv_probe(tmp_path):
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = FakeSSH()
+    ssh.argv_probe = {
+        "classification": "argv_probe_unavailable",
+        "returncode": None,
+        "stdout_tail": "",
+        "stderr_tail": "probe timed out",
+        "timed_out": True,
+    }
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
+
+    response = service.runner_command(IntentType.launch_run, {
+        "job_name": "single_soft_probe",
+        "config_path": "/tmp/demo/single.yaml",
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "idempotency_key": "single-soft-probe-test",
+    })
+
+    assert response.classification == "run_running"
+    assert response.result["preflight"]["argv_probe"]["classification"] == "argv_probe_unavailable"
+    assert ssh.run_launches
+
+
+def test_launch_run_fast_exit_is_classified_failed(tmp_path):
+    class FastExitSSH(FakeSSH):
+        def launch_run(self, **kwargs):
+            launch = super().launch_run(**kwargs)
+            launch["launcher"] = {
+                "job_id": kwargs["job_id"],
+                "pid": "2000",
+                "child_pid": "2001",
+                "exit_code": 2,
+                "finished_at": "2026-06-17T00:00:01+00:00",
+                "status_path": launch["status_path"],
+                "result_path": launch["result_path"],
+            }
+            return launch
+
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = FastExitSSH()
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
+
+    response = service.runner_command(IntentType.launch_run, {
+        "job_name": "single_fast_exit",
+        "config_path": "/tmp/demo/single.yaml",
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "idempotency_key": "single-fast-exit-test",
+    })
+
+    assert response.classification == "run_failed"
+    assert response.job is not None
+    assert response.job.status == JobStatus.failed
+    assert response.job.monitor["last_run_status"]["exit_code"] == 2
 
 
 def test_launch_run_rejects_multi_value_config(tmp_path):
@@ -328,13 +518,111 @@ def test_launch_run_rejects_multi_value_config(tmp_path):
             }
 
     service = ConsoleService(settings=Settings(state_dir=tmp_path), store=ConsoleStore(Settings(state_dir=tmp_path).sqlite_path, Settings(state_dir=tmp_path).audit_path), wandb=FakeWandB(), ssh=MultiValueSSH())
-    with pytest.raises(Exception, match="exactly one value"):
-        service.runner_command(IntentType.launch_run, {
-            "job_name": "bad_single",
-            "remote_config": "/tmp/demo/single.yaml",
-            "remote_host": "gpu-host-1",
-            "remote_cwd": "/tmp/demo",
-        })
+    response = service.runner_command(IntentType.launch_run, {
+        "job_name": "bad_single",
+        "config_path": "/tmp/demo/single.yaml",
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+    })
+
+    assert response.classification == "run_sweep_boundary_error"
+    assert response.job is not None
+    assert response.job.status == JobStatus.failed
+    assert response.job.monitor["kind"] == "single_run"
+    assert response.job.monitor["stage"] == "validation_failed"
+    assert "exactly one value" in response.result["error"]
+    assert "launch-sweep" in response.next_actions[0]
+    assert service.store.get_job(response.job_id).status == JobStatus.failed
+
+
+def test_failed_launch_run_does_not_block_same_identity_launch_sweep(tmp_path):
+    class SwitchingSSH(FakeSSH):
+        def __init__(self):
+            super().__init__()
+            self.mode = "single"
+
+        def read_remote_file(self, *, host, remote_path):
+            if self.mode == "single":
+                return {
+                    "host": host,
+                    "remote_path": remote_path,
+                    "text": "program: train.py\nparameters:\n  seed:\n    values: [0, 1]\n",
+                }
+            return {
+                "host": host,
+                "remote_path": remote_path,
+                "text": (
+                    "method: grid\n"
+                    "name: sweep\n"
+                    "program: train.py\n"
+                    "parameters:\n"
+                    "  dataset:\n"
+                    "    values: [Cora]\n"
+                    "  seed:\n"
+                    "    values: [0, 1, 2, 3, 4]\n"
+                ),
+            }
+
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = SwitchingSSH()
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
+
+    bad_run = service.runner_command(IntentType.launch_run, {
+        "job_name": "same_name",
+        "config_path": "/tmp/demo/shared.yaml",
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+    })
+    assert bad_run.classification == "run_sweep_boundary_error"
+
+    ssh.mode = "sweep"
+    sweep = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "same_name",
+        "config_path": "/tmp/demo/shared.yaml",
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "max_agents": 1,
+        "idempotency_key": "same-name-sweep-test",
+    })
+
+    assert sweep.classification in {"agents_running", "wandb_auth_missing", "agents_failed_wandb_auth"}
+    assert sweep.job is not None
+    assert sweep.job.job_id != bad_run.job_id
+    assert sweep.job.sweep_id == "abc123"
+    assert sweep.job.monitor["kind"] == "sweep"
+    assert sweep.job.monitor["launch_identity_conflicts"][0]["job_id"] == bad_run.job_id
+
+
+def test_launch_sweep_reuses_only_existing_sweep_job(tmp_path):
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = FakeSSH()
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
+    config_path = tmp_path / "sweep.yaml"
+    config_path.write_text(
+        "method: grid\nname: demo\nprogram: train.py\nparameters:\n  dataset:\n    values: [Cora]\n  seed:\n    values: [0, 1, 2, 3, 4]\n",
+        encoding="utf-8",
+    )
+
+    first = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "replay_sweep",
+        "config_path": str(config_path),
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "max_agents": 1,
+        "idempotency_key": "replay-sweep-first",
+    })
+    replay = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "replay_sweep",
+        "config_path": str(config_path),
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "max_agents": 1,
+        "idempotency_key": "replay-sweep-second",
+    })
+
+    assert first.job_id == replay.job_id
+    assert replay.classification == "existing_sweep_reused"
+    assert replay.result["job"]["sweep_id"] == "abc123"
 
 
 def test_single_run_status_stop_and_pull_results(tmp_path):
@@ -343,7 +631,7 @@ def test_single_run_status_stop_and_pull_results(tmp_path):
     service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
     launch = service.runner_command(IntentType.launch_run, {
         "job_name": "single_status",
-        "remote_config": "/tmp/demo/single.yaml",
+        "config_path": "/tmp/demo/single.yaml",
         "remote_host": "gpu-host-1",
         "remote_cwd": "/tmp/demo",
         "idempotency_key": "single-status-test",
@@ -365,7 +653,7 @@ def test_single_run_status_stop_and_pull_results(tmp_path):
     service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=FakeSSH())
     stopped_launch = service.runner_command(IntentType.launch_run, {
         "job_name": "single_stop",
-        "remote_config": "/tmp/demo/single.yaml",
+        "config_path": "/tmp/demo/single.yaml",
         "remote_host": "gpu-host-1",
         "remote_cwd": "/tmp/demo",
         "idempotency_key": "single-stop-test",
@@ -373,6 +661,98 @@ def test_single_run_status_stop_and_pull_results(tmp_path):
     assert stopped_launch.job_id
     stopped = service.runner_command(IntentType.stop_job, {"job_id": stopped_launch.job_id})
     assert stopped.result["stop_run"]["stopped_pids"] == ["2000"]
+
+
+def test_single_run_pull_results_recovers_default_paths_from_legacy_ledger(tmp_path):
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = FakeSSH()
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
+    job = JobRecord(
+        job_id="job_legacy_single",
+        name="legacy-single",
+        status=JobStatus.attention,
+        entity="my-team",
+        project="my-project",
+        remote_host="gpu-host-1",
+        remote_cwd="/tmp/demo",
+        monitor={"kind": "single_run", "run": {}},
+    )
+    service.store.upsert_job(job)
+
+    pulled = service.runner_command(IntentType.pull_results, {"job_id": job.job_id, "metric_keys": ["final_test_auc"]})
+
+    assert pulled.result["valid_results"] == 1
+    assert pulled.result["status"]["status_path"] == "/tmp/demo/.experiment_console/runs/job_legacy_single.status.json"
+    recovered = service.store.get_job(job.job_id)
+    assert recovered is not None
+    assert recovered.monitor["run"]["status_path"] == "/tmp/demo/.experiment_console/runs/job_legacy_single.status.json"
+    assert recovered.monitor["run"]["result_path"] == "/tmp/demo/.experiment_console/runs/job_legacy_single.result.json"
+
+
+def test_unverified_single_run_status_can_transition_to_finished(tmp_path):
+    class UnverifiedStartSSH(FakeSSH):
+        def launch_run(self, **kwargs):
+            launch = super().launch_run(**kwargs)
+            launch["pid"] = ""
+            launch["launcher"] = {
+                "ok": False,
+                "timed_out": True,
+                "launcher_pid": "1999",
+                "status_path": launch["status_path"],
+                "result_path": launch["result_path"],
+                "log_path": launch["log"],
+            }
+            return launch
+
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = UnverifiedStartSSH()
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
+    launch = service.runner_command(IntentType.launch_run, {
+        "job_name": "single_unverified_finished",
+        "config_path": "/tmp/demo/single.yaml",
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "idempotency_key": "single-unverified-finished-test",
+    })
+    assert launch.job_id
+    assert launch.classification == "run_started_unverified"
+
+    ssh.run_status = {
+        **ssh.run_status,
+        "job_id": launch.job_id,
+        "exit_code": 0,
+        "alive_pids": [],
+        "finished_at": "2026-06-17T00:00:00+00:00",
+        "status_path": launch.result["run"]["status_path"],
+        "result_path": launch.result["run"]["result_path"],
+    }
+    status = service.runner_command(IntentType.status_query, {"job_id": launch.job_id})
+
+    assert status.result["state"]["job_status"] == "finished"
+    assert status.result["state"]["agent_health"] == "terminal"
+    assert status.result["job"]["monitor"]["classification"] == "run_finished"
+
+
+def test_single_run_status_failed_exit_needs_attention(tmp_path):
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = FakeSSH()
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
+    launch = service.runner_command(IntentType.launch_run, {
+        "job_name": "single_failed_status",
+        "config_path": "/tmp/demo/single.yaml",
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "idempotency_key": "single-failed-status-test",
+    })
+    assert launch.job_id
+
+    ssh.run_status = {**ssh.run_status, "exit_code": 2, "alive_pids": [], "finished_at": "2026-06-17T00:00:00+00:00"}
+    status = service.runner_command(IntentType.status_query, {"job_id": launch.job_id})
+
+    assert status.classification == "attention"
+    assert status.result["state"]["job_status"] == "failed"
+    assert status.result["state"]["agent_health"] == "failed"
+    assert status.result["job"]["monitor"]["classification"] == "run_failed"
 
 
 def test_status_collects_failure_diagnostics_for_missing_sweep_agent(tmp_path):

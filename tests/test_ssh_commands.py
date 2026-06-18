@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from experiment_console.command import CommandResult
 from experiment_console.config import Settings
-from experiment_console.ssh import SSHExecutor, build_failure_diagnostics, extract_error_signals
+from experiment_console.ssh import SSHExecutor, build_failure_diagnostics, classify_argv_probe, extract_error_signals
 
 
 class RecordingRunner:
@@ -90,3 +90,9 @@ def test_build_failure_diagnostics_reports_missing_process_and_log_tail():
     assert "import_error" in kinds
     assert "agent_process_missing" in kinds
     assert diagnostics["log_tails"][0]["tail"].startswith("ModuleNotFoundError")
+
+
+def test_classify_argv_probe_detects_argparse_error():
+    assert classify_argv_probe(0, "usage: main.py [-h]\n", "") == "argv_compatible"
+    assert classify_argv_probe(2, "", "main.py: error: argument --wandb: expected one argument\n") == "argv_incompatible"
+    assert classify_argv_probe(1, "", "RuntimeError: import failed\n") == "argv_probe_unavailable"
