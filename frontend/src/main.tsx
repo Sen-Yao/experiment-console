@@ -11,6 +11,7 @@ import {
   Server,
   Timer,
 } from 'lucide-react'
+import experimentLogoUrl from './assets/experiment-results.svg'
 import './styles.css'
 
 type Job = {
@@ -138,8 +139,11 @@ function App() {
     <main className="consoleShell">
       <header className="systemBar">
         <div className="brandBlock">
-          <span className="eyebrow">Experiment Console</span>
-          <h1>实验控制台</h1>
+          <img className="brandLogo" src={experimentLogoUrl} alt="" />
+          <div className="brandText">
+            <span className="eyebrow">Experiment Console</span>
+            <h1>实验控制台</h1>
+          </div>
         </div>
         <div className="systemReadouts" aria-label="系统状态">
           <StatusPill status={overview?.status ?? 'loading'} degraded={overview?.degraded} />
