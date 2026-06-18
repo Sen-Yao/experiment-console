@@ -78,8 +78,8 @@ def build_plan(intent: IntentType, payload: dict, settings: Settings) -> Executi
         commands = [
             CommandPreview(
                 label="validate_single_run_config",
-                argv=["local-validator", "--profile", "single-run", "--config", parsed.config_path or parsed.remote_config or "<remote_config>"],
-                reason="Validate that the config expands to exactly one training command.",
+                argv=["remote-validator", "--profile", "single-run", "--config", parsed.config_path],
+                reason="Validate that the remote config expands to exactly one training command.",
             ),
             CommandPreview(
                 label="remote_preflight",

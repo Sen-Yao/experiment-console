@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-/opt/homebrew/bin/python3}"
+RUNNER_SCRIPT="${EXPERIMENT_RUNNER_SCRIPT:-$HOME/.agents/skills/experiment-runner/scripts/experiment.py}"
+CONSOLE_URL="${EXPERIMENT_CONSOLE_URL:-http://127.0.0.1:5174}"
+DEPS_DIR="${EXPERIMENT_CONSOLE_DEPS_DIR:-$ROOT/.local_deps}"
+PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-/private/tmp/pycache}"
+
+if [[ ! -r "$RUNNER_SCRIPT" ]]; then
+  echo "Missing experiment runner script: $RUNNER_SCRIPT" >&2
+  exit 2
+fi
+
+RUNNER_DIR="$(cd "$(dirname "$RUNNER_SCRIPT")" && pwd)"
+
+export EXPERIMENT_CONSOLE_URL="$CONSOLE_URL"
+export PYTHONPYCACHEPREFIX
+export PYTHONPATH="$DEPS_DIR:/private/tmp/experiment-console-deps:$RUNNER_DIR:${PYTHONPATH:-}"
+
+exec "$PYTHON_BIN" "$RUNNER_SCRIPT" "$@"

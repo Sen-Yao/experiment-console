@@ -97,10 +97,7 @@ http://127.0.0.1:5174/
 Use the installed runner as a thin client:
 
 ```bash
-EXPERIMENT_CONSOLE_URL=http://127.0.0.1:5174 \
-PYTHONPATH="/Users/oliver/Developer/experiment-console/.local_deps:/private/tmp/experiment-console-deps:/Users/oliver/.agents/skills/experiment-runner/scripts" \
-/opt/homebrew/bin/python3 /Users/oliver/.agents/skills/experiment-runner/scripts/experiment.py \
-  status --job-id job_20260615_152258_prod_matguardgt_cleg3_v4_console_20260615 --json
+./scripts/exp status --job-id job_20260615_152258_prod_matguardgt_cleg3_v4_console_20260615 --json
 ```
 
 Expected classification:
@@ -112,13 +109,9 @@ ok
 When local YAML dependencies are missing, use the zero-dependency Console client path:
 
 ```bash
-EXPERIMENT_CONSOLE_URL=http://127.0.0.1:5174 \
-/opt/homebrew/bin/python3 /Users/oliver/.agents/skills/experiment-runner/scripts/experiment.py \
-  console get /health
+./scripts/exp console get /health
 
-EXPERIMENT_CONSOLE_URL=http://127.0.0.1:5174 \
-/opt/homebrew/bin/python3 /Users/oliver/.agents/skills/experiment-runner/scripts/experiment.py \
-  console post /api/runner/status --data '{"job_id":"job_20260615_152258_prod_matguardgt_cleg3_v4_console_20260615"}'
+./scripts/exp console post /api/runner/status --data '{"job_id":"job_20260615_152258_prod_matguardgt_cleg3_v4_console_20260615"}'
 ```
 
 Current verified production sweep at the time of this handoff:
@@ -139,10 +132,7 @@ d38eb99
 Console-owned agent health check:
 
 ```bash
-EXPERIMENT_CONSOLE_URL=http://127.0.0.1:5174 \
-PYTHONPATH="/Users/oliver/Developer/experiment-console/.local_deps:/private/tmp/experiment-console-deps:/Users/oliver/.agents/skills/experiment-runner/scripts" \
-/opt/homebrew/bin/python3 /Users/oliver/.agents/skills/experiment-runner/scripts/experiment.py \
-  watchdog-once --job-id job_20260615_152258_prod_matguardgt_cleg3_v4_console_20260615 --json
+./scripts/exp watchdog-once --job-id job_20260615_152258_prod_matguardgt_cleg3_v4_console_20260615 --json
 ```
 
 Current compact status smoke:
@@ -164,17 +154,16 @@ agent_health=terminal
 Managed single-run smoke shape:
 
 ```bash
-EXPERIMENT_CONSOLE_URL=http://127.0.0.1:5174 \
-PYTHONPATH="/Users/oliver/Developer/experiment-console/.local_deps:/private/tmp/experiment-console-deps:/Users/oliver/.agents/skills/experiment-runner/scripts" \
-/opt/homebrew/bin/python3 /Users/oliver/.agents/skills/experiment-runner/scripts/experiment.py \
-  launch-run \
+./scripts/exp launch-run \
   --profile single-run \
   --name demo_single_run \
-  --remote-config /absolute/remote/single-run.yaml \
+  --config /home/linziyao/DualRefGAD/configs/demo_single_run.yaml \
   --remote-host HCCS-25 \
-  --remote-cwd /absolute/remote/project \
+  --remote-cwd /home/linziyao/DualRefGAD \
   --json
 ```
+
+For `launch-run`, `launch-sweep`, and `preflight`, `--config` is a remote path in the target checkout. Sync the YAML through GitHub, run `git pull --ff-only` on the remote host, and verify the file there before launching. The local `validate --config` command is a separate local-only check.
 
 Current bounded result smoke:
 

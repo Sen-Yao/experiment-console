@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -94,9 +93,10 @@ class ValidateConfigPayload(BaseModel):
 
 
 class LaunchSweepPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     job_name: str
-    remote_config: str | None = None
-    config_path: str | None = None
+    config_path: str
     entity: str | None = None
     project: str | None = None
     remote_host: str | None = None
@@ -115,17 +115,12 @@ class LaunchSweepPayload(BaseModel):
             raise ValueError("max_agents must be positive")
         return value
 
-    @model_validator(mode="after")
-    def require_remote_or_local_config(self) -> "LaunchSweepPayload":
-        if not self.remote_config and not self.config_path:
-            raise ValueError("remote_config is required for production launch; config_path is only a local debug fallback")
-        return self
-
 
 class LaunchRunPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     job_name: str
-    remote_config: str | None = None
-    config_path: str | None = None
+    config_path: str
     entity: str | None = None
     project: str | None = None
     remote_host: str | None = None
@@ -144,12 +139,6 @@ class LaunchRunPayload(BaseModel):
         if value is not None and value < 0:
             raise ValueError("gpu_index must be non-negative")
         return value
-
-    @model_validator(mode="after")
-    def require_remote_or_local_config(self) -> "LaunchRunPayload":
-        if not self.remote_config and not self.config_path:
-            raise ValueError("remote_config is required for production launch; config_path is only a local debug fallback")
-        return self
 
 
 class StatusQueryPayload(BaseModel):
@@ -248,12 +237,15 @@ class AuthCheckPayload(BaseModel):
 
 
 class PreflightPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     remote_host: str
     remote_cwd: str
-    remote_config: str | None = None
     config_path: str | None = None
     conda_env: str | None = None
     conda_sh: str | None = None
+    profile: Literal["sweep", "single-run"] | None = None
+    argv_probe: bool = True
 
 
 class PullResultsPayload(BaseModel):

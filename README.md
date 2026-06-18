@@ -132,6 +132,8 @@ Environment variables:
 
 The temporary local runtime and the full FastAPI runtime are expected to expose the same runner-facing contract. `experiment-runner` should call these endpoints instead of doing SSH, W&B, job-store, result aggregation, or watchdog side effects locally.
 
+For runner-facing launch and preflight calls, `config_path` means the YAML path on the remote host, not a local workstation path. The intended flow is to commit/push the config, pull it in the remote checkout, verify the remote file exists, then launch with a path such as `/home/linziyao/DualRefGAD/configs/demo.yaml`. The standalone `validate-config` endpoint remains a local validation helper and is separate from launch/preflight config handling.
+
 ## Development
 
 Run all checks:
