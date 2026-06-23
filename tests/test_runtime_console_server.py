@@ -59,6 +59,7 @@ def test_runtime_mounts_runner_contract(monkeypatch):
         ("/api/runner/repair-watchdog", {"job_id": "job1", "remote_cwd": "/project"}),
         ("/api/runner/schedule-monitor", {"job_id": "job1"}),
         ("/api/runner/unschedule-monitor", {"job_id": "job1"}),
+        ("/api/runner/advance-queue", {}),
     ]
     for path, payload in endpoints:
         response = client.post(path, json=payload)
@@ -76,4 +77,5 @@ def test_runtime_mounts_runner_contract(monkeypatch):
         "repair_watchdog",
         "schedule_monitor",
         "unschedule_monitor",
+        "advance_queue",
     ]

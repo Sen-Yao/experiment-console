@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import statistics
 from datetime import datetime, timezone
 from typing import Any
 
@@ -10,6 +11,7 @@ from .command import CommandFailed
 from .config import Settings
 from .models import (
     AuditEvent,
+    AdvanceQueuePayload,
     ConfirmRequest,
     ExecuteResponse,
     IntentPreviewRequest,
@@ -70,6 +72,7 @@ MUTATING_INTENTS = {
     IntentType.unschedule_monitor,
     IntentType.watchdog_once,
     IntentType.pull_results,
+    IntentType.advance_queue,
 }
 
 
@@ -91,6 +94,100 @@ OPEN_OPERATION_STATUSES = {OperationStatus.accepted.value, OperationStatus.execu
 SINGLE_RUN_BOUNDARY_NEXT_ACTIONS = [
     "launch-run 只接受所有参数均为单值的 single-run 配置；这个配置会展开成多次运行，请改用 launch-sweep。",
 ]
+
+
+TERMINAL_SWEEP_STATES = {"finished", "failed", "crashed", "killed", "canceled", "cancelled"}
+
+
+def result_pull_classification(result: dict[str, Any]) -> str:
+    if result.get("classification") == "result_sources_unavailable":
+        return "result_sources_unavailable"
+    if result.get("truncated"):
+        return "truncated_results"
+    if to_non_negative_int(result.get("valid_results")) <= 0:
+        return "no_scientific_results_yet"
+    if not result.get("complete"):
+        return "partial_results"
+    return "ok"
+
+
+def classify_result_readiness(result: dict[str, Any] | None, sweep_state: str | None = None) -> str:
+    if not isinstance(result, dict):
+        return "unknown"
+    if result.get("readiness") in {"unknown", "none", "partial", "truncated", "complete", "complete_with_failures"}:
+        return str(result["readiness"])
+    if result.get("truncated"):
+        return "truncated"
+    valid = to_non_negative_int(result.get("valid_runs", result.get("valid_results")))
+    if valid <= 0:
+        return "none"
+    missing = to_non_negative_int(result.get("missing_runs", result.get("missing_results")))
+    failed = to_non_negative_int(result.get("failed_runs", result.get("failed_results")))
+    complete = bool(result.get("complete"))
+    if complete:
+        return "complete_with_failures" if (missing or failed) else "complete"
+    if sweep_state and str(sweep_state).lower() not in TERMINAL_SWEEP_STATES:
+        return "partial"
+    return "partial"
+
+
+def numeric_metric(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def build_result_groups(rows: list[dict[str, Any]], group_keys: list[str], metric_keys: list[str]) -> dict[str, Any]:
+    if not group_keys:
+        return {"groups": [], "top_groups": []}
+    metrics = list(metric_keys)
+    if not metrics:
+        seen: list[str] = []
+        for row in rows:
+            for key, value in (row.get("metrics") or {}).items():
+                if key not in seen and numeric_metric(value) is not None:
+                    seen.append(key)
+        metrics = seen
+    grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for row in rows:
+        config = row.get("config") if isinstance(row.get("config"), dict) else {}
+        key = tuple(config.get(group_key) for group_key in group_keys)
+        grouped.setdefault(key, []).append(row)
+    groups: list[dict[str, Any]] = []
+    for key, group_rows in grouped.items():
+        item: dict[str, Any] = {
+            "config": dict(zip(group_keys, key)),
+            "count": len(group_rows),
+            "valid_count": sum(1 for row in group_rows if row.get("has_scientific_result")),
+            "run_ids": [row.get("run_id") for row in group_rows if row.get("run_id")],
+            "metrics": {},
+        }
+        for metric in metrics:
+            values = [
+                numeric
+                for row in group_rows
+                if (numeric := numeric_metric((row.get("metrics") or {}).get(metric))) is not None
+            ]
+            if values:
+                item["metrics"][metric] = {
+                    "mean": sum(values) / len(values),
+                    "std": statistics.pstdev(values) if len(values) > 1 else 0.0,
+                    "min": min(values),
+                    "max": max(values),
+                }
+        groups.append(item)
+    if metrics:
+        first_metric = metrics[0]
+        top_groups = sorted(
+            [group for group in groups if first_metric in group.get("metrics", {})],
+            key=lambda group: group["metrics"][first_metric]["mean"],
+            reverse=True,
+        )
+    else:
+        top_groups = []
+    return {"groups": groups, "top_groups": top_groups[:20]}
 
 
 class ConsoleService:
@@ -135,6 +232,107 @@ class ConsoleService:
         idem_key = str(raw_key)
         op_seed = hashlib.sha256(f"{intent.value}:{idem_key}".encode("utf-8")).hexdigest()[:12]
         return f"op_{intent.value}_{op_seed}", idem_key
+
+    def _materialize_result_snapshot(
+        self,
+        *,
+        job: JobRecord | None,
+        entity: str | None,
+        project: str | None,
+        sweep_id: str | None,
+        result: dict[str, Any],
+        group_keys: list[str],
+        metric_keys: list[str],
+        expected_runs: int | None,
+        discovered_runs: int | None,
+        requested_limit: int | None,
+        run_id_source: str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        rows = result.get("rows") if isinstance(result.get("rows"), list) else []
+        fetched_runs = len(rows)
+        valid_runs = to_non_negative_int(result.get("valid_results"))
+        if "valid_results" not in result:
+            valid_runs = sum(1 for row in rows if isinstance(row, dict) and row.get("has_scientific_result"))
+        missing_runs = to_non_negative_int(result.get("missing_results"))
+        failed_runs = to_non_negative_int(result.get("failed_results"))
+        coverage_target = expected_runs or discovered_runs
+        truncated = bool(result.get("truncated"))
+        if requested_limit is not None and coverage_target and requested_limit < coverage_target:
+            truncated = True
+        if discovered_runs is not None and fetched_runs < discovered_runs and requested_limit is not None:
+            truncated = True
+        complete = bool(coverage_target and fetched_runs >= coverage_target and not truncated)
+        groups = build_result_groups(rows, group_keys, metric_keys)
+        enriched = {
+            **result,
+            "expected_runs": expected_runs,
+            "discovered_runs": discovered_runs,
+            "requested_limit": requested_limit,
+            "fetched_runs": fetched_runs,
+            "valid_runs": valid_runs,
+            "missing_runs": missing_runs,
+            "failed_runs": failed_runs,
+            "truncated": truncated,
+            "complete": complete,
+            "groups": groups["groups"],
+            "top_groups": groups["top_groups"],
+        }
+        readiness = classify_result_readiness(enriched)
+        classification = result_pull_classification(enriched)
+        enriched["classification"] = classification
+        enriched["readiness"] = readiness
+        snapshot_id = new_id("result_snapshot", job.job_id if job else (sweep_id or "unknown"))
+        snapshot_key = job.job_id if job else (sweep_id or "unknown")
+        safe_key = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in snapshot_key)
+        snapshot_dir = self.settings.results_dir / safe_key
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_path = snapshot_dir / f"{snapshot_id}.json"
+        provenance = {
+            "run_id_source": run_id_source or result.get("run_id_source"),
+            "config_sources": result.get("config_sources", {}),
+            "metric_sources": result.get("metric_sources", {}),
+            "missing_config_keys": result.get("missing_config_keys", {}),
+        }
+        for key_name in ["remote_error", "wandb_error"]:
+            if result.get(key_name):
+                provenance[key_name] = result[key_name]
+        snapshot = {
+            "identity": {
+                "snapshot_id": snapshot_id,
+                "job_id": job.job_id if job else None,
+                "entity": entity,
+                "project": project,
+                "sweep_id": sweep_id,
+                "source": result.get("source"),
+                "generated_at": utc_now(),
+            },
+            "completeness": {
+                "expected_runs": expected_runs,
+                "discovered_runs": discovered_runs,
+                "requested_limit": requested_limit,
+                "fetched_runs": fetched_runs,
+                "valid_runs": valid_runs,
+                "missing_runs": missing_runs,
+                "failed_runs": failed_runs,
+                "truncated": truncated,
+                "complete": complete,
+            },
+            "rows": rows,
+            "groups": groups["groups"],
+            "top_groups": groups["top_groups"],
+            "provenance": provenance,
+            "classification": classification,
+            "readiness": readiness,
+        }
+        snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        summary = summarize_result_pull({
+            **enriched,
+            "snapshot_id": snapshot_id,
+            "snapshot_path": str(snapshot_path),
+        })
+        summary["path"] = str(snapshot_path)
+        enriched["snapshot"] = summary
+        return enriched, summary
 
     def _current_operation(self, job: JobRecord | None) -> dict[str, Any] | None:
         if not job:
@@ -522,7 +720,199 @@ class ConsoleService:
             return self._preflight(parsed), None
         if isinstance(parsed, PullResultsPayload):
             return self._pull_results(parsed, requested_by=requested_by, operation_id=operation_id, idempotency_key=idempotency_key), None
+        if isinstance(parsed, AdvanceQueuePayload):
+            return self._advance_queue(parsed, requested_by=requested_by, operation_id=operation_id, idempotency_key=idempotency_key), None
         raise ValueError(f"unsupported intent: {intent}")
+
+    def _queue_group_for(self, *, remote_host: str, remote_cwd: str, payload: LaunchSweepPayload) -> str:
+        return payload.queue_group or f"{remote_host}:{remote_cwd}"
+
+    def _queue_position(self, job: JobRecord) -> dict[str, Any] | None:
+        queue = job.monitor.get("queue") if isinstance(job.monitor.get("queue"), dict) else {}
+        queue_group = queue.get("queue_group")
+        if not queue_group:
+            return None
+        queued_jobs = self.store.list_queued_jobs(str(queue_group))
+        blocker = self.store.active_queue_blocker(str(queue_group), exclude_job_id=job.job_id)
+        position = None
+        for index, queued in enumerate(queued_jobs, start=1):
+            if queued.job_id == job.job_id:
+                position = index
+                break
+        blocked_by = queue.get("blocked_by_job_id") or (blocker.job_id if blocker else None)
+        return {
+            "queue_group": queue_group,
+            "queue_position": position,
+            "blocked_by_job_id": blocked_by,
+            "queued_count": len(queued_jobs),
+        }
+
+    def _queued_replay_result(self, job: JobRecord) -> dict[str, Any]:
+        return {
+            "stage": "queued",
+            "classification": "queued",
+            "created_new_sweep": False,
+            "job": job.model_dump(mode="json"),
+            "queue": self._queue_position(job),
+            "next_actions": [
+                "Queued only: W&B sweep has not been created. Wait for the blocker to finish, then run advance-queue.",
+            ],
+        }
+
+    def _queue_sweep(
+        self,
+        payload: LaunchSweepPayload,
+        *,
+        entity: str,
+        project: str,
+        remote_host: str,
+        remote_cwd: str,
+        conda_env: str,
+        queue_group: str,
+        blocker: JobRecord,
+        operation_id: str,
+        idempotency_key: str,
+        requested_by: str,
+        conflicting_jobs: list[JobRecord],
+        preflight: dict[str, Any] | None = None,
+        validation: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], JobRecord]:
+        job = JobRecord(
+            job_id=new_id("job", payload.job_name),
+            name=payload.job_name,
+            status=JobStatus.queued,
+            operation_id=operation_id,
+            idempotency_key=idempotency_key,
+            entity=entity,
+            project=project,
+            config_path=str(payload.config_path),
+            remote_host=remote_host,
+            remote_cwd=remote_cwd,
+            conda_env=conda_env,
+            monitor={
+                "kind": "sweep",
+                "stage": "queued",
+                "classification": "queued",
+                "created_new_sweep": False,
+                "launch_identity_conflicts": [
+                    {
+                        "job_id": conflict.job_id,
+                        "kind": infer_job_kind(conflict),
+                        "status": conflict.status.value,
+                    }
+                    for conflict in conflicting_jobs[:5]
+                ],
+                "preflight": preflight,
+                "validation": validation,
+                "queue": {
+                    "queue_group": queue_group,
+                    "queue_policy": payload.queue_policy,
+                    "queue_after_job_id": payload.queue_after_job_id,
+                    "blocked_by_job_id": blocker.job_id,
+                    "payload": payload.model_dump(mode="json"),
+                    "queued_at": utc_now(),
+                },
+            },
+        )
+        self.store.upsert_job(job)
+        queue_state = self._queue_position(job) or {"queue_group": queue_group, "blocked_by_job_id": blocker.job_id}
+        result = {
+            "stage": "queued",
+            "classification": "queued",
+            "created_new_sweep": False,
+            "job_id": job.job_id,
+            "queue": queue_state,
+            "launch_identity_conflicts": job.monitor.get("launch_identity_conflicts") or [],
+            "next_actions": [
+                "Queued only: W&B sweep has not been created and no agents were launched.",
+                "When the blocking job reaches a terminal state, run advance-queue or let watchdog-once advance it.",
+            ],
+        }
+        self._record_operation(
+            job,
+            operation_id=operation_id,
+            intent=IntentType.launch_sweep,
+            requested_by=requested_by,
+            idempotency_key=idempotency_key,
+            stage="queued",
+            classification="queued",
+            status=OperationStatus.accepted.value,
+            result=result,
+            retry_after_seconds=30,
+        )
+        return result, job
+
+    def _sweep_entrypoint_probe(
+        self,
+        *,
+        remote_config_text: str,
+        remote_host: str,
+        remote_cwd: str,
+        conda_env: str | None,
+        conda_sh: str | None,
+    ) -> dict[str, Any]:
+        try:
+            config = load_yaml_text(remote_config_text)
+            program = config.get("program")
+            if not program:
+                return {
+                    "classification": "argv_probe_unavailable",
+                    "returncode": None,
+                    "stdout_tail": "",
+                    "stderr_tail": "config has no program field",
+                    "timed_out": False,
+                    "probe_argv": [],
+                }
+            return self.ssh.probe_argv_compat(
+                host=remote_host,
+                remote_cwd=remote_cwd,
+                argv=["python", str(program)],
+                conda_env=conda_env,
+                conda_sh=conda_sh,
+            )
+        except Exception as exc:
+            return {
+                "classification": "argv_probe_unavailable",
+                "returncode": None,
+                "stdout_tail": "",
+                "stderr_tail": compact_error(exc),
+                "timed_out": False,
+                "probe_argv": [],
+            }
+
+    def _sweep_launch_preflight(
+        self,
+        *,
+        remote_host: str,
+        remote_cwd: str,
+        remote_config_path: str,
+        conda_env: str | None,
+        conda_sh: str | None,
+        profile: str,
+    ) -> dict[str, Any]:
+        remote_snapshot = self.ssh.read_remote_file(host=remote_host, remote_path=remote_config_path)
+        validation = validate_experiment_config_text(remote_snapshot["text"], profile, path_label=remote_config_path)
+        entrypoint_probe = self._sweep_entrypoint_probe(
+            remote_config_text=remote_snapshot["text"],
+            remote_host=remote_host,
+            remote_cwd=remote_cwd,
+            conda_env=conda_env,
+            conda_sh=conda_sh,
+        )
+        validation["entrypoint_probe"] = entrypoint_probe
+        classification = "preflight_ok" if entrypoint_probe.get("classification") == "argv_compatible" else "entrypoint_probe_failed"
+        return {
+            "classification": classification,
+            "ok": classification == "preflight_ok",
+            "remote_config_snapshot": remote_snapshot,
+            "validation": validation,
+            "entrypoint_probe": entrypoint_probe,
+            "preflight": {
+                "entrypoint_probe": entrypoint_probe,
+                "classification": classification,
+                "ok": classification == "preflight_ok",
+            },
+        }
 
     def _launch_sweep(self, payload: LaunchSweepPayload, *, requested_by: str = "experiment-runner", operation_id: str | None = None, idempotency_key: str | None = None) -> tuple[dict[str, Any], JobRecord]:
         entity = payload.entity or self.settings.default_entity
@@ -530,7 +920,6 @@ class ConsoleService:
         remote_host = payload.remote_host or self.settings.default_remote_host
         remote_cwd = payload.remote_cwd or self.settings.default_remote_cwd
         conda_env = payload.conda_env or self.settings.default_conda_env
-        conda_sh = payload.conda_sh or self.settings.default_conda_sh
         remote_config_path = payload.config_path
         operation_id = operation_id or self._operation_identity(IntentType.launch_sweep, payload.model_dump(mode="json"))[0]
         idempotency_key = idempotency_key or self._operation_identity(IntentType.launch_sweep, payload.model_dump(mode="json"))[1]
@@ -543,6 +932,8 @@ class ConsoleService:
         conflicting_jobs = [job for job in matching_jobs if infer_job_kind(job) not in {"sweep"}]
         existing = next((job for job in matching_jobs if infer_job_kind(job) == "sweep"), None)
         if existing:
+            if existing.status == JobStatus.queued:
+                return self._queued_replay_result(existing), existing
             if not self._current_operation(existing):
                 self._record_operation(
                     existing,
@@ -567,7 +958,156 @@ class ConsoleService:
                 "job": existing.model_dump(mode="json"),
                 "next_actions": ["使用 recover-agents 为既有 sweep 补 agent，而不是重新创建 sweep。"],
             }, existing
+        queue_group = self._queue_group_for(remote_host=remote_host, remote_cwd=remote_cwd, payload=payload)
+        blocker = self.store.get_job(payload.queue_after_job_id) if payload.queue_after_job_id else None
+        if payload.queue_after_job_id and blocker is None:
+            raise ValueError(f"queue_after_job_id not found: {payload.queue_after_job_id}")
+        if blocker:
+            blocker_queue = blocker.monitor.get("queue") if isinstance(blocker.monitor.get("queue"), dict) else {}
+            blocker_group = blocker_queue.get("queue_group") or (
+                f"{blocker.remote_host}:{blocker.remote_cwd}" if blocker.remote_host and blocker.remote_cwd else None
+            )
+            if blocker_group and blocker_group != queue_group:
+                raise ValueError(
+                    f"queue_after_job_id belongs to queue_group {blocker_group}, not {queue_group}"
+                )
+        if blocker and blocker.status in TERMINAL_JOB_STATUSES:
+            blocker = None
+        if payload.queue_policy == "sequential" and blocker is None:
+            blocker = self.store.active_queue_blocker(queue_group)
+        if payload.queue_policy == "sequential" and blocker is not None:
+            try:
+                launch_preflight = self._sweep_launch_preflight(
+                    remote_host=remote_host,
+                    remote_cwd=remote_cwd,
+                    remote_config_path=remote_config_path,
+                    conda_env=conda_env,
+                    conda_sh=payload.conda_sh or self.settings.default_conda_sh,
+                    profile=payload.profile,
+                )
+            except Exception as exc:
+                job = JobRecord(
+                    job_id=new_id("job", payload.job_name),
+                    name=payload.job_name,
+                    status=JobStatus.failed,
+                    operation_id=operation_id,
+                    idempotency_key=idempotency_key,
+                    entity=entity,
+                    project=project,
+                    config_path=str(remote_config_path),
+                    remote_host=remote_host,
+                    remote_cwd=remote_cwd,
+                    conda_env=conda_env,
+                )
+                return self._fail_launch_job(
+                    job,
+                    intent=IntentType.launch_sweep,
+                    operation_id=operation_id,
+                    requested_by=requested_by,
+                    idempotency_key=idempotency_key,
+                    stage="validation_failed",
+                    classification="validation_failed",
+                    exc=exc,
+                    next_actions=["修复 sweep 配置或远端 config 路径后，再重新 launch-sweep。"],
+                )
+            if launch_preflight["classification"] != "preflight_ok":
+                job = JobRecord(
+                    job_id=new_id("job", payload.job_name),
+                    name=payload.job_name,
+                    status=JobStatus.attention,
+                    operation_id=operation_id,
+                    idempotency_key=idempotency_key,
+                    entity=entity,
+                    project=project,
+                    config_path=str(remote_config_path),
+                    remote_host=remote_host,
+                    remote_cwd=remote_cwd,
+                    conda_env=conda_env,
+                    monitor={
+                        "kind": "sweep",
+                        "validation": launch_preflight["validation"],
+                        "preflight": launch_preflight["preflight"],
+                        "stage": "preflight_failed",
+                        "classification": "entrypoint_probe_failed",
+                    },
+                )
+                self.store.upsert_job(job)
+                result = {
+                    "stage": "preflight_failed",
+                    "classification": "entrypoint_probe_failed",
+                    "created_new_sweep": False,
+                    "job_id": job.job_id,
+                    "validation": launch_preflight["validation"],
+                    "entrypoint_probe": launch_preflight["entrypoint_probe"],
+                    "preflight": launch_preflight["preflight"],
+                    "next_actions": ["修复 sweep program 入口、导入路径或 --help CLI 后，再重新 launch-sweep。"],
+                }
+                self._record_operation(
+                    job,
+                    operation_id=operation_id,
+                    intent=IntentType.launch_sweep,
+                    requested_by=requested_by,
+                    idempotency_key=idempotency_key,
+                    stage="preflight_failed",
+                    classification="entrypoint_probe_failed",
+                    status=OperationStatus.failed.value,
+                    result=result,
+                )
+                return result, job
+            return self._queue_sweep(
+                payload,
+                entity=entity,
+                project=project,
+                remote_host=remote_host,
+                remote_cwd=remote_cwd,
+                conda_env=conda_env,
+                queue_group=queue_group,
+                blocker=blocker,
+                operation_id=operation_id,
+                idempotency_key=idempotency_key,
+                requested_by=requested_by,
+                conflicting_jobs=conflicting_jobs,
+                preflight=launch_preflight["preflight"],
+                validation=launch_preflight["validation"],
+            )
+        return self._launch_sweep_now(
+            payload,
+            requested_by=requested_by,
+            operation_id=operation_id,
+            idempotency_key=idempotency_key,
+            queue_group=queue_group,
+            conflicting_jobs=conflicting_jobs,
+        )
 
+    def _launch_sweep_now(
+        self,
+        payload: LaunchSweepPayload,
+        *,
+        requested_by: str = "experiment-runner",
+        operation_id: str | None = None,
+        idempotency_key: str | None = None,
+        queue_group: str | None = None,
+        queued_job: JobRecord | None = None,
+        conflicting_jobs: list[JobRecord] | None = None,
+    ) -> tuple[dict[str, Any], JobRecord]:
+        entity = payload.entity or self.settings.default_entity
+        project = payload.project or self.settings.default_project
+        remote_host = payload.remote_host or self.settings.default_remote_host
+        remote_cwd = payload.remote_cwd or self.settings.default_remote_cwd
+        conda_env = payload.conda_env or self.settings.default_conda_env
+        conda_sh = payload.conda_sh or self.settings.default_conda_sh
+        remote_config_path = payload.config_path
+        operation_id = operation_id or self._operation_identity(IntentType.launch_sweep, payload.model_dump(mode="json"))[0]
+        idempotency_key = idempotency_key or self._operation_identity(IntentType.launch_sweep, payload.model_dump(mode="json"))[1]
+        if conflicting_jobs is None:
+            matching_jobs = self.store.find_jobs_by_launch_identity(
+                name=payload.job_name,
+                config_path=str(remote_config_path),
+                remote_host=remote_host,
+                remote_cwd=remote_cwd,
+            )
+            conflicting_jobs = [job for job in matching_jobs if infer_job_kind(job) not in {"sweep"}]
+        queue_group = queue_group or self._queue_group_for(remote_host=remote_host, remote_cwd=remote_cwd, payload=payload)
         job = JobRecord(
             job_id=new_id("job", payload.job_name),
             name=payload.job_name,
@@ -583,6 +1123,13 @@ class ConsoleService:
             monitor={
                 "kind": "sweep",
                 "stage": "validating",
+                "queue": {
+                    "queue_group": queue_group,
+                    "queue_policy": payload.queue_policy,
+                    "queue_after_job_id": payload.queue_after_job_id,
+                    "started_from_queue": bool(queued_job),
+                    "payload": payload.model_dump(mode="json"),
+                },
                 "launch_identity_conflicts": [
                     {
                         "job_id": conflict.job_id,
@@ -593,6 +1140,39 @@ class ConsoleService:
                 ],
             },
         )
+        if queued_job:
+            job = queued_job
+            job.status = JobStatus.validating
+            job.operation_id = operation_id
+            job.idempotency_key = idempotency_key
+            job.entity = entity
+            job.project = project
+            job.config_path = str(remote_config_path)
+            job.remote_host = remote_host
+            job.remote_cwd = remote_cwd
+            job.conda_env = conda_env
+            job.monitor.update({
+                "kind": "sweep",
+                "stage": "validating",
+                "classification": "accepted",
+                "queue": {
+                    **(job.monitor.get("queue") if isinstance(job.monitor.get("queue"), dict) else {}),
+                    "queue_group": queue_group,
+                    "queue_policy": payload.queue_policy,
+                    "queue_after_job_id": payload.queue_after_job_id,
+                    "started_from_queue": True,
+                    "started_at": utc_now(),
+                    "payload": payload.model_dump(mode="json"),
+                },
+                "launch_identity_conflicts": [
+                    {
+                        "job_id": conflict.job_id,
+                        "kind": infer_job_kind(conflict),
+                        "status": conflict.status.value,
+                    }
+                    for conflict in conflicting_jobs[:5]
+                ],
+            })
         self.store.upsert_job(job)
         self._record_operation(
             job,
@@ -613,8 +1193,16 @@ class ConsoleService:
             retry_after_seconds=2,
         )
         try:
-            remote_snapshot = self.ssh.read_remote_file(host=remote_host, remote_path=remote_config_path)
-            validation = validate_experiment_config_text(remote_snapshot["text"], payload.profile, path_label=remote_config_path)
+            launch_preflight = self._sweep_launch_preflight(
+                remote_host=remote_host,
+                remote_cwd=remote_cwd,
+                remote_config_path=remote_config_path,
+                conda_env=conda_env,
+                conda_sh=conda_sh,
+                profile=payload.profile,
+            )
+            validation = launch_preflight["validation"]
+            entrypoint_probe = launch_preflight["entrypoint_probe"]
         except Exception as exc:
             return self._fail_launch_job(
                 job,
@@ -629,6 +1217,38 @@ class ConsoleService:
             )
         job.monitor.update({"validation": validation, "stage": "validating"})
         self.store.upsert_job(job)
+        if launch_preflight["classification"] != "preflight_ok":
+            classification = "entrypoint_probe_failed"
+            job.status = JobStatus.attention
+            job.monitor.update({
+                "validation": validation,
+                "preflight": launch_preflight["preflight"],
+                "stage": "preflight_failed",
+                "classification": classification,
+            })
+            self.store.upsert_job(job)
+            result = {
+                "stage": "preflight_failed",
+                "classification": classification,
+                "created_new_sweep": False,
+                "job_id": job.job_id,
+                "validation": validation,
+                "entrypoint_probe": entrypoint_probe,
+                "preflight": job.monitor["preflight"],
+                "next_actions": ["修复 sweep program 入口、导入路径或 --help CLI 后，再重新 launch-sweep。"],
+            }
+            self._record_operation(
+                job,
+                operation_id=operation_id,
+                intent=IntentType.launch_sweep,
+                requested_by=requested_by,
+                idempotency_key=idempotency_key,
+                stage="preflight_failed",
+                classification=classification,
+                status=OperationStatus.failed.value,
+                result=result,
+            )
+            return result, job
         try:
             preflight = self.ssh.preflight(
                 host=remote_host,
@@ -637,6 +1257,7 @@ class ConsoleService:
                 conda_sh=conda_sh,
                 config_path=remote_config_path,
             )
+            preflight["entrypoint_probe"] = entrypoint_probe
         except Exception as exc:
             return self._fail_launch_job(
                 job,
@@ -792,6 +1413,83 @@ class ConsoleService:
             "launch_identity_conflicts": job.monitor.get("launch_identity_conflicts") or [],
             "next_actions": next_actions_for_classification(classification),
         }, job
+
+    def _advance_queue(
+        self,
+        payload: AdvanceQueuePayload,
+        *,
+        requested_by: str = "experiment-runner",
+        operation_id: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        groups = [payload.queue_group] if payload.queue_group else self.store.queue_groups()
+        advanced: list[dict[str, Any]] = []
+        blocked: list[dict[str, Any]] = []
+        idle: list[str] = []
+        for queue_group in [str(group) for group in groups if group]:
+            blocker = self.store.active_queue_blocker(queue_group)
+            if blocker:
+                blocked.append({
+                    "queue_group": queue_group,
+                    "blocked_by_job_id": blocker.job_id,
+                    "blocked_by_status": blocker.status.value,
+                })
+                continue
+            queued = self.store.next_queued_job(queue_group)
+            if not queued:
+                idle.append(queue_group)
+                continue
+            queue_meta = queued.monitor.get("queue") if isinstance(queued.monitor.get("queue"), dict) else {}
+            raw_payload = queue_meta.get("payload")
+            if not isinstance(raw_payload, dict):
+                queued.status = JobStatus.failed
+                queued.monitor.update({
+                    "stage": "queue_failed",
+                    "classification": "queued_payload_missing",
+                    "error": "queued launch payload is missing",
+                })
+                self.store.upsert_job(queued)
+                blocked.append({
+                    "queue_group": queue_group,
+                    "blocked_by_job_id": queued.job_id,
+                    "blocked_by_status": queued.status.value,
+                    "classification": "queued_payload_missing",
+                })
+                continue
+            launch_payload = LaunchSweepPayload.model_validate({
+                **raw_payload,
+                "queue_group": queue_group,
+            })
+            launch_operation_id = operation_id or self._operation_identity(IntentType.launch_sweep, launch_payload.model_dump(mode="json"))[0]
+            launch_idempotency_key = idempotency_key or self._operation_identity(IntentType.launch_sweep, launch_payload.model_dump(mode="json"))[1]
+            result, started_job = self._launch_sweep_now(
+                launch_payload,
+                requested_by=requested_by,
+                operation_id=launch_operation_id,
+                idempotency_key=launch_idempotency_key,
+                queue_group=queue_group,
+                queued_job=queued,
+            )
+            advanced.append({
+                "queue_group": queue_group,
+                "job_id": started_job.job_id,
+                "classification": result.get("classification"),
+                "stage": result.get("stage"),
+                "created_new_sweep": result.get("created_new_sweep"),
+            })
+        classification = "advanced" if advanced else "blocked" if blocked else "idle"
+        return {
+            "stage": "done",
+            "classification": classification,
+            "advanced": advanced,
+            "blocked": blocked,
+            "idle": idle,
+            "next_actions": [
+                "Monitor any advanced job with status/watchdog-once.",
+            ] if advanced else [
+                "No queued sweep was started; inspect queue for blockers.",
+            ],
+        }
 
     def _create_sweep(self, remote_config_path: str, *, entity: str, project: str, payload: LaunchSweepPayload) -> dict[str, Any]:
         remote_host = payload.remote_host or self.settings.default_remote_host
@@ -1148,7 +1846,10 @@ class ConsoleService:
         entity = (job.entity if job else None) or self.settings.default_entity
         project = (job.project if job else None) or self.settings.default_project
         sweep_id = payload.sweep_id or (job.sweep_id if job else None)
+        result_snapshot = job.monitor.get("last_result_snapshot") if job else None
         result_pull = job.monitor.get("last_result_pull") if job else None
+        result_for_readiness = result_snapshot or result_pull
+        queue_state = self._queue_position(job) if job else None
         run_status = None
         if job and job.monitor.get("kind") == "single_run":
             run_meta = job.monitor.get("run") if isinstance(job.monitor.get("run"), dict) else {}
@@ -1195,7 +1896,7 @@ class ConsoleService:
         if job and job.entity and job.project and job.sweep_id:
             sweep_path = str(job.monitor.get("sweep_path") or f"{job.entity}/{job.project}/{job.sweep_id}")
         agent_probe = None
-        if job and job.monitor.get("kind") != "single_run" and job.remote_host and (job.agent_pids or sweep_path):
+        if job and job.status != JobStatus.queued and job.monitor.get("kind") != "single_run" and job.remote_host and (job.agent_pids or sweep_path):
             try:
                 agent_probe = self.ssh.check_agent_processes(
                     host=job.remote_host,
@@ -1224,18 +1925,22 @@ class ConsoleService:
                 agent_health = "running"
             elif job.status == JobStatus.running and agent_launches:
                 agent_health = "missing"
+            elif job.status == JobStatus.running and sweep and str(sweep.get("state") or "").lower() == "running":
+                agent_health = "running"
             elif job.status in TERMINAL_JOB_STATUSES:
                 agent_health = "terminal"
             else:
                 agent_health = "unknown"
         elif job and job.status == JobStatus.running:
-            agent_health = "running" if agent_launches else "missing"
+            agent_health = "running" if agent_launches or (sweep and str(sweep.get("state") or "").lower() == "running") else "missing"
         elif job and job.status in TERMINAL_JOB_STATUSES:
             agent_health = "terminal"
+        elif job and job.status == JobStatus.queued:
+            agent_health = "queued"
         sweep_attention = False
         sweep_attention_reasons: list[str] = []
         if job and job.monitor.get("kind") != "single_run" and sweep:
-            sweep_attention, sweep_attention_reasons = sweep_requires_attention(sweep, result_pull)
+            sweep_attention, sweep_attention_reasons = sweep_requires_attention(sweep, result_for_readiness)
             if sweep_attention and job.status == JobStatus.running:
                 try:
                     job = self.store.update_job_status(job.job_id, JobStatus.attention, {"sweep_attention_reasons": sweep_attention_reasons})
@@ -1255,14 +1960,7 @@ class ConsoleService:
                 self.store.upsert_job(job)
         elif job and isinstance(job.monitor.get("last_failure_diagnostics"), dict):
             failure_diagnostics = job.monitor["last_failure_diagnostics"]
-        result_readiness = "unknown"
-        if isinstance(result_pull, dict):
-            if result_pull.get("valid_results", 0):
-                result_readiness = "ready"
-            elif result_pull.get("partial"):
-                result_readiness = "partial"
-            else:
-                result_readiness = "empty"
+        result_readiness = classify_result_readiness(result_for_readiness, sweep.get("state") if sweep else None)
         classification = "ok"
         next_actions: list[str] = []
         if missing_requested_job:
@@ -1270,6 +1968,9 @@ class ConsoleService:
             next_actions = [
                 "使用 register-existing-sweep 将已有 W&B sweep 登记到 Console ledger，或确认 job_id 是否来自当前 state_dir。",
             ]
+        elif job and job.status == JobStatus.queued:
+            classification = "queued"
+            next_actions = ["Queued only: W&B sweep has not been created. Wait for the blocker to finish, then run advance-queue."]
         elif degraded:
             classification = "degraded"
             next_actions = ["稍后重试 status；如持续 degraded，检查 W&B/API 网络与本地 WANDB_API_KEY。"]
@@ -1298,7 +1999,9 @@ class ConsoleService:
             "results": {
                 "readiness": result_readiness,
                 "last_pull": result_pull,
+                "last_snapshot": result_snapshot,
             },
+            "queue": queue_state,
             "failure_diagnostics": failure_diagnostics,
             "state": {
                 "job_status": job.status.value if job else None,
@@ -1308,6 +2011,7 @@ class ConsoleService:
                 "result_readiness": result_readiness,
                 "sweep_attention": sweep_attention,
                 "sweep_attention_reasons": sweep_attention_reasons,
+                "queue": queue_state,
             },
             "degraded": degraded,
             "next_actions": next_actions,
@@ -1317,7 +2021,8 @@ class ConsoleService:
     def _stop(self, payload: StopJobPayload, *, requested_by: str = "experiment-runner", operation_id: str | None = None, idempotency_key: str | None = None) -> tuple[dict[str, Any], JobRecord]:
         job = self._require_job(payload.job_id)
         is_single_run = job.monitor.get("kind") == "single_run"
-        if not is_single_run and (not job.sweep_id or not job.entity or not job.project or not job.remote_host):
+        is_queued = job.status == JobStatus.queued
+        if not is_single_run and not is_queued and (not job.sweep_id or not job.entity or not job.project or not job.remote_host):
             raise ValueError("job lacks sweep/remote metadata required for stop")
         if is_single_run and not job.remote_host:
             raise ValueError("job lacks remote metadata required for stop")
@@ -1336,7 +2041,10 @@ class ConsoleService:
             retry_after_seconds=2,
         )
         result = {"cancel_wandb_requested": payload.cancel_wandb, "cancel_wandb_implemented": False}
-        if payload.kill_agents:
+        if is_queued:
+            result["queued_cancelled"] = True
+            result["note"] = "Queued job had no W&B sweep or agents."
+        elif payload.kill_agents:
             if is_single_run:
                 result["stop_run"] = self.ssh.stop_pids(host=job.remote_host, pids=job.agent_pids)
             else:
@@ -1786,6 +2494,13 @@ class ConsoleService:
             "failure_diagnostics": status_result.get("failure_diagnostics"),
             "status_result": status_result,
         }
+        if is_terminal:
+            queue_group = ((status_result.get("queue") or {}).get("queue_group") if isinstance(status_result.get("queue"), dict) else None)
+            if queue_group:
+                result["queue_advance"] = self._advance_queue(
+                    AdvanceQueuePayload(queue_group=queue_group),
+                    requested_by=requested_by,
+                )
         job_record = self.store.get_job(payload.job_id)
         if job_record:
             operation_id = operation_id or self._operation_identity(IntentType.watchdog_once, payload.model_dump(mode="json"))[0]
@@ -1832,7 +2547,19 @@ class ConsoleService:
         )
         if payload.config_path:
             try:
-                result["remote_config_snapshot"] = self.ssh.read_remote_file(host=payload.remote_host, remote_path=payload.config_path)
+                snapshot = self.ssh.read_remote_file(host=payload.remote_host, remote_path=payload.config_path)
+                result["remote_config_snapshot"] = snapshot
+                entrypoint_probe = self._sweep_entrypoint_probe(
+                    remote_config_text=snapshot["text"],
+                    remote_host=payload.remote_host,
+                    remote_cwd=payload.remote_cwd,
+                    conda_env=conda_env,
+                    conda_sh=conda_sh,
+                )
+                result["entrypoint_probe"] = entrypoint_probe
+                if entrypoint_probe.get("classification") != "argv_compatible":
+                    result["classification"] = "entrypoint_probe_failed"
+                    result["ok"] = False
             except Exception as exc:
                 result["remote_config_snapshot_error"] = compact_error(exc)
         return {**result, "provenance": {"source": "ssh_remote_preflight"}}
@@ -1887,6 +2614,63 @@ class ConsoleService:
                 },
                 retry_after_seconds=2,
             )
+
+        def finalize_result(
+            result: dict[str, Any],
+            *,
+            expected_runs: int | None,
+            discovered_runs: int | None,
+            requested_limit: int | None,
+            run_id_source: str | None = None,
+            operation_status: str = OperationStatus.succeeded.value,
+        ) -> dict[str, Any]:
+            enriched, snapshot_summary = self._materialize_result_snapshot(
+                job=job,
+                entity=entity,
+                project=project,
+                sweep_id=sweep_id,
+                result={"stage": result.get("stage", "done"), "entity": entity, "project": project, "sweep_id": sweep_id, **result},
+                group_keys=payload.group_keys,
+                metric_keys=payload.metric_keys,
+                expected_runs=expected_runs,
+                discovered_runs=discovered_runs,
+                requested_limit=requested_limit,
+                run_id_source=run_id_source,
+            )
+            if job:
+                job.monitor["last_result_pull"] = summarize_result_pull(enriched)
+                job.monitor["last_result_snapshot"] = snapshot_summary
+                self._record_operation(
+                    job,
+                    operation_id=operation_id,
+                    intent=IntentType.pull_results,
+                    requested_by=requested_by,
+                    idempotency_key=idempotency_key,
+                    stage=enriched.get("stage", "done"),
+                    classification=enriched["classification"],
+                    status=operation_status,
+                    result={
+                        "stage": enriched.get("stage", "done"),
+                        "classification": enriched["classification"],
+                        "entity": entity,
+                        "project": project,
+                        "sweep_id": sweep_id,
+                        "snapshot": snapshot_summary,
+                        "expected_runs": enriched.get("expected_runs"),
+                        "discovered_runs": enriched.get("discovered_runs"),
+                        "requested_limit": enriched.get("requested_limit"),
+                        "fetched_runs": enriched.get("fetched_runs"),
+                        "valid_runs": enriched.get("valid_runs"),
+                        "missing_runs": enriched.get("missing_runs"),
+                        "failed_runs": enriched.get("failed_runs"),
+                        "truncated": enriched.get("truncated"),
+                        "complete": enriched.get("complete"),
+                        "readiness": enriched.get("readiness"),
+                    },
+                )
+                self.store.upsert_job(job)
+            return enriched
+
         if is_single_run:
             if not remote_host:
                 raise ValueError("remote_host is required for single-run pull-results")
@@ -1919,80 +2703,55 @@ class ConsoleService:
                         "result_path": result_path,
                     })
                     job.monitor["run"] = run_meta
-                job.monitor["last_result_pull"] = summarize_result_pull(result)
-                self._record_operation(
-                    job,
-                    operation_id=operation_id,
-                    intent=IntentType.pull_results,
-                    requested_by=requested_by,
-                    idempotency_key=idempotency_key,
-                    stage="done",
-                    classification="ok" if result.get("valid_results", 0) else "no_scientific_results_yet",
-                    status=OperationStatus.succeeded.value,
-                    result={"stage": "done", "classification": "ok" if result.get("valid_results", 0) else "no_scientific_results_yet", "entity": entity, "project": project, **result},
-                )
-            return {"stage": "done", "classification": "ok" if result.get("valid_results", 0) else "no_scientific_results_yet", "entity": entity, "project": project, **result}
+            return finalize_result(result, expected_runs=1, discovered_runs=1, requested_limit=payload.max_runs)
         if not remote_host or not remote_cwd:
             if payload.allow_partial:
                 result = self._pull_results_from_wandb(entity, project, sweep_id, payload)
-                if job:
-                    self._record_operation(
-                        job,
-                        operation_id=operation_id,
-                        intent=IntentType.pull_results,
-                        requested_by=requested_by,
-                        idempotency_key=idempotency_key,
-                        stage=result.get("stage", "done"),
-                        classification=result.get("classification", "wandb_partial_pull"),
-                        status=OperationStatus.succeeded.value,
-                        result=result,
-                    )
-                return result
+                return finalize_result(
+                    result,
+                    expected_runs=result.get("expected_runs"),
+                    discovered_runs=result.get("discovered_runs"),
+                    requested_limit=payload.max_runs,
+                    run_id_source="wandb_api_fallback",
+                )
             raise ValueError("remote_host and remote_cwd are required for remote result pullback")
         try:
             try:
-                run_ids = self._sweep_run_ids(entity, project, sweep_id, payload.max_runs)
+                sweep = self.wandb.get_sweep_state(entity, project, sweep_id)
+                all_run_ids = [
+                    str(run.get("name"))
+                    for run in (sweep.get("runs") or [])
+                    if run.get("name")
+                ]
+                expected_runs = to_optional_positive_int(sweep.get("expectedRunCount")) or to_optional_positive_int(sweep.get("runCount"))
+                discovered_runs = len(all_run_ids)
+                run_limit = payload.max_runs if payload.max_runs is not None else len(all_run_ids)
+                run_ids = all_run_ids[:run_limit] if run_limit else all_run_ids
                 run_id_source = "wandb_api"
             except Exception:
                 run_ids = cached_run_ids(job, payload.max_runs) if job else []
+                expected_runs = None
+                discovered_runs = len(run_ids) if run_ids else None
                 run_id_source = "cached_wandb_status"
+            ssh_max_runs = payload.max_runs if payload.max_runs is not None else max(len(run_ids), 1)
             result = self.ssh.pull_results(
                 host=remote_host,
                 remote_cwd=remote_cwd,
                 sweep_id=sweep_id,
                 run_ids=run_ids,
                 budget_seconds=payload.budget_seconds,
-                max_runs=payload.max_runs,
+                max_runs=ssh_max_runs,
                 metric_keys=payload.metric_keys,
                 group_keys=payload.group_keys,
             )
             result["run_id_source"] = run_id_source
-            if job:
-                job.monitor["last_result_pull"] = summarize_result_pull(result)
-                self._record_operation(
-                    job,
-                    operation_id=operation_id,
-                    intent=IntentType.pull_results,
-                    requested_by=requested_by,
-                    idempotency_key=idempotency_key,
-                    stage="done",
-                    classification="ok" if result.get("valid_results", 0) else "no_scientific_results_yet",
-                    status=OperationStatus.succeeded.value,
-                    result={
-                        "stage": "done",
-                        "classification": "ok" if result.get("valid_results", 0) else "no_scientific_results_yet",
-                        "entity": entity,
-                        "project": project,
-                        **result,
-                    },
-                )
-            return {
-                "stage": "done",
-                "classification": "ok" if result.get("valid_results", 0) else "no_scientific_results_yet",
-                "entity": entity,
-                "project": project,
-                **result,
-            }
+            return finalize_result(
+                result,
+                expected_runs=expected_runs,
+                discovered_runs=discovered_runs,
+                requested_limit=payload.max_runs,
+                run_id_source=run_id_source,
+            )
         except Exception as exc:
             if not payload.allow_partial:
                 raise
@@ -2000,48 +2759,15 @@ class ConsoleService:
                 fallback = self._pull_results_from_wandb(entity, project, sweep_id, payload)
                 fallback["remote_error"] = compact_error(exc)
                 fallback["classification"] = "remote_pull_failed_wandb_fallback"
-                if job:
-                    self._record_operation(
-                        job,
-                        operation_id=operation_id,
-                        intent=IntentType.pull_results,
-                        requested_by=requested_by,
-                        idempotency_key=idempotency_key,
-                        stage=fallback.get("stage", "degraded"),
-                        classification=fallback.get("classification", "remote_pull_failed_wandb_fallback"),
-                        status=OperationStatus.succeeded.value,
-                        result=fallback,
-                    )
-                return fallback
+                return finalize_result(
+                    fallback,
+                    expected_runs=fallback.get("expected_runs"),
+                    discovered_runs=fallback.get("discovered_runs"),
+                    requested_limit=payload.max_runs,
+                    run_id_source="wandb_api_fallback",
+                )
             except Exception as fallback_exc:
-                if job:
-                    self._record_operation(
-                        job,
-                        operation_id=operation_id,
-                        intent=IntentType.pull_results,
-                        requested_by=requested_by,
-                        idempotency_key=idempotency_key,
-                        stage="degraded",
-                        classification="result_sources_unavailable",
-                        status=OperationStatus.failed.value,
-                        result={
-                            "stage": "degraded",
-                            "classification": "result_sources_unavailable",
-                            "source": "degraded_empty_partial",
-                            "entity": entity,
-                            "project": project,
-                            "sweep_id": sweep_id,
-                            "rows": [],
-                            "groups": {},
-                            "valid_results": 0,
-                            "missing_results": 0,
-                            "failed_results": 0,
-                            "partial": True,
-                            "remote_error": compact_error(exc),
-                            "wandb_error": compact_error(fallback_exc),
-                        },
-                    )
-                return {
+                degraded = {
                     "stage": "degraded",
                     "classification": "result_sources_unavailable",
                     "source": "degraded_empty_partial",
@@ -2049,7 +2775,6 @@ class ConsoleService:
                     "project": project,
                     "sweep_id": sweep_id,
                     "rows": [],
-                    "groups": {},
                     "valid_results": 0,
                     "missing_results": 0,
                     "failed_results": 0,
@@ -2058,11 +2783,29 @@ class ConsoleService:
                     "wandb_error": compact_error(fallback_exc),
                     "next_actions": ["确认远端 host/cwd 可达，或配置 WANDB_API_KEY 后重试。"],
                 }
+                if job:
+                    return finalize_result(
+                        degraded,
+                        expected_runs=None,
+                        discovered_runs=None,
+                        requested_limit=payload.max_runs,
+                        operation_status=OperationStatus.failed.value,
+                    )
+                return finalize_result(
+                    degraded,
+                    expected_runs=None,
+                    discovered_runs=None,
+                    requested_limit=payload.max_runs,
+                    operation_status=OperationStatus.failed.value,
+                )
 
     def _pull_results_from_wandb(self, entity: str, project: str, sweep_id: str, payload: PullResultsPayload) -> dict[str, Any]:
         sweep = self.wandb.get_sweep_state(entity, project, sweep_id)
+        runs = sweep.get("runs") or []
+        if payload.max_runs is not None:
+            runs = runs[:payload.max_runs]
         rows = []
-        for run in (sweep.get("runs") or [])[:payload.max_runs]:
+        for run in runs:
             summary = parse_wandb_json_field(run.get("summary_metrics"))
             config = parse_wandb_json_field(run.get("config"))
             rows.append({
@@ -2082,13 +2825,20 @@ class ConsoleService:
             "rows": rows,
             "valid_results": sum(1 for row in rows if row["has_scientific_result"]),
             "missing_results": sum(1 for row in rows if not row["has_scientific_result"]),
+            "failed_results": sum(1 for row in rows if str(row.get("state") or "").lower() in {"failed", "crashed", "killed"}),
             "partial": True,
+            "expected_runs": to_optional_positive_int(sweep.get("expectedRunCount")) or to_optional_positive_int(sweep.get("runCount")),
+            "discovered_runs": len(sweep.get("runs") or []),
+            "truncated": bool(payload.max_runs is not None and len(sweep.get("runs") or []) > payload.max_runs),
         }
 
-    def _sweep_run_ids(self, entity: str, project: str, sweep_id: str, max_runs: int) -> list[str]:
+    def _sweep_run_ids(self, entity: str, project: str, sweep_id: str, max_runs: int | None) -> list[str]:
         sweep = self.wandb.get_sweep_state(entity, project, sweep_id)
         run_ids = []
-        for run in (sweep.get("runs") or [])[:max_runs]:
+        runs = sweep.get("runs") or []
+        if max_runs is not None:
+            runs = runs[:max_runs]
+        for run in runs:
             name = run.get("name")
             if name:
                 run_ids.append(str(name))
@@ -2296,9 +3046,22 @@ def summarize_result_pull(result: dict[str, Any]) -> dict[str, Any]:
         "source": result.get("source"),
         "sweep_id": result.get("sweep_id"),
         "run_id": result.get("status", {}).get("job_id") if isinstance(result.get("status"), dict) else None,
+        "snapshot_id": result.get("snapshot_id"),
+        "snapshot_path": result.get("snapshot_path"),
+        "classification": result.get("classification"),
+        "readiness": result.get("readiness"),
+        "expected_runs": result.get("expected_runs"),
+        "discovered_runs": result.get("discovered_runs"),
+        "requested_limit": result.get("requested_limit"),
+        "fetched_runs": result.get("fetched_runs"),
+        "valid_runs": result.get("valid_runs"),
+        "missing_runs": result.get("missing_runs"),
+        "failed_runs": result.get("failed_runs"),
         "valid_results": result.get("valid_results"),
         "missing_results": result.get("missing_results"),
         "failed_results": result.get("failed_results"),
+        "complete": result.get("complete"),
+        "truncated": result.get("truncated"),
         "partial": result.get("partial"),
         "generated_at": utc_now(),
     }
@@ -2370,6 +3133,11 @@ def to_non_negative_int(value: Any) -> int:
         return 0
 
 
+def to_optional_positive_int(value: Any) -> int | None:
+    parsed = to_non_negative_int(value)
+    return parsed or None
+
+
 def compact_agent_probe(probe: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(probe, dict):
         return None
@@ -2421,6 +3189,7 @@ def compact_job_record(job: JobRecord) -> dict[str, Any]:
         "created_new_sweep",
         "sweep_path",
         "last_result_pull",
+        "last_result_snapshot",
         "last_watchdog",
         "cron",
         "watchdog",
@@ -2527,12 +3296,15 @@ def compact_operation(operation: dict[str, Any] | None) -> dict[str, Any] | None
     }
 
 
-def cached_run_ids(job: JobRecord, max_runs: int) -> list[str]:
+def cached_run_ids(job: JobRecord, max_runs: int | None) -> list[str]:
     last_status = job.monitor.get("last_wandb_status")
     if not isinstance(last_status, dict):
         return []
     run_ids = []
-    for run in (last_status.get("runs") or [])[:max_runs]:
+    runs = last_status.get("runs") or []
+    if max_runs is not None:
+        runs = runs[:max_runs]
+    for run in runs:
         if isinstance(run, dict) and run.get("name"):
             run_ids.append(str(run["name"]))
     return run_ids

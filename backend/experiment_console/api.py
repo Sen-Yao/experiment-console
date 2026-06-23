@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .config import Settings
 from .models import (
     ConfirmRequest,
+    AdvanceQueuePayload,
     AuthCheckPayload,
     CancelSweepPayload,
     IntentPreviewRequest,
@@ -211,6 +212,14 @@ def runner_watchdog_once(payload: WatchdogOncePayload, requested_by: str = "expe
         return service.runner_command(IntentType.watchdog_once, payload.model_dump(mode="json"), requested_by=requested_by).model_dump(mode="json", exclude_none=True)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/runner/advance-queue")
+def runner_advance_queue(payload: AdvanceQueuePayload, requested_by: str = "experiment-runner"):
+    try:
+        return service.runner_command(IntentType.advance_queue, payload.model_dump(mode="json"), requested_by=requested_by).model_dump(mode="json", exclude_none=True)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 

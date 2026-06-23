@@ -819,7 +819,7 @@ print(json.dumps({
         group_keys: list[str],
     ) -> dict[str, Any]:
         script = """
-import glob, json, os, time
+import glob, json, os, re, time
 cwd = __CWD__
 sweep_id = __SWEEP_ID__
 run_ids = __RUN_IDS__
@@ -845,12 +845,61 @@ def scalar_map(data):
             out[key] = value
     return out
 
+def parse_scalar(value):
+    text = str(value).strip()
+    if not text:
+        return ""
+    if text in {"true", "True"}:
+        return True
+    if text in {"false", "False"}:
+        return False
+    if text in {"null", "None", "~"}:
+        return None
+    if (text.startswith('"') and text.endswith('"')) or (text.startswith("'") and text.endswith("'")):
+        return text[1:-1]
+    try:
+        if re.match(r"^[-+]?\\d+$", text):
+            return int(text)
+        return float(text)
+    except Exception:
+        return text
+
+def load_wandb_config(path):
+    try:
+        text = open(path, encoding="utf-8", errors="replace").read()
+    except Exception:
+        return {}
+    config = {}
+    for key, value in re.findall(r"^\\s*-\\s+--([^=\\s]+)=(.*)$", text, flags=re.M):
+        config[key] = parse_scalar(value)
+    current_key = None
+    for line in text.splitlines():
+        top = re.match(r"^([A-Za-z_][A-Za-z0-9_.-]*):\\s*$", line)
+        if top:
+            current_key = top.group(1)
+            continue
+        direct = re.match(r"^([A-Za-z_][A-Za-z0-9_.-]*):\\s+(.+)$", line)
+        if direct:
+            config.setdefault(direct.group(1), parse_scalar(direct.group(2)))
+            current_key = None
+            continue
+        nested = re.match(r"^\\s+value:\\s*(.*)$", line)
+        if current_key and nested:
+            config.setdefault(current_key, parse_scalar(nested.group(1)))
+            current_key = None
+    return config
+
 rows = []
+config_sources = {}
+metric_sources = {}
+missing_config_keys = {}
 for run_id in run_ids[:max_runs]:
     if len(rows) >= max_runs or time.time() > deadline:
         break
     summary_paths = glob.glob(os.path.join(cwd, "wandb", f"run-*{run_id}", "files", "wandb-summary.json"))
     summary_paths = sorted(set(summary_paths), key=lambda p: os.path.getmtime(p), reverse=True)
+    config_paths = glob.glob(os.path.join(cwd, "wandb", f"run-*{run_id}", "files", "config.yaml"))
+    config_paths = sorted(set(config_paths), key=lambda p: os.path.getmtime(p), reverse=True)
     output_patterns = [
         os.path.join(cwd, "investigations", "**", "experiments", "outputs", f"*{run_id}*.json"),
         os.path.join(cwd, "outputs", f"*{run_id}*.json"),
@@ -867,15 +916,35 @@ for run_id in run_ids[:max_runs]:
     for output_path in output_paths[:3]:
         data.update(load_json(output_path))
         sources.append(output_path)
+    wandb_config = load_wandb_config(config_paths[0]) if config_paths else {}
     if not data:
-        rows.append({"run_id": run_id, "sources": [], "config": {}, "metrics": {}, "has_scientific_result": False})
+        config = {key: wandb_config.get(key) for key in group_keys} if group_keys else {}
+        for key in group_keys:
+            if key in wandb_config and config_paths:
+                config_sources.setdefault(run_id, {})[key] = config_paths[0]
+            else:
+                missing_config_keys.setdefault(run_id, []).append(key)
+        rows.append({"run_id": run_id, "sources": config_paths[:1], "config": config, "metrics": {}, "has_scientific_result": False})
         continue
     flat = scalar_map(data)
     metrics = {key: flat.get(key) for key in metric_keys if key in flat} if metric_keys else {
         key: value for key, value in flat.items()
         if isinstance(value, (int, float, bool)) and not key.startswith("_")
     }
-    config = {key: flat.get(key) for key in group_keys if key in flat} if group_keys else {}
+    config = {}
+    if group_keys:
+        for key in group_keys:
+            if key in flat:
+                config[key] = flat.get(key)
+                config_sources.setdefault(run_id, {})[key] = sources[0] if sources else None
+            elif key in wandb_config:
+                config[key] = wandb_config.get(key)
+                config_sources.setdefault(run_id, {})[key] = config_paths[0] if config_paths else None
+            else:
+                config[key] = None
+                missing_config_keys.setdefault(run_id, []).append(key)
+    for key in metrics:
+        metric_sources.setdefault(run_id, {})[key] = sources[0] if sources else None
     has_result = bool(metrics)
     rows.append({"run_id": run_id, "sources": sources, "config": config, "metrics": metrics, "has_scientific_result": has_result})
 if not rows:
@@ -887,7 +956,10 @@ print(json.dumps({
     "valid_results": sum(1 for row in rows if row["has_scientific_result"]),
     "missing_results": sum(1 for row in rows if not row["has_scientific_result"]),
     "failed_results": 0,
-    "partial": len(rows) >= max_runs,
+    "partial": len(rows) < len(run_ids),
+    "config_sources": config_sources,
+    "metric_sources": metric_sources,
+    "missing_config_keys": missing_config_keys,
 }))
 """
         script = (

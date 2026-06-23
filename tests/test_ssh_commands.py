@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+
 from experiment_console.command import CommandResult
 from experiment_console.config import Settings
 from experiment_console.ssh import SSHExecutor, build_failure_diagnostics, classify_argv_probe, extract_error_signals
@@ -12,6 +14,12 @@ class RecordingRunner:
     def run(self, argv, *, timeout, input_text=None):
         self.calls.append({"argv": argv, "timeout": timeout, "input_text": input_text})
         return CommandResult(argv=argv, returncode=0, stdout='{"ok": true, "pid": 12345, "log": "/tmp/agent.log"}\n', stderr="")
+
+
+class LocalRemotePythonRunner:
+    def run(self, argv, *, timeout, input_text=None):
+        completed = subprocess.run(argv[2], shell=True, text=True, capture_output=True, timeout=timeout, input=input_text)
+        return CommandResult(argv=argv, returncode=completed.returncode, stdout=completed.stdout, stderr=completed.stderr)
 
 
 def test_launch_agent_uses_conda_run_for_agent_process(tmp_path):
@@ -49,6 +57,40 @@ def test_stop_agents_uses_single_layer_shell_matching(tmp_path):
     assert "kill -TERM" in remote
     assert "python3 -c" not in remote
     assert "wandb agent HCCS/DualRefGAD/abc123" in remote
+
+
+def test_pull_results_reads_group_keys_from_wandb_config_yaml(tmp_path):
+    run_files = tmp_path / "wandb" / "run-20260620_000000-run-a" / "files"
+    run_files.mkdir(parents=True)
+    (run_files / "wandb-summary.json").write_text('{"final_test_auc": 0.91}\n', encoding="utf-8")
+    (run_files / "config.yaml").write_text(
+        "_wandb:\n"
+        "  value:\n"
+        "    e:\n"
+        "      run:\n"
+        "        args:\n"
+        "          - --batch_size=512\n"
+        "          - --layers=2\n"
+        "lr:\n"
+        "  value: 0.001\n",
+        encoding="utf-8",
+    )
+    ssh = SSHExecutor(Settings(state_dir=tmp_path), runner=LocalRemotePythonRunner())
+
+    result = ssh.pull_results(
+        host="local",
+        remote_cwd=str(tmp_path),
+        sweep_id="abc123",
+        run_ids=["run-a"],
+        budget_seconds=10,
+        max_runs=1,
+        metric_keys=["final_test_auc"],
+        group_keys=["batch_size", "layers", "lr"],
+    )
+
+    assert result["rows"][0]["config"] == {"batch_size": 512, "layers": 2, "lr": 0.001}
+    assert result["config_sources"]["run-a"]["batch_size"].endswith("config.yaml")
+    assert result["missing_config_keys"] == {}
 
 
 def test_extract_error_signals_from_agent_log_tail():

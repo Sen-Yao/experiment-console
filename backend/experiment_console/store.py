@@ -6,7 +6,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from .models import AuditEvent, IntentRecord, IntentStatus, JobRecord, JobStatus, now_iso
+from .models import AuditEvent, IntentRecord, IntentStatus, JobRecord, JobStatus, TERMINAL_JOB_STATUSES, now_iso
 from .redaction import redact_value
 from .state import validate_job_transition
 
@@ -224,6 +224,47 @@ class ConsoleStore:
                 (entity, project, sweep_id),
             ).fetchone()
         return self._job_from_row(row) if row else None
+
+    def list_queue_group_jobs(self, queue_group: str) -> list[JobRecord]:
+        jobs = [
+            job
+            for job in self.list_jobs()
+            if isinstance(job.monitor.get("queue"), dict)
+            and job.monitor["queue"].get("queue_group") == queue_group
+        ]
+        return sorted(jobs, key=lambda job: job.created_at)
+
+    def list_queued_jobs(self, queue_group: str | None = None) -> list[JobRecord]:
+        jobs = [
+            job
+            for job in self.list_jobs()
+            if job.status == JobStatus.queued
+            and isinstance(job.monitor.get("queue"), dict)
+            and (queue_group is None or job.monitor["queue"].get("queue_group") == queue_group)
+        ]
+        return sorted(jobs, key=lambda job: job.created_at)
+
+    def queue_groups(self) -> list[str]:
+        groups = {
+            str(job.monitor["queue"].get("queue_group"))
+            for job in self.list_jobs()
+            if isinstance(job.monitor.get("queue"), dict) and job.monitor["queue"].get("queue_group")
+        }
+        return sorted(groups)
+
+    def active_queue_blocker(self, queue_group: str, *, exclude_job_id: str | None = None) -> JobRecord | None:
+        for job in self.list_queue_group_jobs(queue_group):
+            if exclude_job_id and job.job_id == exclude_job_id:
+                continue
+            if job.status in TERMINAL_JOB_STATUSES or job.status == JobStatus.queued:
+                continue
+            if infer_job_kind(job) == "sweep":
+                return job
+        return None
+
+    def next_queued_job(self, queue_group: str) -> JobRecord | None:
+        jobs = self.list_queued_jobs(queue_group)
+        return jobs[0] if jobs else None
 
     def _job_from_row(self, row: sqlite3.Row) -> JobRecord:
         keys = set(row.keys())

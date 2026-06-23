@@ -41,3 +41,7 @@ class Settings(BaseModel):
     @property
     def sweep_telemetry_cache_path(self) -> Path:
         return self.state_dir / "sweep_telemetry_cache.json"
+
+    @property
+    def results_dir(self) -> Path:
+        return self.state_dir / "results"

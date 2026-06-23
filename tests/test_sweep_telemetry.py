@@ -51,6 +51,52 @@ def test_second_observation_computes_speed_and_eta():
     assert telemetry["eta_seconds"] == 3600
 
 
+def test_active_run_durations_keep_speed_and_eta_stable_without_new_completions():
+    previous = {
+        "finished_runs": 2,
+        "observed_at": "2026-06-17T00:00:00+00:00",
+    }
+    sweep = {
+        "id": "s1",
+        "entity": "e",
+        "project": "p",
+        "state": "RUNNING",
+        "runCount": 4,
+        "expectedRunCount": 6,
+        "runs": [
+            {
+                "name": "run-a",
+                "state": "finished",
+                "created_at": "2026-06-17T00:00:00+00:00",
+                "heartbeat_at": "2026-06-17T00:10:00+00:00",
+            },
+            {
+                "name": "run-b",
+                "state": "finished",
+                "created_at": "2026-06-17T00:00:30+00:00",
+                "heartbeat_at": "2026-06-17T00:10:30+00:00",
+            },
+            {
+                "name": "run-c",
+                "state": "running",
+                "created_at": "2026-06-17T00:05:00+00:00",
+            },
+            {
+                "name": "run-d",
+                "state": "running",
+                "created_at": "2026-06-17T00:05:00+00:00",
+            },
+        ],
+    }
+
+    telemetry, _ = compute_sweep_telemetry(sweep, previous, observed_at="2026-06-17T00:10:00+00:00")
+
+    assert telemetry["finished_runs"] == 2
+    assert telemetry["running_runs"] == 2
+    assert telemetry["speed_per_hour"] == 12.0
+    assert telemetry["eta_seconds"] == 900
+
+
 def test_running_sweep_without_active_runs_reports_zero_running():
     sweep = {
         "id": "s1",

@@ -13,6 +13,7 @@ Running sweeps often means juggling a YAML config, W&B sweep creation, GPU selec
 - create a W&B sweep;
 - probe remote GPUs with `nvidia-smi`;
 - launch one W&B agent per eligible GPU;
+- queue formal sweeps per remote GPU workspace so the active sweep uses all available GPUs before the next sweep starts;
 - recover agents for an existing sweep;
 - stop only the agents that match a tracked sweep;
 - keep local job state and redacted audit logs.
@@ -129,10 +130,13 @@ Environment variables:
 - `POST /api/runner/schedule-monitor`
 - `POST /api/runner/unschedule-monitor`
 - `POST /api/runner/watchdog-once`
+- `POST /api/runner/advance-queue`
 
 The temporary local runtime and the full FastAPI runtime are expected to expose the same runner-facing contract. `experiment-runner` should call these endpoints instead of doing SSH, W&B, job-store, result aggregation, or watchdog side effects locally.
 
 For runner-facing launch and preflight calls, `config_path` means the YAML path on the remote host, not a local workstation path. The intended flow is to commit/push the config, pull it in the remote checkout, verify the remote file exists, then launch with a path such as `/home/linziyao/DualRefGAD/configs/demo.yaml`. The standalone `validate-config` endpoint remains a local validation helper and is separate from launch/preflight config handling.
+
+Runner-facing `launch-sweep` defaults to `queue_policy=sequential`. If another sweep is already active in the same queue group, defaulting to `<remote_host>:<remote_cwd>`, Console records a queued job but does not create a W&B sweep or launch agents until `/api/runner/advance-queue` starts it. Use `queue_policy=immediate` only for explicitly approved concurrent launches.
 
 ## Development
 

@@ -39,6 +39,7 @@ class IntentType(str, Enum):
     auth_check = "auth_check"
     preflight = "preflight"
     pull_results = "pull_results"
+    advance_queue = "advance_queue"
 
 
 class IntentStatus(str, Enum):
@@ -59,6 +60,7 @@ class OperationStatus(str, Enum):
 
 class JobStatus(str, Enum):
     planned = "planned"
+    queued = "queued"
     validating = "validating"
     running = "running"
     attention = "attention"
@@ -106,6 +108,9 @@ class LaunchSweepPayload(BaseModel):
     gpu_mode: Literal["auto", "strict"] = "auto"
     max_agents: int | None = None
     profile: Literal["sweep", "mini"] = "sweep"
+    queue_policy: Literal["sequential", "immediate"] = "sequential"
+    queue_group: str | None = None
+    queue_after_job_id: str | None = None
     idempotency_key: str | None = None
 
     @field_validator("max_agents")
@@ -227,6 +232,11 @@ class WatchdogOncePayload(BaseModel):
     idempotency_key: str | None = None
 
 
+class AdvanceQueuePayload(BaseModel):
+    queue_group: str | None = None
+    idempotency_key: str | None = None
+
+
 class AuthCheckPayload(BaseModel):
     job_id: str | None = None
     sweep_id: str | None = None
@@ -256,7 +266,7 @@ class PullResultsPayload(BaseModel):
     remote_host: str | None = None
     remote_cwd: str | None = None
     budget_seconds: int = 90
-    max_runs: int = 200
+    max_runs: int | None = None
     metric_keys: list[str] = Field(default_factory=list)
     group_keys: list[str] = Field(default_factory=list)
     allow_partial: bool = True
@@ -268,7 +278,7 @@ class PullResultsPayload(BaseModel):
             raise ValueError("job_id or sweep_id is required")
         if self.budget_seconds <= 0:
             raise ValueError("budget_seconds must be positive")
-        if self.max_runs <= 0:
+        if self.max_runs is not None and self.max_runs <= 0:
             raise ValueError("max_runs must be positive")
         return self
 
@@ -386,6 +396,8 @@ def parse_payload(intent: IntentType, payload: dict[str, Any]) -> BaseModel:
         return PreflightPayload.model_validate(payload)
     if intent is IntentType.pull_results:
         return PullResultsPayload.model_validate(payload)
+    if intent is IntentType.advance_queue:
+        return AdvanceQueuePayload.model_validate(payload)
     raise ValueError(f"unsupported intent: {intent}")
 
 

@@ -75,8 +75,18 @@ def compute_sweep_telemetry(
         running = 0
         source = "wandb_sweep_runCount"
 
-    speed = _speed_per_hour(previous, finished, stamp)
-    eta = _eta_seconds(expected, finished, speed, state)
+    typical_run_seconds = _typical_finished_run_seconds(runs)
+    speed = _duration_based_speed_per_hour(typical_run_seconds, running) or _speed_per_hour(previous, finished, stamp)
+    eta = _eta_seconds(
+        expected,
+        finished,
+        speed,
+        state,
+        runs=runs,
+        observed_at=stamp,
+        typical_run_seconds=typical_run_seconds,
+        running=running,
+    )
     telemetry = {
         "finished_runs": finished,
         "running_runs": running,
@@ -132,11 +142,62 @@ def _speed_per_hour(previous: dict[str, Any] | None, finished: int, observed_at:
     return delta_runs * 3600.0 / delta_seconds
 
 
-def _eta_seconds(expected: int, finished: int, speed_per_hour: float | None, state: str) -> int | None:
+def _duration_based_speed_per_hour(typical_run_seconds: float | None, running: int) -> float | None:
+    if not typical_run_seconds or typical_run_seconds <= 0 or running <= 0:
+        return None
+    return running * 3600.0 / typical_run_seconds
+
+
+def _typical_finished_run_seconds(runs: list[dict[str, Any]]) -> float | None:
+    durations = []
+    for run in runs:
+        if _run_state(run) not in FINISHED_STATES:
+            continue
+        started = _parse_time(run.get("created_at"))
+        ended = _parse_time(run.get("heartbeat_at"))
+        if not started or not ended:
+            continue
+        duration = (ended - started).total_seconds()
+        if duration > 0:
+            durations.append(duration)
+    if not durations:
+        return None
+    durations.sort()
+    middle = len(durations) // 2
+    if len(durations) % 2:
+        return durations[middle]
+    return (durations[middle - 1] + durations[middle]) / 2
+
+
+def _eta_seconds(
+    expected: int,
+    finished: int,
+    speed_per_hour: float | None,
+    state: str,
+    *,
+    runs: list[dict[str, Any]] | None = None,
+    observed_at: str | None = None,
+    typical_run_seconds: float | None = None,
+    running: int = 0,
+) -> int | None:
     if state in TERMINAL_STATES:
         return None
     if expected <= 0 or finished >= expected:
         return None
+    if typical_run_seconds and typical_run_seconds > 0 and running > 0:
+        current_at = _parse_time(observed_at)
+        active_runs = [run for run in (runs or []) if _run_state(run) in RUNNING_STATES]
+        active_work_seconds = 0.0
+        for run in active_runs:
+            started = _parse_time(run.get("created_at"))
+            if started and current_at:
+                age_seconds = max(0.0, (current_at - started).total_seconds())
+                active_work_seconds += max(typical_run_seconds - age_seconds, min(60.0, typical_run_seconds * 0.1))
+            else:
+                active_work_seconds += typical_run_seconds
+        queued_runs = max(0, expected - finished - len(active_runs))
+        total_work_seconds = active_work_seconds + queued_runs * typical_run_seconds
+        return int(round(total_work_seconds / running))
     if not speed_per_hour or speed_per_hour <= 0:
         return None
     return int(round((expected - finished) / speed_per_hour * 3600))

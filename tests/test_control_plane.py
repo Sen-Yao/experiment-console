@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from experiment_console.config import Settings
@@ -11,8 +13,13 @@ from experiment_console.store import ConsoleStore
 
 
 class FakeWandB:
+    def __init__(self):
+        self.created = 0
+
     def create_sweep(self, config_path, *, entity, project):
-        return {"sweep_id": "abc123", "entity": entity, "project": project, "command": {"stdout": "ok"}}
+        self.created += 1
+        sweep_id = "abc123" if self.created == 1 else f"abc123_{self.created}"
+        return {"sweep_id": sweep_id, "entity": entity, "project": project, "command": {"stdout": "ok"}}
 
     def get_sweep_state(self, entity, project, sweep_id):
         return {
@@ -36,6 +43,7 @@ class FakeSSH:
     def __init__(self):
         self.launches = []
         self.run_launches = []
+        self.created_sweeps = 0
         self.agent_probe = None
         self.argv_probe = {
             "classification": "argv_compatible",
@@ -47,6 +55,7 @@ class FakeSSH:
             "timeout_seconds": 20,
         }
         self.failure_logs = []
+        self.pull_results_calls = []
         self.run_status = {
             "job_id": "job_run",
             "pid": "2000",
@@ -80,7 +89,9 @@ class FakeSSH:
         return {"host": host, "gpu_index": gpu_index, "pid": str(1000 + gpu_index), "sweep_path": sweep_path}
 
     def create_sweep(self, *, host, remote_cwd, remote_config, entity, project, wandb_api_key):
-        return {"sweep_id": "abc123", "entity": entity, "project": project, "remote_config_path": remote_config}
+        self.created_sweeps += 1
+        sweep_id = "abc123" if self.created_sweeps == 1 else f"abc123_{self.created_sweeps}"
+        return {"sweep_id": sweep_id, "entity": entity, "project": project, "remote_config_path": remote_config}
 
     def read_remote_file(self, *, host, remote_path):
         from pathlib import Path
@@ -200,15 +211,27 @@ class FakeSSH:
         }
 
     def pull_results(self, *, host, remote_cwd, sweep_id, run_ids, budget_seconds, max_runs, metric_keys, group_keys):
-        assert run_ids == ["run-a", "run-b"]
+        self.pull_results_calls.append({
+            "host": host,
+            "remote_cwd": remote_cwd,
+            "sweep_id": sweep_id,
+            "run_ids": list(run_ids),
+            "budget_seconds": budget_seconds,
+            "max_runs": max_runs,
+            "metric_keys": list(metric_keys),
+            "group_keys": list(group_keys),
+        })
+        rows = []
+        for index, run_id in enumerate(run_ids[:max_runs]):
+            metrics = {"final_test_auc": 0.8 + (index / 1000)}
+            if index == 0:
+                metrics.update({"semantic_token_dim": 256, "rwse_token_steps": 0})
+            rows.append({"run_id": run_id, "metrics": metrics, "config": {}, "has_scientific_result": True})
         return {
             "source": "remote_local_files",
             "sweep_id": sweep_id,
-            "rows": [
-                {"run_id": "run-a", "metrics": {"semantic_token_dim": 256, "rwse_token_steps": 0}, "has_scientific_result": True},
-                {"run_id": "run-b", "metrics": {"final_test_auc": 0.9}, "has_scientific_result": True},
-            ],
-            "valid_results": 2,
+            "rows": rows,
+            "valid_results": len(rows),
             "missing_results": 0,
             "failed_results": 0,
             "partial": False,
@@ -232,6 +255,21 @@ def make_service(tmp_path):
     settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
     store = ConsoleStore(settings.sqlite_path, settings.audit_path)
     return ConsoleService(settings=settings, store=store, wandb=FakeWandB(), ssh=FakeSSH())
+
+
+def write_sweep_config(path):
+    path.write_text(
+        "method: grid\n"
+        "name: demo\n"
+        "program: train.py\n"
+        "parameters:\n"
+        "  dataset:\n"
+        "    values: [Cora]\n"
+        "  seed:\n"
+        "    values: [0, 1, 2, 3, 4]\n",
+        encoding="utf-8",
+    )
+    return str(path)
 
 
 def test_preview_idempotency_replays_existing_intent(tmp_path):
@@ -314,6 +352,228 @@ def test_launch_sweep_uses_console_default_conda_env(tmp_path):
     assert ssh.launches[0]["conda_env"] == "DualRefGAD"
 
 
+def test_second_launch_sweep_same_queue_group_is_queued(tmp_path):
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = FakeSSH()
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
+    config_a = write_sweep_config(tmp_path / "a.yaml")
+    config_b = write_sweep_config(tmp_path / "b.yaml")
+    first = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "queue_a",
+        "config_path": config_a,
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "idempotency_key": "queue-a",
+    })
+    second = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "queue_b",
+        "config_path": config_b,
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "idempotency_key": "queue-b",
+    })
+
+    assert first.job.status == JobStatus.running
+    assert second.classification == "queued"
+    assert second.job.status == JobStatus.queued
+    assert second.result["created_new_sweep"] is False
+    assert second.result["queue"]["blocked_by_job_id"] == first.job_id
+    assert len(ssh.launches) == 2
+
+
+def test_relaunch_queued_sweep_reports_queued_not_existing_sweep(tmp_path):
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = FakeSSH()
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
+    config_a = write_sweep_config(tmp_path / "a.yaml")
+    config_b = write_sweep_config(tmp_path / "b.yaml")
+    first = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "queue_replay_a",
+        "config_path": config_a,
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "idempotency_key": "queue-replay-a",
+    })
+    second = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "queue_replay_b",
+        "config_path": config_b,
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "idempotency_key": "queue-replay-b",
+    })
+    replay = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "queue_replay_b",
+        "config_path": config_b,
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "idempotency_key": "queue-replay-b-again",
+    })
+
+    assert first.job.status == JobStatus.running
+    assert replay.job_id == second.job_id
+    assert replay.classification == "queued"
+    assert replay.result["created_new_sweep"] is False
+    assert replay.result["queue"]["blocked_by_job_id"] == first.job_id
+    assert "recover-agents" not in " ".join(replay.next_actions)
+    assert len(ssh.launches) == 2
+
+
+def test_immediate_launch_sweep_bypasses_queue(tmp_path):
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = FakeSSH()
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
+    config_a = write_sweep_config(tmp_path / "a.yaml")
+    config_b = write_sweep_config(tmp_path / "b.yaml")
+    first = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "immediate_a",
+        "config_path": config_a,
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "idempotency_key": "immediate-a",
+    })
+    second = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "immediate_b",
+        "config_path": config_b,
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "queue_policy": "immediate",
+        "idempotency_key": "immediate-b",
+    })
+
+    assert first.job.status == JobStatus.running
+    assert second.job.status == JobStatus.running
+    assert second.result["created_new_sweep"] is True
+    assert len(ssh.launches) == 4
+
+
+def test_different_queue_group_does_not_block_sweep_launch(tmp_path):
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = FakeSSH()
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
+    config_a = write_sweep_config(tmp_path / "a.yaml")
+    config_b = write_sweep_config(tmp_path / "b.yaml")
+    first = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "group_a",
+        "config_path": config_a,
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "idempotency_key": "group-a",
+    })
+    second = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "group_b",
+        "config_path": config_b,
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "queue_group": "separate-pool",
+        "idempotency_key": "group-b",
+    })
+
+    assert first.job.status == JobStatus.running
+    assert second.job.status == JobStatus.running
+    assert second.job.monitor["queue"]["queue_group"] == "separate-pool"
+
+
+def test_queue_after_job_id_must_exist_and_match_group(tmp_path):
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = FakeSSH()
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
+    config_a = write_sweep_config(tmp_path / "a.yaml")
+    config_b = write_sweep_config(tmp_path / "b.yaml")
+    first = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "after_a",
+        "config_path": config_a,
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo-a",
+        "idempotency_key": "after-a",
+    })
+
+    with pytest.raises(ValueError, match="queue_after_job_id not found"):
+        service.runner_command(IntentType.launch_sweep, {
+            "job_name": "after_missing",
+            "config_path": config_b,
+            "remote_host": "gpu-host-1",
+            "remote_cwd": "/tmp/demo-a",
+            "queue_after_job_id": "job_missing",
+            "idempotency_key": "after-missing",
+        })
+    with pytest.raises(ValueError, match="not gpu-host-1:/tmp/demo-b"):
+        service.runner_command(IntentType.launch_sweep, {
+            "job_name": "after_wrong_group",
+            "config_path": config_b,
+            "remote_host": "gpu-host-1",
+            "remote_cwd": "/tmp/demo-b",
+            "queue_after_job_id": first.job_id,
+            "idempotency_key": "after-wrong-group",
+        })
+
+
+def test_advance_queue_starts_next_job_after_blocker_finishes(tmp_path):
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = FakeSSH()
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
+    config_a = write_sweep_config(tmp_path / "a.yaml")
+    config_b = write_sweep_config(tmp_path / "b.yaml")
+    first = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "advance_a",
+        "config_path": config_a,
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "idempotency_key": "advance-a",
+    })
+    second = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "advance_b",
+        "config_path": config_b,
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "idempotency_key": "advance-b",
+    })
+
+    blocked = service.runner_command(IntentType.advance_queue, {"queue_group": "gpu-host-1:/tmp/demo"})
+    assert blocked.classification == "blocked"
+    service.store.update_job_status(first.job_id, JobStatus.finished)
+    advanced = service.runner_command(IntentType.advance_queue, {"queue_group": "gpu-host-1:/tmp/demo"})
+
+    assert advanced.classification == "advanced"
+    assert advanced.result["advanced"][0]["job_id"] == second.job_id
+    started = service.store.get_job(second.job_id)
+    assert started.status == JobStatus.running
+    assert started.sweep_id == "abc123_2"
+    assert started.monitor["queue"]["queue_policy"] == "sequential"
+    assert started.monitor["queue"]["started_from_queue"] is True
+
+
+def test_queued_job_status_and_stop_do_not_touch_wandb_or_agents(tmp_path):
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = FakeSSH()
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
+    config_a = write_sweep_config(tmp_path / "a.yaml")
+    config_b = write_sweep_config(tmp_path / "b.yaml")
+    first = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "queued_status_a",
+        "config_path": config_a,
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "idempotency_key": "queued-status-a",
+    })
+    second = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "queued_status_b",
+        "config_path": config_b,
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "idempotency_key": "queued-status-b",
+    })
+
+    status = service.runner_command(IntentType.status_query, {"job_id": second.job_id})
+    assert status.classification == "queued"
+    assert status.result["queue"]["blocked_by_job_id"] == first.job_id
+    assert status.result["queue"]["queue_position"] == 1
+    stop = service.runner_command(IntentType.stop_job, {"job_id": second.job_id})
+    assert stop.classification == "job_cancelled"
+    assert stop.result["queued_cancelled"] is True
+    assert service.store.get_job(second.job_id).status == JobStatus.cancelled
+    assert len(ssh.launches) == 2
+
+
 def test_launch_run_creates_managed_single_run_job(tmp_path):
     settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project", default_conda_env="DualRefGAD")
     ssh = FakeSSH()
@@ -383,6 +643,62 @@ def test_launch_run_unverified_start_preserves_recoverable_run_metadata(tmp_path
     assert response.result["run"]["status_path"].endswith(".status.json")
     assert response.result["run"]["result_path"].endswith(".result.json")
     assert response.job.monitor["last_run_status"]["status_path"] == response.result["run"]["status_path"]
+
+
+def test_sweep_preflight_detects_entrypoint_probe_failure(tmp_path):
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = FakeSSH()
+    ssh.argv_probe = {
+        "classification": "argv_probe_unavailable",
+        "returncode": 1,
+        "stdout_tail": "",
+        "stderr_tail": "ModuleNotFoundError: No module named 'main'\n",
+        "timed_out": False,
+    }
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
+    config_path = write_sweep_config(tmp_path / "bad_entrypoint.yaml")
+
+    response = service.runner_command(IntentType.preflight, {
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "config_path": config_path,
+        "profile": "sweep",
+    })
+
+    assert response.classification == "entrypoint_probe_failed"
+    assert response.result["ok"] is False
+    assert "ModuleNotFoundError" in response.result["entrypoint_probe"]["stderr_tail"]
+
+
+def test_launch_sweep_blocks_failed_entrypoint_before_creating_wandb_sweep(tmp_path):
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = FakeSSH()
+    ssh.argv_probe = {
+        "classification": "argv_probe_unavailable",
+        "returncode": 1,
+        "stdout_tail": "",
+        "stderr_tail": "ModuleNotFoundError: No module named 'main'\n",
+        "timed_out": False,
+    }
+    wandb = FakeWandB()
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=wandb, ssh=ssh)
+    config_path = write_sweep_config(tmp_path / "bad_launch_entrypoint.yaml")
+
+    response = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "bad_entrypoint",
+        "config_path": config_path,
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "idempotency_key": "bad-entrypoint",
+    })
+
+    assert response.classification == "entrypoint_probe_failed"
+    assert response.job is not None
+    assert response.job.status == JobStatus.attention
+    assert response.result["created_new_sweep"] is False
+    assert wandb.created == 0
+    assert ssh.launches == []
+    assert "ModuleNotFoundError" in response.result["entrypoint_probe"]["stderr_tail"]
 
 
 def test_single_run_preflight_detects_incompatible_argv(tmp_path):
@@ -617,6 +933,7 @@ def test_launch_sweep_reuses_only_existing_sweep_job(tmp_path):
         "remote_host": "gpu-host-1",
         "remote_cwd": "/tmp/demo",
         "max_agents": 1,
+        "queue_policy": "immediate",
         "idempotency_key": "replay-sweep-second",
     })
 
@@ -958,7 +1275,7 @@ def test_overview_returns_sweep_telemetry_without_run_payloads(tmp_path):
     sweep = overview["sweeps"][0]
 
     assert "runs" not in sweep
-    assert sweep["finished_runs"] == 0
+    assert sweep["finished_runs"] == 1
     assert sweep["running_runs"] == 0
     assert sweep["failed_runs"] == 0
     assert sweep["last_sync_at"]
@@ -988,6 +1305,18 @@ def test_status_returns_sweep_telemetry(tmp_path):
     assert sweep["last_sync_at"]
     assert sweep["speed_per_hour"] is None
     assert sweep["eta_seconds"] is None
+    assert response.result["state"]["job_status"] == "running"
+    assert response.result["state"]["wandb_sweep_status"] == "RUNNING"
+    assert response.result["state"]["agent_health"] == "running"
+    assert response.result["state"]["result_readiness"] == "unknown"
+    assert response.result["failure_diagnostics"] is None
+
+    serialized = response.model_dump(mode="json", exclude_none=True)
+    forbidden_text = json.dumps(serialized)
+    assert "codex_followup_suggestion" not in forbidden_text
+    assert "automation_update" not in forbidden_text
+    assert "RRULE" not in forbidden_text
+    assert "heartbeat" not in forbidden_text
 
 
 def test_status_returns_compact_sweep_without_run_payloads(tmp_path):
@@ -1060,6 +1389,168 @@ def test_pull_results_uses_target_sweep_run_ids(tmp_path):
     assert result["valid_results"] == 2
     assert [row["run_id"] for row in result["rows"]] == ["run-a", "run-b"]
     assert result["rows"][0]["metrics"]["semantic_token_dim"] == 256
+    stored = service.store.get_job(job.job_id)
+    snapshot_summary = stored.monitor["last_result_snapshot"]
+    assert snapshot_summary["classification"] == "ok"
+    assert snapshot_summary["readiness"] == "complete"
+    assert "rows" not in snapshot_summary
+    assert (tmp_path / "results" / job.job_id / f"{snapshot_summary['snapshot_id']}.json").exists()
+
+
+def test_pull_results_default_uses_full_wandb_run_list(tmp_path):
+    class ManyRunsWandB(FakeWandB):
+        def get_sweep_state(self, entity, project, sweep_id):
+            return {
+                "id": sweep_id,
+                "entity": entity,
+                "project": project,
+                "state": "FINISHED",
+                "runCount": 240,
+                "expectedRunCount": 240,
+                "runs": [{"name": f"run-{index:03d}"} for index in range(240)],
+            }
+
+    ssh = FakeSSH()
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=ManyRunsWandB(), ssh=ssh)
+    service.store.upsert_job(JobRecord(
+        job_id="job_many_results",
+        name="results",
+        status=JobStatus.finished,
+        entity="my-team",
+        project="my-project",
+        sweep_id="abc123",
+        remote_host="gpu-host-1",
+        remote_cwd="/tmp/demo",
+    ))
+
+    result = service._pull_results(PullResultsPayload(job_id="job_many_results"))
+
+    assert len(ssh.pull_results_calls[0]["run_ids"]) == 240
+    assert ssh.pull_results_calls[0]["max_runs"] == 240
+    assert result["expected_runs"] == 240
+    assert result["fetched_runs"] == 240
+    assert result["complete"] is True
+    assert result["truncated"] is False
+    assert result["classification"] == "ok"
+
+
+def test_pull_results_explicit_max_runs_marks_truncated(tmp_path):
+    class ThreeRunsWandB(FakeWandB):
+        def get_sweep_state(self, entity, project, sweep_id):
+            return {
+                "id": sweep_id,
+                "entity": entity,
+                "project": project,
+                "state": "FINISHED",
+                "runCount": 3,
+                "expectedRunCount": 3,
+                "runs": [{"name": "run-a"}, {"name": "run-b"}, {"name": "run-c"}],
+            }
+
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=ThreeRunsWandB(), ssh=FakeSSH())
+    service.store.upsert_job(JobRecord(
+        job_id="job_truncated",
+        name="results",
+        status=JobStatus.finished,
+        entity="my-team",
+        project="my-project",
+        sweep_id="abc123",
+        remote_host="gpu-host-1",
+        remote_cwd="/tmp/demo",
+    ))
+
+    result = service._pull_results(PullResultsPayload(job_id="job_truncated", max_runs=2))
+
+    assert [row["run_id"] for row in result["rows"]] == ["run-a", "run-b"]
+    assert result["requested_limit"] == 2
+    assert result["truncated"] is True
+    assert result["complete"] is False
+    assert result["classification"] == "truncated_results"
+    assert result["readiness"] == "truncated"
+
+
+def test_pull_results_snapshot_groups_metrics(tmp_path):
+    class GroupSSH(FakeSSH):
+        def pull_results(self, *, host, remote_cwd, sweep_id, run_ids, budget_seconds, max_runs, metric_keys, group_keys):
+            self.pull_results_calls.append({"run_ids": list(run_ids), "max_runs": max_runs})
+            return {
+                "source": "remote_local_files",
+                "sweep_id": sweep_id,
+                "rows": [
+                    {"run_id": "run-a", "config": {"variant": "x"}, "metrics": {"final_test_auc": 0.8}, "has_scientific_result": True},
+                    {"run_id": "run-b", "config": {"variant": "x"}, "metrics": {"final_test_auc": 1.0}, "has_scientific_result": True},
+                    {"run_id": "run-c", "config": {"variant": "y"}, "metrics": {"final_test_auc": 0.7}, "has_scientific_result": True},
+                ],
+                "valid_results": 3,
+                "missing_results": 0,
+                "failed_results": 0,
+                "partial": False,
+            }
+
+    class ThreeRunsWandB(FakeWandB):
+        def get_sweep_state(self, entity, project, sweep_id):
+            return {
+                "id": sweep_id,
+                "entity": entity,
+                "project": project,
+                "state": "FINISHED",
+                "runCount": 3,
+                "expectedRunCount": 3,
+                "runs": [{"name": "run-a"}, {"name": "run-b"}, {"name": "run-c"}],
+            }
+
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=ThreeRunsWandB(), ssh=GroupSSH())
+    service.store.upsert_job(JobRecord(
+        job_id="job_grouped",
+        name="results",
+        status=JobStatus.finished,
+        entity="my-team",
+        project="my-project",
+        sweep_id="abc123",
+        remote_host="gpu-host-1",
+        remote_cwd="/tmp/demo",
+    ))
+
+    result = service._pull_results(PullResultsPayload(job_id="job_grouped", metric_keys=["final_test_auc"], group_keys=["variant"]))
+
+    assert result["top_groups"][0]["config"] == {"variant": "x"}
+    assert result["top_groups"][0]["metrics"]["final_test_auc"]["mean"] == pytest.approx(0.9)
+    snapshot = json.loads(open(result["snapshot"]["path"], encoding="utf-8").read())
+    assert snapshot["groups"][0]["metrics"]["final_test_auc"]["max"] == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "expected"),
+    [
+        ({}, "unknown"),
+        ({"valid_runs": 0, "valid_results": 0}, "none"),
+        ({"valid_runs": 1, "valid_results": 1, "complete": False}, "partial"),
+        ({"valid_runs": 1, "valid_results": 1, "truncated": True}, "truncated"),
+        ({"valid_runs": 2, "valid_results": 2, "complete": True, "missing_runs": 0, "failed_runs": 0}, "complete"),
+        ({"valid_runs": 2, "valid_results": 2, "complete": True, "missing_runs": 1, "failed_runs": 0}, "complete_with_failures"),
+    ],
+)
+def test_status_result_readiness_uses_snapshot_summary(tmp_path, snapshot, expected):
+    service = make_service(tmp_path)
+    monitor = {"last_result_snapshot": snapshot} if snapshot else {}
+    service.store.upsert_job(JobRecord(
+        job_id="job_readiness",
+        name="readiness",
+        status=JobStatus.finished,
+        entity="my-team",
+        project="my-project",
+        sweep_id="abc123",
+        remote_host="gpu-host-1",
+        remote_cwd="/tmp/demo",
+        monitor=monitor,
+    ))
+
+    response = service.runner_command(IntentType.status_query, {"job_id": "job_readiness"})
+
+    assert response.result["state"]["result_readiness"] == expected
 
 
 def test_pull_results_without_explicit_key_does_not_replay_stale_result(tmp_path):

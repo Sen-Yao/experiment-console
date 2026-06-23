@@ -8,7 +8,8 @@ class InvalidTransition(ValueError):
 
 
 ALLOWED_TRANSITIONS = {
-    JobStatus.planned: {JobStatus.validating, JobStatus.running, JobStatus.failed, JobStatus.cancelled, JobStatus.unknown},
+    JobStatus.planned: {JobStatus.queued, JobStatus.validating, JobStatus.running, JobStatus.failed, JobStatus.cancelled, JobStatus.unknown},
+    JobStatus.queued: {JobStatus.validating, JobStatus.failed, JobStatus.cancelled, JobStatus.unknown},
     JobStatus.validating: {JobStatus.running, JobStatus.attention, JobStatus.failed, JobStatus.cancelled},
     JobStatus.running: {JobStatus.attention, JobStatus.finished, JobStatus.failed, JobStatus.cancelled, JobStatus.unknown},
     JobStatus.attention: {JobStatus.running, JobStatus.finished, JobStatus.failed, JobStatus.cancelled, JobStatus.unknown},
