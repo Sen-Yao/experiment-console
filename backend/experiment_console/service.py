@@ -139,17 +139,23 @@ def numeric_metric(value: Any) -> float | None:
     return None
 
 
+def ordered_numeric_metric_keys(rows: list[dict[str, Any]], metric_keys: list[str] | None = None) -> list[str]:
+    seen: list[str] = []
+    for metric in metric_keys or []:
+        if metric not in seen:
+            seen.append(metric)
+    for row in rows:
+        metrics = row.get("metrics") if isinstance(row.get("metrics"), dict) else {}
+        for key, value in metrics.items():
+            if key not in seen and numeric_metric(value) is not None:
+                seen.append(key)
+    return seen
+
+
 def build_result_groups(rows: list[dict[str, Any]], group_keys: list[str], metric_keys: list[str]) -> dict[str, Any]:
     if not group_keys:
         return {"groups": [], "top_groups": []}
-    metrics = list(metric_keys)
-    if not metrics:
-        seen: list[str] = []
-        for row in rows:
-            for key, value in (row.get("metrics") or {}).items():
-                if key not in seen and numeric_metric(value) is not None:
-                    seen.append(key)
-        metrics = seen
+    metrics = ordered_numeric_metric_keys(rows, metric_keys)
     grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
     for row in rows:
         config = row.get("config") if isinstance(row.get("config"), dict) else {}
@@ -188,6 +194,35 @@ def build_result_groups(rows: list[dict[str, Any]], group_keys: list[str], metri
     else:
         top_groups = []
     return {"groups": groups, "top_groups": top_groups[:20]}
+
+
+def build_metric_summaries(rows: list[dict[str, Any]], metric_keys: list[str] | None = None) -> dict[str, Any]:
+    wanted = ordered_numeric_metric_keys(rows, metric_keys)
+    summaries: dict[str, Any] = {}
+    for metric in wanted:
+        values = [
+            numeric
+            for row in rows
+            if (numeric := numeric_metric((row.get("metrics") or {}).get(metric))) is not None
+        ]
+        if values:
+            summaries[metric] = {
+                "count": len(values),
+                "mean": sum(values) / len(values),
+                "std": statistics.pstdev(values) if len(values) > 1 else 0.0,
+                "min": min(values),
+                "max": max(values),
+            }
+    return summaries
+
+
+def selector_label(selector: str) -> str:
+    text = str(selector or "")
+    if "=" in text:
+        alias, _ = text.split("=", 1)
+        if alias:
+            return alias
+    return text
 
 
 class ConsoleService:
@@ -263,6 +298,7 @@ class ConsoleService:
             truncated = True
         complete = bool(coverage_target and fetched_runs >= coverage_target and not truncated)
         groups = build_result_groups(rows, group_keys, metric_keys)
+        metric_summaries = build_metric_summaries(rows, metric_keys)
         enriched = {
             **result,
             "expected_runs": expected_runs,
@@ -276,6 +312,7 @@ class ConsoleService:
             "complete": complete,
             "groups": groups["groups"],
             "top_groups": groups["top_groups"],
+            "metric_summaries": metric_summaries,
         }
         readiness = classify_result_readiness(enriched)
         classification = result_pull_classification(enriched)
@@ -292,6 +329,8 @@ class ConsoleService:
             "config_sources": result.get("config_sources", {}),
             "metric_sources": result.get("metric_sources", {}),
             "missing_config_keys": result.get("missing_config_keys", {}),
+            "missing_metric_paths": result.get("missing_metric_paths", {}),
+            "discovery_sources": result.get("discovery_sources", {}),
         }
         for key_name in ["remote_error", "wandb_error"]:
             if result.get(key_name):
@@ -320,6 +359,7 @@ class ConsoleService:
             "rows": rows,
             "groups": groups["groups"],
             "top_groups": groups["top_groups"],
+            "metric_summaries": metric_summaries,
             "provenance": provenance,
             "classification": classification,
             "readiness": readiness,
@@ -2794,6 +2834,8 @@ class ConsoleService:
                 raise ValueError("sweep_id is required for pull-results")
         operation_id = operation_id or self._operation_identity(IntentType.pull_results, payload.model_dump(mode="json"))[0]
         idempotency_key = idempotency_key or self._operation_identity(IntentType.pull_results, payload.model_dump(mode="json"))[1]
+        metric_labels = [*payload.metric_keys, *[selector_label(item) for item in payload.metric_paths]]
+        group_labels = [*payload.group_keys, *[selector_label(item) for item in payload.group_paths]]
         if job:
             self._record_operation(
                 job,
@@ -2829,8 +2871,8 @@ class ConsoleService:
                 project=project,
                 sweep_id=sweep_id,
                 result={"stage": result.get("stage", "done"), "entity": entity, "project": project, "sweep_id": sweep_id, **result},
-                group_keys=payload.group_keys,
-                metric_keys=payload.metric_keys,
+                group_keys=group_labels,
+                metric_keys=metric_labels,
                 expected_runs=expected_runs,
                 discovered_runs=discovered_runs,
                 requested_limit=requested_limit,
@@ -2942,6 +2984,9 @@ class ConsoleService:
                 max_runs=ssh_max_runs,
                 metric_keys=payload.metric_keys,
                 group_keys=payload.group_keys,
+                metric_paths=payload.metric_paths,
+                group_paths=payload.group_paths,
+                output_globs=payload.output_globs,
             )
             result["run_id_source"] = run_id_source
             return finalize_result(
@@ -3262,6 +3307,7 @@ def summarize_result_pull(result: dict[str, Any]) -> dict[str, Any]:
         "complete": result.get("complete"),
         "truncated": result.get("truncated"),
         "partial": result.get("partial"),
+        "metric_summaries": result.get("metric_summaries"),
         "generated_at": utc_now(),
     }
 

@@ -817,6 +817,9 @@ print(json.dumps({
         max_runs: int,
         metric_keys: list[str],
         group_keys: list[str],
+        metric_paths: list[str] | None = None,
+        group_paths: list[str] | None = None,
+        output_globs: list[str] | None = None,
     ) -> dict[str, Any]:
         script = """
 import glob, json, os, re, time
@@ -826,6 +829,9 @@ run_ids = __RUN_IDS__
 max_runs = __MAX_RUNS__
 metric_keys = __METRIC_KEYS__
 group_keys = __GROUP_KEYS__
+metric_paths = __METRIC_PATHS__
+group_paths = __GROUP_PATHS__
+output_globs = __OUTPUT_GLOBS__
 deadline = time.time() + __BUDGET_SECONDS__
 if not run_ids:
     raise SystemExit("target run ids unavailable")
@@ -862,7 +868,104 @@ def parse_scalar(value):
             return int(text)
         return float(text)
     except Exception:
-        return text
+            return text
+
+def parse_selector(selector):
+    text = str(selector or "")
+    if "=" in text:
+        alias, path = text.split("=", 1)
+        return alias or path, path
+    return None, text
+
+def extract_path_values(data, path):
+    parts = [part for part in str(path or "").split(".") if part]
+    out = []
+    def walk(value, remaining, actual):
+        if not remaining:
+            out.append((".".join(actual), value))
+            return
+        part = remaining[0]
+        rest = remaining[1:]
+        if part == "*":
+            if isinstance(value, dict):
+                for key in sorted(value):
+                    walk(value[key], rest, actual + [str(key)])
+            elif isinstance(value, list):
+                for index, item in enumerate(value):
+                    walk(item, rest, actual + [str(index)])
+            return
+        if isinstance(value, dict) and part in value:
+            walk(value[part], rest, actual + [part])
+        elif isinstance(value, list):
+            try:
+                index = int(part)
+            except Exception:
+                return
+            if 0 <= index < len(value):
+                walk(value[index], rest, actual + [part])
+    walk(data, parts, [])
+    return out
+
+def selector_values(data, selector):
+    alias, path = parse_selector(selector)
+    matches = extract_path_values(data, path)
+    values = {}
+    for actual_path, value in matches:
+        key = alias if alias and len(matches) == 1 else actual_path
+        if alias and len(matches) > 1:
+            key = alias + "." + actual_path
+        values[key] = value
+    return values
+
+def normalize_remote_path(path, run_id):
+    if path is None:
+        return None
+    text = str(path).strip()
+    if not text:
+        return None
+    for token in ["${wandb.run.id}", "${wandb_run_id}", "{wandb.run.id}", "{run_id}"]:
+        text = text.replace(token, run_id)
+    if not text.endswith(".json"):
+        return None
+    if not os.path.isabs(text):
+        text = os.path.join(cwd, text)
+    return os.path.normpath(text)
+
+def is_progress_path(path):
+    return "progress" in os.path.basename(str(path)).lower()
+
+def discover_config_paths(wandb_config, run_id):
+    preferred = {"out", "result_path", "output_path", "result_out", "json_out"}
+    candidates = []
+    progress = []
+    seen = set()
+    items = sorted(wandb_config.items(), key=lambda item: (0 if item[0] in preferred else 1, item[0]))
+    for key, value in items:
+        path = normalize_remote_path(value, run_id)
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        item = {"path": path, "config_key": key, "exists": os.path.isfile(path)}
+        if is_progress_path(path):
+            progress.append(item)
+        else:
+            candidates.append(item)
+    return candidates, progress
+
+def expand_output_globs(patterns, run_id):
+    paths = []
+    seen = set()
+    for pattern in patterns or []:
+        text = str(pattern or "")
+        for token in ["${wandb.run.id}", "${wandb_run_id}", "{wandb.run.id}", "{run_id}"]:
+            text = text.replace(token, run_id)
+        if not os.path.isabs(text):
+            text = os.path.join(cwd, text)
+        for path in glob.glob(text, recursive=True):
+            if path.endswith(".json") and path not in seen:
+                seen.add(path)
+                paths.append(path)
+    return sorted(paths, key=lambda p: os.path.getmtime(p), reverse=True)
 
 def load_wandb_config(path):
     try:
@@ -893,6 +996,8 @@ rows = []
 config_sources = {}
 metric_sources = {}
 missing_config_keys = {}
+missing_metric_paths = {}
+discovery_sources = {}
 for run_id in run_ids[:max_runs]:
     if len(rows) >= max_runs or time.time() > deadline:
         break
@@ -900,14 +1005,40 @@ for run_id in run_ids[:max_runs]:
     summary_paths = sorted(set(summary_paths), key=lambda p: os.path.getmtime(p), reverse=True)
     config_paths = glob.glob(os.path.join(cwd, "wandb", f"run-*{run_id}", "files", "config.yaml"))
     config_paths = sorted(set(config_paths), key=lambda p: os.path.getmtime(p), reverse=True)
+    wandb_config = load_wandb_config(config_paths[0]) if config_paths else {}
+    config_candidates, progress_candidates = discover_config_paths(wandb_config, run_id)
     output_patterns = [
         os.path.join(cwd, "investigations", "**", "experiments", "outputs", f"*{run_id}*.json"),
         os.path.join(cwd, "outputs", f"*{run_id}*.json"),
     ]
+    config_output_paths = []
+    for item in config_candidates:
+        if item["exists"]:
+            config_output_paths.append(item["path"])
+    fallback_output_paths = []
+    if not config_output_paths:
+        for pattern in output_patterns:
+            fallback_output_paths.extend(glob.glob(pattern, recursive=True))
+        fallback_output_paths.extend(expand_output_globs(output_globs, run_id))
+    raw_output_paths = config_output_paths or fallback_output_paths
+    progress_paths = [item["path"] for item in progress_candidates if item.get("exists")]
+    progress_paths.extend(path for path in raw_output_paths if is_progress_path(path))
     output_paths = []
-    for pattern in output_patterns:
-        output_paths.extend(glob.glob(pattern, recursive=True))
-    output_paths = sorted(set(output_paths), key=lambda p: os.path.getmtime(p), reverse=True)
+    seen_output_paths = set()
+    for path in raw_output_paths:
+        if is_progress_path(path) or path in seen_output_paths:
+            continue
+        seen_output_paths.add(path)
+        output_paths.append(path)
+    if not config_output_paths:
+        output_paths = sorted(output_paths, key=lambda p: os.path.getmtime(p), reverse=True)
+    discovery_sources[run_id] = {
+        "config_paths": config_paths[:1],
+        "config_candidates": config_candidates,
+        "progress_paths": sorted(set(progress_paths)),
+        "output_globs": list(output_globs or []),
+        "selected_paths": output_paths[:3],
+    }
     data = {}
     sources = []
     if summary_paths:
@@ -916,7 +1047,6 @@ for run_id in run_ids[:max_runs]:
     for output_path in output_paths[:3]:
         data.update(load_json(output_path))
         sources.append(output_path)
-    wandb_config = load_wandb_config(config_paths[0]) if config_paths else {}
     if not data:
         config = {key: wandb_config.get(key) for key in group_keys} if group_keys else {}
         for key in group_keys:
@@ -924,6 +1054,8 @@ for run_id in run_ids[:max_runs]:
                 config_sources.setdefault(run_id, {})[key] = config_paths[0]
             else:
                 missing_config_keys.setdefault(run_id, []).append(key)
+        for selector in metric_paths:
+            missing_metric_paths.setdefault(run_id, []).append(selector)
         rows.append({"run_id": run_id, "sources": config_paths[:1], "config": config, "metrics": {}, "has_scientific_result": False})
         continue
     flat = scalar_map(data)
@@ -931,6 +1063,18 @@ for run_id in run_ids[:max_runs]:
         key: value for key, value in flat.items()
         if isinstance(value, (int, float, bool)) and not key.startswith("_")
     }
+    for selector in metric_paths:
+        selected = selector_values(data, selector)
+        if not selected:
+            missing_metric_paths.setdefault(run_id, []).append(selector)
+            continue
+        selected_numeric = False
+        for key, value in selected.items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                metrics[key] = value
+                selected_numeric = True
+        if not selected_numeric:
+            missing_metric_paths.setdefault(run_id, []).append(selector)
     config = {}
     if group_keys:
         for key in group_keys:
@@ -943,10 +1087,20 @@ for run_id in run_ids[:max_runs]:
             else:
                 config[key] = None
                 missing_config_keys.setdefault(run_id, []).append(key)
+    for selector in group_paths:
+        selected = selector_values(data, selector)
+        alias, path = parse_selector(selector)
+        if selected:
+            key, value = next(iter(selected.items()))
+            config[key] = value
+            config_sources.setdefault(run_id, {})[key] = sources[0] if sources else None
+        else:
+            config[alias or path] = None
+            missing_config_keys.setdefault(run_id, []).append(selector)
     for key in metrics:
         metric_sources.setdefault(run_id, {})[key] = sources[0] if sources else None
     has_result = bool(metrics)
-    rows.append({"run_id": run_id, "sources": sources, "config": config, "metrics": metrics, "has_scientific_result": has_result})
+    rows.append({"run_id": run_id, "sources": sources, "config": config, "metrics": metrics, "has_scientific_result": has_result, "missing_metric_paths": missing_metric_paths.get(run_id, [])})
 if not rows:
     raise SystemExit("no remote result files found")
 print(json.dumps({
@@ -960,6 +1114,8 @@ print(json.dumps({
     "config_sources": config_sources,
     "metric_sources": metric_sources,
     "missing_config_keys": missing_config_keys,
+    "missing_metric_paths": missing_metric_paths,
+    "discovery_sources": discovery_sources,
 }))
 """
         script = (
@@ -969,6 +1125,9 @@ print(json.dumps({
             .replace("__MAX_RUNS__", repr(max_runs))
             .replace("__METRIC_KEYS__", repr(metric_keys))
             .replace("__GROUP_KEYS__", repr(group_keys))
+            .replace("__METRIC_PATHS__", repr(metric_paths or []))
+            .replace("__GROUP_PATHS__", repr(group_paths or []))
+            .replace("__OUTPUT_GLOBS__", repr(output_globs or []))
             .replace("__BUDGET_SECONDS__", repr(budget_seconds))
         )
         result = self.run(host, "python3 -c " + shlex.quote(script), timeout=budget_seconds + 10)

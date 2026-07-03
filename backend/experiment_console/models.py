@@ -272,6 +272,9 @@ class PullResultsPayload(BaseModel):
     max_runs: int | None = None
     metric_keys: list[str] = Field(default_factory=list)
     group_keys: list[str] = Field(default_factory=list)
+    metric_paths: list[str] = Field(default_factory=list)
+    group_paths: list[str] = Field(default_factory=list)
+    output_globs: list[str] = Field(default_factory=list)
     allow_partial: bool = True
     idempotency_key: str | None = None
 

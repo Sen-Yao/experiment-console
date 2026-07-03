@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 
 from experiment_console.command import CommandResult
@@ -91,6 +92,91 @@ def test_pull_results_reads_group_keys_from_wandb_config_yaml(tmp_path):
     assert result["rows"][0]["config"] == {"batch_size": 512, "layers": 2, "lr": 0.001}
     assert result["config_sources"]["run-a"]["batch_size"].endswith("config.yaml")
     assert result["missing_config_keys"] == {}
+
+
+def test_pull_results_discovers_config_output_and_nested_metric_paths(tmp_path):
+    run_files = tmp_path / "wandb" / "run-20260620_000000-run-a" / "files"
+    run_files.mkdir(parents=True)
+    output_dir = tmp_path / "outputs" / "foo"
+    output_dir.mkdir(parents=True)
+    final_path = output_dir / "run-a.json"
+    progress_path = output_dir / "progress_run-a.json"
+    (run_files / "wandb-summary.json").write_text('{"final_test_auc": 0.1}\n', encoding="utf-8")
+    final_path.write_text(
+        json.dumps({
+            "final_test_auc": 0.91,
+            "seed": 3,
+            "representations": {
+                "hybrid": {
+                    "reader_metrics": {
+                        "mlp_flat": {"auc": 0.88},
+                        "linear": {"auc": 0.82},
+                    }
+                }
+            },
+        }),
+        encoding="utf-8",
+    )
+    progress_path.write_text('{"final_test_auc": 0.01}\n', encoding="utf-8")
+    (run_files / "config.yaml").write_text(
+        "_wandb:\n"
+        "  value:\n"
+        "    e:\n"
+        "      run:\n"
+        "        args:\n"
+        f"          - --out={final_path}\n"
+        f"          - --progress_out={progress_path}\n",
+        encoding="utf-8",
+    )
+    ssh = SSHExecutor(Settings(state_dir=tmp_path), runner=LocalRemotePythonRunner())
+
+    result = ssh.pull_results(
+        host="local",
+        remote_cwd=str(tmp_path),
+        sweep_id="abc123",
+        run_ids=["run-a"],
+        budget_seconds=10,
+        max_runs=1,
+        metric_keys=["final_test_auc"],
+        group_keys=["seed"],
+        metric_paths=["representations.*.reader_metrics.*.auc", "missing.path"],
+    )
+
+    row = result["rows"][0]
+    assert row["metrics"]["final_test_auc"] == 0.91
+    assert row["metrics"]["representations.hybrid.reader_metrics.linear.auc"] == 0.82
+    assert row["metrics"]["representations.hybrid.reader_metrics.mlp_flat.auc"] == 0.88
+    assert row["config"] == {"seed": 3}
+    assert result["discovery_sources"]["run-a"]["selected_paths"] == [str(final_path)]
+    assert str(progress_path) in result["discovery_sources"]["run-a"]["progress_paths"]
+    assert result["missing_metric_paths"] == {"run-a": ["missing.path"]}
+
+
+def test_pull_results_output_globs_fill_when_config_has_no_result_path(tmp_path):
+    run_files = tmp_path / "wandb" / "run-20260620_000000-run-a" / "files"
+    run_files.mkdir(parents=True)
+    custom_dir = tmp_path / "custom-results"
+    custom_dir.mkdir()
+    result_path = custom_dir / "science.json"
+    result_path.write_text('{"final_test_auc": 0.73, "seed": 1}\n', encoding="utf-8")
+    (run_files / "config.yaml").write_text("seed:\n  value: 1\n", encoding="utf-8")
+    ssh = SSHExecutor(Settings(state_dir=tmp_path), runner=LocalRemotePythonRunner())
+
+    result = ssh.pull_results(
+        host="local",
+        remote_cwd=str(tmp_path),
+        sweep_id="abc123",
+        run_ids=["run-a"],
+        budget_seconds=10,
+        max_runs=1,
+        metric_keys=["final_test_auc"],
+        group_keys=["seed"],
+        output_globs=[str(custom_dir / "*.json")],
+    )
+
+    assert result["rows"][0]["metrics"] == {"final_test_auc": 0.73}
+    assert result["rows"][0]["config"] == {"seed": 1}
+    assert result["discovery_sources"]["run-a"]["selected_paths"] == [str(result_path)]
 
 
 def test_extract_error_signals_from_agent_log_tail():

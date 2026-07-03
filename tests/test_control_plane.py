@@ -210,7 +210,7 @@ class FakeSSH:
             "timeout_seconds": timeout_seconds,
         }
 
-    def pull_results(self, *, host, remote_cwd, sweep_id, run_ids, budget_seconds, max_runs, metric_keys, group_keys):
+    def pull_results(self, *, host, remote_cwd, sweep_id, run_ids, budget_seconds, max_runs, metric_keys, group_keys, metric_paths=None, group_paths=None, output_globs=None):
         self.pull_results_calls.append({
             "host": host,
             "remote_cwd": remote_cwd,
@@ -220,6 +220,9 @@ class FakeSSH:
             "max_runs": max_runs,
             "metric_keys": list(metric_keys),
             "group_keys": list(group_keys),
+            "metric_paths": list(metric_paths or []),
+            "group_paths": list(group_paths or []),
+            "output_globs": list(output_globs or []),
         })
         rows = []
         for index, run_id in enumerate(run_ids[:max_runs]):
@@ -1626,15 +1629,21 @@ def test_pull_results_explicit_max_runs_marks_truncated(tmp_path):
 
 def test_pull_results_snapshot_groups_metrics(tmp_path):
     class GroupSSH(FakeSSH):
-        def pull_results(self, *, host, remote_cwd, sweep_id, run_ids, budget_seconds, max_runs, metric_keys, group_keys):
-            self.pull_results_calls.append({"run_ids": list(run_ids), "max_runs": max_runs})
+        def pull_results(self, *, host, remote_cwd, sweep_id, run_ids, budget_seconds, max_runs, metric_keys, group_keys, metric_paths=None, group_paths=None, output_globs=None):
+            self.pull_results_calls.append({
+                "run_ids": list(run_ids),
+                "max_runs": max_runs,
+                "metric_paths": list(metric_paths or []),
+                "group_paths": list(group_paths or []),
+                "output_globs": list(output_globs or []),
+            })
             return {
                 "source": "remote_local_files",
                 "sweep_id": sweep_id,
                 "rows": [
-                    {"run_id": "run-a", "config": {"variant": "x"}, "metrics": {"final_test_auc": 0.8}, "has_scientific_result": True},
-                    {"run_id": "run-b", "config": {"variant": "x"}, "metrics": {"final_test_auc": 1.0}, "has_scientific_result": True},
-                    {"run_id": "run-c", "config": {"variant": "y"}, "metrics": {"final_test_auc": 0.7}, "has_scientific_result": True},
+                    {"run_id": "run-a", "config": {"variant": "x"}, "metrics": {"final_test_auc": 0.8, "representations.hybrid.reader_metrics.mlp_flat.auc": 0.81}, "has_scientific_result": True},
+                    {"run_id": "run-b", "config": {"variant": "x"}, "metrics": {"final_test_auc": 1.0, "representations.hybrid.reader_metrics.mlp_flat.auc": 0.99}, "has_scientific_result": True},
+                    {"run_id": "run-c", "config": {"variant": "y"}, "metrics": {"final_test_auc": 0.7, "representations.hybrid.reader_metrics.mlp_flat.auc": 0.71}, "has_scientific_result": True},
                 ],
                 "valid_results": 3,
                 "missing_results": 0,
@@ -1667,12 +1676,25 @@ def test_pull_results_snapshot_groups_metrics(tmp_path):
         remote_cwd="/tmp/demo",
     ))
 
-    result = service._pull_results(PullResultsPayload(job_id="job_grouped", metric_keys=["final_test_auc"], group_keys=["variant"]))
+    result = service._pull_results(PullResultsPayload(
+        job_id="job_grouped",
+        metric_keys=["final_test_auc"],
+        group_keys=["variant"],
+        metric_paths=["representations.*.reader_metrics.*.auc"],
+        group_paths=["variant"],
+        output_globs=["outputs/*.json"],
+    ))
 
+    assert service.ssh.pull_results_calls[0]["metric_paths"] == ["representations.*.reader_metrics.*.auc"]
+    assert service.ssh.pull_results_calls[0]["group_paths"] == ["variant"]
+    assert service.ssh.pull_results_calls[0]["output_globs"] == ["outputs/*.json"]
     assert result["top_groups"][0]["config"] == {"variant": "x"}
     assert result["top_groups"][0]["metrics"]["final_test_auc"]["mean"] == pytest.approx(0.9)
+    assert result["metric_summaries"]["final_test_auc"]["mean"] == pytest.approx(0.8333333333333334)
+    assert result["metric_summaries"]["representations.hybrid.reader_metrics.mlp_flat.auc"]["max"] == pytest.approx(0.99)
     snapshot = json.loads(open(result["snapshot"]["path"], encoding="utf-8").read())
     assert snapshot["groups"][0]["metrics"]["final_test_auc"]["max"] == pytest.approx(1.0)
+    assert snapshot["metric_summaries"]["representations.hybrid.reader_metrics.mlp_flat.auc"]["count"] == 3
 
 
 @pytest.mark.parametrize(
