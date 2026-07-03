@@ -119,6 +119,21 @@ checks = {
     "conda_sh_exists": os.path.isfile(conda_sh) if conda_sh else False,
     "conda_env": conda_env,
 }
+git = {}
+if os.path.isdir(cwd):
+    try:
+        head = subprocess.run(["git", "-C", cwd, "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=5)
+        status = subprocess.run(["git", "-C", cwd, "status", "--short"], capture_output=True, text=True, timeout=5)
+        branch = subprocess.run(["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True, timeout=5)
+        git = {
+            "available": head.returncode == 0,
+            "head": head.stdout.strip() if head.returncode == 0 else None,
+            "branch": branch.stdout.strip() if branch.returncode == 0 else None,
+            "dirty": bool(status.stdout.strip()) if status.returncode == 0 else None,
+            "status_short": status.stdout.strip().splitlines()[:20] if status.returncode == 0 else [],
+        }
+    except Exception as exc:
+        git = {"available": False, "error": str(exc)}
 python = shutil.which("python3") or "python3"
 if conda_sh and conda_env:
     probe = (
@@ -137,7 +152,7 @@ if conda_sh and conda_env:
         checks['conda_probe_stderr'] = result.stderr[-1000:]
 if config_path:
     checks["config_path_exists"] = os.path.isfile(config_path)
-print(json.dumps({"ok": all(v for v in checks.values() if isinstance(v, bool)), "checks": checks}))
+print(json.dumps({"ok": all(v for v in checks.values() if isinstance(v, bool)), "checks": checks, "git": git}))
 """
         script = (
             script.replace("__CWD__", repr(remote_cwd))
@@ -820,6 +835,8 @@ print(json.dumps({
         metric_paths: list[str] | None = None,
         group_paths: list[str] | None = None,
         output_globs: list[str] | None = None,
+        comparison_paths: list[str] | None = None,
+        include_raw_artifacts: bool = False,
     ) -> dict[str, Any]:
         script = """
 import glob, json, os, re, time
@@ -832,6 +849,8 @@ group_keys = __GROUP_KEYS__
 metric_paths = __METRIC_PATHS__
 group_paths = __GROUP_PATHS__
 output_globs = __OUTPUT_GLOBS__
+comparison_paths = __COMPARISON_PATHS__
+include_raw_artifacts = __INCLUDE_RAW_ARTIFACTS__
 deadline = time.time() + __BUDGET_SECONDS__
 if not run_ids:
     raise SystemExit("target run ids unavailable")
@@ -995,9 +1014,12 @@ def load_wandb_config(path):
 rows = []
 config_sources = {}
 metric_sources = {}
+comparison_sources = {}
 missing_config_keys = {}
 missing_metric_paths = {}
+missing_comparison_paths = {}
 discovery_sources = {}
+raw_artifacts = []
 for run_id in run_ids[:max_runs]:
     if len(rows) >= max_runs or time.time() > deadline:
         break
@@ -1056,7 +1078,9 @@ for run_id in run_ids[:max_runs]:
                 missing_config_keys.setdefault(run_id, []).append(key)
         for selector in metric_paths:
             missing_metric_paths.setdefault(run_id, []).append(selector)
-        rows.append({"run_id": run_id, "sources": config_paths[:1], "config": config, "metrics": {}, "has_scientific_result": False})
+        for selector in comparison_paths:
+            missing_comparison_paths.setdefault(run_id, []).append(selector)
+        rows.append({"run_id": run_id, "sources": config_paths[:1], "config": config, "metrics": {}, "comparisons": {}, "has_scientific_result": False})
         continue
     flat = scalar_map(data)
     metrics = {key: flat.get(key) for key in metric_keys if key in flat} if metric_keys else {
@@ -1075,6 +1099,19 @@ for run_id in run_ids[:max_runs]:
                 selected_numeric = True
         if not selected_numeric:
             missing_metric_paths.setdefault(run_id, []).append(selector)
+    comparisons = {}
+    for selector in comparison_paths:
+        selected = selector_values(data, selector)
+        if not selected:
+            missing_comparison_paths.setdefault(run_id, []).append(selector)
+            continue
+        selected_numeric = False
+        for key, value in selected.items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                comparisons[key] = value
+                selected_numeric = True
+        if not selected_numeric:
+            missing_comparison_paths.setdefault(run_id, []).append(selector)
     config = {}
     if group_keys:
         for key in group_keys:
@@ -1099,8 +1136,18 @@ for run_id in run_ids[:max_runs]:
             missing_config_keys.setdefault(run_id, []).append(selector)
     for key in metrics:
         metric_sources.setdefault(run_id, {})[key] = sources[0] if sources else None
+    for key in comparisons:
+        comparison_sources.setdefault(run_id, {})[key] = sources[0] if sources else None
+    if include_raw_artifacts:
+        for output_path in output_paths[:3]:
+            raw_artifacts.append({
+                "run_id": run_id,
+                "path": output_path,
+                "basename": os.path.basename(output_path),
+                "content": load_json(output_path),
+            })
     has_result = bool(metrics)
-    rows.append({"run_id": run_id, "sources": sources, "config": config, "metrics": metrics, "has_scientific_result": has_result, "missing_metric_paths": missing_metric_paths.get(run_id, [])})
+    rows.append({"run_id": run_id, "sources": sources, "config": config, "metrics": metrics, "comparisons": comparisons, "has_scientific_result": has_result, "missing_metric_paths": missing_metric_paths.get(run_id, []), "missing_comparison_paths": missing_comparison_paths.get(run_id, [])})
 if not rows:
     raise SystemExit("no remote result files found")
 print(json.dumps({
@@ -1113,9 +1160,12 @@ print(json.dumps({
     "partial": len(rows) < len(run_ids),
     "config_sources": config_sources,
     "metric_sources": metric_sources,
+    "comparison_sources": comparison_sources,
     "missing_config_keys": missing_config_keys,
     "missing_metric_paths": missing_metric_paths,
+    "missing_comparison_paths": missing_comparison_paths,
     "discovery_sources": discovery_sources,
+    "raw_artifacts": raw_artifacts,
 }))
 """
         script = (
@@ -1128,6 +1178,8 @@ print(json.dumps({
             .replace("__METRIC_PATHS__", repr(metric_paths or []))
             .replace("__GROUP_PATHS__", repr(group_paths or []))
             .replace("__OUTPUT_GLOBS__", repr(output_globs or []))
+            .replace("__COMPARISON_PATHS__", repr(comparison_paths or []))
+            .replace("__INCLUDE_RAW_ARTIFACTS__", repr(bool(include_raw_artifacts)))
             .replace("__BUDGET_SECONDS__", repr(budget_seconds))
         )
         result = self.run(host, "python3 -c " + shlex.quote(script), timeout=budget_seconds + 10)

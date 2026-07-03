@@ -106,6 +106,7 @@ def test_pull_results_discovers_config_output_and_nested_metric_paths(tmp_path):
         json.dumps({
             "final_test_auc": 0.91,
             "seed": 3,
+            "comparisons": {"topo_gt_minus_mlp": 0.12},
             "representations": {
                 "hybrid": {
                     "reader_metrics": {
@@ -140,6 +141,8 @@ def test_pull_results_discovers_config_output_and_nested_metric_paths(tmp_path):
         metric_keys=["final_test_auc"],
         group_keys=["seed"],
         metric_paths=["representations.*.reader_metrics.*.auc", "missing.path"],
+        comparison_paths=["comparisons.*", "missing.comparison"],
+        include_raw_artifacts=True,
     )
 
     row = result["rows"][0]
@@ -150,6 +153,11 @@ def test_pull_results_discovers_config_output_and_nested_metric_paths(tmp_path):
     assert result["discovery_sources"]["run-a"]["selected_paths"] == [str(final_path)]
     assert str(progress_path) in result["discovery_sources"]["run-a"]["progress_paths"]
     assert result["missing_metric_paths"] == {"run-a": ["missing.path"]}
+    assert row["comparisons"] == {"comparisons.topo_gt_minus_mlp": 0.12}
+    assert result["missing_comparison_paths"] == {"run-a": ["missing.comparison"]}
+    assert result["raw_artifacts"][0]["path"] == str(final_path)
+    assert result["raw_artifacts"][0]["content"]["final_test_auc"] == 0.91
+    assert all("progress" not in item["basename"] for item in result["raw_artifacts"])
 
 
 def test_pull_results_output_globs_fill_when_config_has_no_result_path(tmp_path):
@@ -177,6 +185,34 @@ def test_pull_results_output_globs_fill_when_config_has_no_result_path(tmp_path)
     assert result["rows"][0]["metrics"] == {"final_test_auc": 0.73}
     assert result["rows"][0]["config"] == {"seed": 1}
     assert result["discovery_sources"]["run-a"]["selected_paths"] == [str(result_path)]
+    assert result["raw_artifacts"] == []
+
+
+def test_preflight_reports_remote_git_and_config_facts(tmp_path):
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "--allow-empty", "-m", "init"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("method: grid\n", encoding="utf-8")
+    ssh = SSHExecutor(Settings(state_dir=tmp_path), runner=LocalRemotePythonRunner())
+
+    result = ssh.preflight(
+        host="local",
+        remote_cwd=str(tmp_path),
+        conda_env=None,
+        conda_sh=None,
+        config_path=str(config_path),
+    )
+
+    assert result["checks"]["config_path_exists"] is True
+    assert result["git"]["available"] is True
+    assert result["git"]["head"]
+    assert result["git"]["dirty"] is True
+    assert any("config.yaml" in item for item in result["git"]["status_short"])
 
 
 def test_extract_error_signals_from_agent_log_tail():

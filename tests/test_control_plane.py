@@ -210,7 +210,7 @@ class FakeSSH:
             "timeout_seconds": timeout_seconds,
         }
 
-    def pull_results(self, *, host, remote_cwd, sweep_id, run_ids, budget_seconds, max_runs, metric_keys, group_keys, metric_paths=None, group_paths=None, output_globs=None):
+    def pull_results(self, *, host, remote_cwd, sweep_id, run_ids, budget_seconds, max_runs, metric_keys, group_keys, metric_paths=None, group_paths=None, output_globs=None, comparison_paths=None, include_raw_artifacts=False):
         self.pull_results_calls.append({
             "host": host,
             "remote_cwd": remote_cwd,
@@ -223,6 +223,8 @@ class FakeSSH:
             "metric_paths": list(metric_paths or []),
             "group_paths": list(group_paths or []),
             "output_globs": list(output_globs or []),
+            "comparison_paths": list(comparison_paths or []),
+            "include_raw_artifacts": bool(include_raw_artifacts),
         })
         rows = []
         for index, run_id in enumerate(run_ids[:max_runs]):
@@ -1683,21 +1685,26 @@ def test_pull_results_explicit_max_runs_marks_truncated(tmp_path):
 
 def test_pull_results_snapshot_groups_metrics(tmp_path):
     class GroupSSH(FakeSSH):
-        def pull_results(self, *, host, remote_cwd, sweep_id, run_ids, budget_seconds, max_runs, metric_keys, group_keys, metric_paths=None, group_paths=None, output_globs=None):
+        def pull_results(self, *, host, remote_cwd, sweep_id, run_ids, budget_seconds, max_runs, metric_keys, group_keys, metric_paths=None, group_paths=None, output_globs=None, comparison_paths=None, include_raw_artifacts=False):
             self.pull_results_calls.append({
                 "run_ids": list(run_ids),
                 "max_runs": max_runs,
                 "metric_paths": list(metric_paths or []),
                 "group_paths": list(group_paths or []),
                 "output_globs": list(output_globs or []),
+                "comparison_paths": list(comparison_paths or []),
+                "include_raw_artifacts": bool(include_raw_artifacts),
             })
             return {
                 "source": "remote_local_files",
                 "sweep_id": sweep_id,
                 "rows": [
-                    {"run_id": "run-a", "config": {"variant": "x"}, "metrics": {"final_test_auc": 0.8, "representations.hybrid.reader_metrics.mlp_flat.auc": 0.81}, "has_scientific_result": True},
-                    {"run_id": "run-b", "config": {"variant": "x"}, "metrics": {"final_test_auc": 1.0, "representations.hybrid.reader_metrics.mlp_flat.auc": 0.99}, "has_scientific_result": True},
-                    {"run_id": "run-c", "config": {"variant": "y"}, "metrics": {"final_test_auc": 0.7, "representations.hybrid.reader_metrics.mlp_flat.auc": 0.71}, "has_scientific_result": True},
+                    {"run_id": "run-a", "config": {"variant": "x"}, "metrics": {"final_test_auc": 0.8, "arms.topo.reader_metrics.mlp_flat.auc": 0.81}, "comparisons": {"topo_gt_minus_mlp": 0.02}, "has_scientific_result": True},
+                    {"run_id": "run-b", "config": {"variant": "x"}, "metrics": {"final_test_auc": 1.0, "arms.topo.reader_metrics.mlp_flat.auc": 0.99}, "comparisons": {"topo_gt_minus_mlp": 0.04}, "has_scientific_result": True},
+                    {"run_id": "run-c", "config": {"variant": "y"}, "metrics": {"final_test_auc": 0.7, "arms.topo.reader_metrics.mlp_flat.auc": 0.71}, "comparisons": {"topo_gt_minus_mlp": -0.01}, "has_scientific_result": True},
+                ],
+                "raw_artifacts": [
+                    {"run_id": "run-a", "path": "/remote/run-a.json", "basename": "run-a.json", "content": {"final_test_auc": 0.8}},
                 ],
                 "valid_results": 3,
                 "missing_results": 0,
@@ -1734,21 +1741,36 @@ def test_pull_results_snapshot_groups_metrics(tmp_path):
         job_id="job_grouped",
         metric_keys=["final_test_auc"],
         group_keys=["variant"],
-        metric_paths=["representations.*.reader_metrics.*.auc"],
+        metric_paths=["arms.*.reader_metrics.*.auc"],
         group_paths=["variant"],
         output_globs=["outputs/*.json"],
+        comparison_paths=["comparisons.*"],
+        matrix_by=["arm", "reader"],
+        export_artifacts=True,
+        artifact_dir=str(tmp_path / "exported_artifacts"),
     ))
 
-    assert service.ssh.pull_results_calls[0]["metric_paths"] == ["representations.*.reader_metrics.*.auc"]
+    assert service.ssh.pull_results_calls[0]["metric_paths"] == ["arms.*.reader_metrics.*.auc"]
     assert service.ssh.pull_results_calls[0]["group_paths"] == ["variant"]
     assert service.ssh.pull_results_calls[0]["output_globs"] == ["outputs/*.json"]
+    assert service.ssh.pull_results_calls[0]["comparison_paths"] == ["comparisons.*"]
+    assert service.ssh.pull_results_calls[0]["include_raw_artifacts"] is True
     assert result["top_groups"][0]["config"] == {"variant": "x"}
     assert result["top_groups"][0]["metrics"]["final_test_auc"]["mean"] == pytest.approx(0.9)
     assert result["metric_summaries"]["final_test_auc"]["mean"] == pytest.approx(0.8333333333333334)
-    assert result["metric_summaries"]["representations.hybrid.reader_metrics.mlp_flat.auc"]["max"] == pytest.approx(0.99)
+    assert result["metric_summaries"]["arms.topo.reader_metrics.mlp_flat.auc"]["max"] == pytest.approx(0.99)
+    assert result["comparison_summaries"]["topo_gt_minus_mlp"]["mean"] == pytest.approx(0.016666666666666666)
+    assert result["metric_matrix"]["table"]["topo"]["mlp_flat"]["auc"]["count"] == 3
     snapshot = json.loads(open(result["snapshot"]["path"], encoding="utf-8").read())
     assert snapshot["groups"][0]["metrics"]["final_test_auc"]["max"] == pytest.approx(1.0)
-    assert snapshot["metric_summaries"]["representations.hybrid.reader_metrics.mlp_flat.auc"]["count"] == 3
+    assert snapshot["metric_summaries"]["arms.topo.reader_metrics.mlp_flat.auc"]["count"] == 3
+    assert snapshot["comparison_summaries"]["topo_gt_minus_mlp"]["count"] == 3
+    bundle = snapshot["artifact_bundle"]
+    assert bundle["raw_files"][0]["path"].endswith("raw/run-a__run-a.json")
+    assert (tmp_path / "exported_artifacts" / "result_snapshot.json").exists()
+    assert (tmp_path / "exported_artifacts" / "summary.json").exists()
+    assert (tmp_path / "exported_artifacts" / "summary.md").exists()
+    assert (tmp_path / "exported_artifacts" / "raw" / "run-a__run-a.json").exists()
 
 
 @pytest.mark.parametrize(

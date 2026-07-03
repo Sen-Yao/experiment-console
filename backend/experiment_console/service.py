@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+from pathlib import Path
 import statistics
 from datetime import datetime, timezone
 from typing import Any
@@ -216,6 +217,93 @@ def build_metric_summaries(rows: list[dict[str, Any]], metric_keys: list[str] | 
     return summaries
 
 
+def ordered_numeric_value_keys(rows: list[dict[str, Any]], field: str, keys: list[str] | None = None) -> list[str]:
+    seen: list[str] = []
+    for key in keys or []:
+        if key not in seen:
+            seen.append(key)
+    for row in rows:
+        values = row.get(field) if isinstance(row.get(field), dict) else {}
+        for key, value in values.items():
+            if key not in seen and numeric_metric(value) is not None:
+                seen.append(key)
+    return seen
+
+
+def build_value_summaries(rows: list[dict[str, Any]], field: str, keys: list[str] | None = None) -> dict[str, Any]:
+    wanted = ordered_numeric_value_keys(rows, field, keys)
+    summaries: dict[str, Any] = {}
+    for key in wanted:
+        values = [
+            numeric
+            for row in rows
+            if (numeric := numeric_metric((row.get(field) or {}).get(key))) is not None
+        ]
+        if values:
+            summaries[key] = {
+                "count": len(values),
+                "mean": sum(values) / len(values),
+                "std": statistics.pstdev(values) if len(values) > 1 else 0.0,
+                "min": min(values),
+                "max": max(values),
+            }
+    return summaries
+
+
+def path_dimension_value(metric_key: str, dimension: str) -> str | None:
+    parts = [part for part in str(metric_key or "").split(".") if part]
+    if not parts:
+        return None
+    dim = str(dimension or "").lower()
+    if dim in {"arm", "arms"}:
+        if parts[0] == "arms" and len(parts) > 1:
+            return parts[1]
+        return parts[0] if len(parts) > 2 else None
+    if dim in {"reader", "reader_variant", "reader_variants"}:
+        if "reader_metrics" in parts:
+            index = parts.index("reader_metrics")
+            if index + 1 < len(parts):
+                return parts[index + 1]
+        return parts[-2] if len(parts) > 2 else None
+    if dim in {"metric", "measure", "value"}:
+        return parts[-1]
+    for index, part in enumerate(parts[:-1]):
+        if part.lower() == dim:
+            return parts[index + 1]
+    return None
+
+
+def build_metric_matrix(metric_summaries: dict[str, Any], matrix_by: list[str]) -> dict[str, Any]:
+    if len(matrix_by) < 2 or not metric_summaries:
+        return {}
+    row_dimension = matrix_by[0]
+    column_dimension = matrix_by[1]
+    table: dict[str, dict[str, dict[str, Any]]] = {}
+    cells: list[dict[str, Any]] = []
+    for metric_key, summary in metric_summaries.items():
+        row_value = path_dimension_value(metric_key, row_dimension)
+        column_value = path_dimension_value(metric_key, column_dimension)
+        if not row_value or not column_value:
+            continue
+        metric_name = path_dimension_value(metric_key, "metric") or metric_key
+        table.setdefault(row_value, {}).setdefault(column_value, {})[metric_name] = summary
+        cells.append({
+            "row": row_value,
+            "column": column_value,
+            "metric": metric_name,
+            "metric_key": metric_key,
+            "summary": summary,
+        })
+    if not cells:
+        return {}
+    return {
+        "row_dimension": row_dimension,
+        "column_dimension": column_dimension,
+        "table": table,
+        "cells": cells,
+    }
+
+
 def selector_label(selector: str) -> str:
     text = str(selector or "")
     if "=" in text:
@@ -223,6 +311,51 @@ def selector_label(selector: str) -> str:
         if alias:
             return alias
     return text
+
+
+def safe_filename(value: str, default: str = "artifact") -> str:
+    text = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in str(value or ""))
+    return text.strip("._") or default
+
+
+def write_json_file(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def render_result_summary_markdown(summary: dict[str, Any]) -> str:
+    lines = [
+        "# Experiment Result Summary",
+        "",
+        f"- classification: `{summary.get('classification') or '-'}`",
+        f"- readiness: `{summary.get('readiness') or '-'}`",
+        f"- source: `{summary.get('source') or '-'}`",
+        f"- snapshot: `{summary.get('snapshot_path') or summary.get('path') or '-'}`",
+        f"- valid/missing/failed: `{summary.get('valid_runs', summary.get('valid_results', '-'))}/{summary.get('missing_runs', summary.get('missing_results', '-'))}/{summary.get('failed_runs', summary.get('failed_results', '-'))}`",
+    ]
+    for section, values in [
+        ("Metric Summaries", summary.get("metric_summaries")),
+        ("Comparison Summaries", summary.get("comparison_summaries")),
+    ]:
+        if isinstance(values, dict) and values:
+            lines.extend(["", f"## {section}", ""])
+            for key, item in list(values.items())[:20]:
+                if not isinstance(item, dict):
+                    continue
+                lines.append(
+                    f"- `{key}`: count={item.get('count')}, mean={item.get('mean')}, std={item.get('std')}, min={item.get('min')}, max={item.get('max')}"
+                )
+    matrix = summary.get("metric_matrix")
+    if isinstance(matrix, dict) and matrix.get("cells"):
+        lines.extend(["", "## Metric Matrix", ""])
+        for cell in matrix["cells"][:40]:
+            if not isinstance(cell, dict):
+                continue
+            cell_summary = cell.get("summary") if isinstance(cell.get("summary"), dict) else {}
+            lines.append(
+                f"- `{cell.get('row')}` x `{cell.get('column')}` `{cell.get('metric')}`: mean={cell_summary.get('mean')}, std={cell_summary.get('std')}, count={cell_summary.get('count')}"
+            )
+    return "\n".join(lines) + "\n"
 
 
 class ConsoleService:
@@ -278,10 +411,14 @@ class ConsoleService:
         result: dict[str, Any],
         group_keys: list[str],
         metric_keys: list[str],
+        comparison_keys: list[str],
+        matrix_by: list[str],
         expected_runs: int | None,
         discovered_runs: int | None,
         requested_limit: int | None,
         run_id_source: str | None = None,
+        export_artifacts: bool = False,
+        artifact_dir: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         rows = result.get("rows") if isinstance(result.get("rows"), list) else []
         fetched_runs = len(rows)
@@ -299,6 +436,8 @@ class ConsoleService:
         complete = bool(coverage_target and fetched_runs >= coverage_target and not truncated)
         groups = build_result_groups(rows, group_keys, metric_keys)
         metric_summaries = build_metric_summaries(rows, metric_keys)
+        comparison_summaries = build_value_summaries(rows, "comparisons", comparison_keys)
+        metric_matrix = build_metric_matrix(metric_summaries, matrix_by)
         enriched = {
             **result,
             "expected_runs": expected_runs,
@@ -313,6 +452,8 @@ class ConsoleService:
             "groups": groups["groups"],
             "top_groups": groups["top_groups"],
             "metric_summaries": metric_summaries,
+            "comparison_summaries": comparison_summaries,
+            "metric_matrix": metric_matrix,
         }
         readiness = classify_result_readiness(enriched)
         classification = result_pull_classification(enriched)
@@ -324,12 +465,61 @@ class ConsoleService:
         snapshot_dir = self.settings.results_dir / safe_key
         snapshot_dir.mkdir(parents=True, exist_ok=True)
         snapshot_path = snapshot_dir / f"{snapshot_id}.json"
+        include_artifacts = bool(export_artifacts or artifact_dir)
+        bundle_dir = snapshot_dir / snapshot_id
+        raw_dir = bundle_dir / "raw"
+        summary_json_path = bundle_dir / "summary.json"
+        summary_md_path = bundle_dir / "summary.md"
+        export_dir = Path(artifact_dir).expanduser() if artifact_dir else None
+        artifact_bundle: dict[str, Any] = {
+            "snapshot_path": str(snapshot_path),
+            "bundle_dir": str(bundle_dir) if include_artifacts else None,
+            "summary_json_path": str(summary_json_path) if include_artifacts else None,
+            "summary_markdown_path": str(summary_md_path) if include_artifacts else None,
+            "raw_dir": str(raw_dir) if include_artifacts else None,
+            "raw_files": [],
+            "export_dir": str(export_dir) if export_dir else None,
+            "exported": include_artifacts,
+        }
+        if include_artifacts:
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            for artifact in result.get("raw_artifacts") or []:
+                if not isinstance(artifact, dict) or "content" not in artifact:
+                    continue
+                run_id = safe_filename(str(artifact.get("run_id") or "run"))
+                basename = safe_filename(str(artifact.get("basename") or Path(str(artifact.get("path") or "result.json")).name), "result.json")
+                filename = f"{run_id}__{basename}"
+                raw_path = raw_dir / filename
+                content = artifact.get("content")
+                if isinstance(content, dict):
+                    write_json_file(raw_path, content)
+                else:
+                    raw_path.write_text(str(content), encoding="utf-8")
+                raw_record = {
+                    "run_id": artifact.get("run_id"),
+                    "source_path": artifact.get("path"),
+                    "path": str(raw_path),
+                    "basename": basename,
+                }
+                artifact_bundle["raw_files"].append(raw_record)
+            if export_dir:
+                (export_dir / "raw").mkdir(parents=True, exist_ok=True)
+                for raw_record in artifact_bundle["raw_files"]:
+                    source_path = Path(str(raw_record["path"]))
+                    target_path = export_dir / "raw" / source_path.name
+                    target_path.write_text(source_path.read_text(encoding="utf-8"), encoding="utf-8")
+                    raw_record["export_path"] = str(target_path)
+                artifact_bundle["export_snapshot_path"] = str(export_dir / "result_snapshot.json")
+                artifact_bundle["export_summary_json_path"] = str(export_dir / "summary.json")
+                artifact_bundle["export_summary_markdown_path"] = str(export_dir / "summary.md")
         provenance = {
             "run_id_source": run_id_source or result.get("run_id_source"),
             "config_sources": result.get("config_sources", {}),
             "metric_sources": result.get("metric_sources", {}),
+            "comparison_sources": result.get("comparison_sources", {}),
             "missing_config_keys": result.get("missing_config_keys", {}),
             "missing_metric_paths": result.get("missing_metric_paths", {}),
+            "missing_comparison_paths": result.get("missing_comparison_paths", {}),
             "discovery_sources": result.get("discovery_sources", {}),
         }
         for key_name in ["remote_error", "wandb_error"]:
@@ -360,6 +550,9 @@ class ConsoleService:
             "groups": groups["groups"],
             "top_groups": groups["top_groups"],
             "metric_summaries": metric_summaries,
+            "comparison_summaries": comparison_summaries,
+            "metric_matrix": metric_matrix,
+            "artifact_bundle": artifact_bundle,
             "provenance": provenance,
             "classification": classification,
             "readiness": readiness,
@@ -369,9 +562,18 @@ class ConsoleService:
             **enriched,
             "snapshot_id": snapshot_id,
             "snapshot_path": str(snapshot_path),
+            "artifact_bundle": artifact_bundle,
         })
         summary["path"] = str(snapshot_path)
+        if include_artifacts:
+            write_json_file(summary_json_path, summary)
+            summary_md_path.write_text(render_result_summary_markdown(summary), encoding="utf-8")
+            if export_dir:
+                write_json_file(export_dir / "result_snapshot.json", snapshot)
+                write_json_file(export_dir / "summary.json", summary)
+                (export_dir / "summary.md").write_text(render_result_summary_markdown(summary), encoding="utf-8")
         enriched["snapshot"] = summary
+        enriched["artifact_bundle"] = artifact_bundle
         return enriched, summary
 
     def _current_operation(self, job: JobRecord | None) -> dict[str, Any] | None:
@@ -2838,6 +3040,7 @@ class ConsoleService:
         idempotency_key = idempotency_key or self._operation_identity(IntentType.pull_results, payload.model_dump(mode="json"))[1]
         metric_labels = [*payload.metric_keys, *[selector_label(item) for item in payload.metric_paths]]
         group_labels = [*payload.group_keys, *[selector_label(item) for item in payload.group_paths]]
+        comparison_labels = [selector_label(item) for item in payload.comparison_paths]
         if job:
             self._record_operation(
                 job,
@@ -2875,6 +3078,10 @@ class ConsoleService:
                 result={"stage": result.get("stage", "done"), "entity": entity, "project": project, "sweep_id": sweep_id, **result},
                 group_keys=group_labels,
                 metric_keys=metric_labels,
+                comparison_keys=comparison_labels,
+                matrix_by=payload.matrix_by,
+                export_artifacts=payload.export_artifacts,
+                artifact_dir=payload.artifact_dir,
                 expected_runs=expected_runs,
                 discovered_runs=discovered_runs,
                 requested_limit=requested_limit,
@@ -2909,6 +3116,9 @@ class ConsoleService:
                         "truncated": enriched.get("truncated"),
                         "complete": enriched.get("complete"),
                         "readiness": enriched.get("readiness"),
+                        "comparison_summaries": enriched.get("comparison_summaries"),
+                        "metric_matrix": enriched.get("metric_matrix"),
+                        "artifact_bundle": enriched.get("artifact_bundle"),
                     },
                 )
                 self.store.upsert_job(job)
@@ -2989,6 +3199,8 @@ class ConsoleService:
                 metric_paths=payload.metric_paths,
                 group_paths=payload.group_paths,
                 output_globs=payload.output_globs,
+                comparison_paths=payload.comparison_paths,
+                include_raw_artifacts=bool(payload.export_artifacts or payload.artifact_dir),
             )
             result["run_id_source"] = run_id_source
             return finalize_result(
@@ -3310,6 +3522,9 @@ def summarize_result_pull(result: dict[str, Any]) -> dict[str, Any]:
         "truncated": result.get("truncated"),
         "partial": result.get("partial"),
         "metric_summaries": result.get("metric_summaries"),
+        "comparison_summaries": result.get("comparison_summaries"),
+        "metric_matrix": result.get("metric_matrix"),
+        "artifact_bundle": result.get("artifact_bundle"),
         "generated_at": utc_now(),
     }
 
@@ -3458,7 +3673,7 @@ def compact_job_record(job: JobRecord) -> dict[str, Any]:
             elif key == "preflight" and isinstance(monitor[key], dict):
                 compact_monitor[key] = {
                     preflight_key: monitor[key].get(preflight_key)
-                    for preflight_key in ["ok", "classification", "checks", "argv_probe", "warnings", "remote_config_snapshot_error"]
+                    for preflight_key in ["ok", "classification", "checks", "git", "argv_probe", "warnings", "remote_config_snapshot_error"]
                     if preflight_key in monitor[key]
                 }
             else:
@@ -3515,6 +3730,9 @@ def compact_operation(operation: dict[str, Any] | None) -> dict[str, Any] | None
         "success",
         "failure_diagnostics",
         "launch_identity_conflicts",
+        "comparison_summaries",
+        "metric_matrix",
+        "artifact_bundle",
     ]:
         if key in result:
             compact_result[key] = compact_failure_diagnostics(result[key]) if key == "failure_diagnostics" else result[key]

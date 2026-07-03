@@ -275,6 +275,10 @@ class PullResultsPayload(BaseModel):
     metric_paths: list[str] = Field(default_factory=list)
     group_paths: list[str] = Field(default_factory=list)
     output_globs: list[str] = Field(default_factory=list)
+    comparison_paths: list[str] = Field(default_factory=list)
+    matrix_by: list[str] = Field(default_factory=list)
+    export_artifacts: bool = False
+    artifact_dir: str | None = None
     allow_partial: bool = True
     idempotency_key: str | None = None
 
