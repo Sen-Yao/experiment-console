@@ -2174,6 +2174,7 @@ class ConsoleService:
         elif sweep_attention:
             classification = "attention"
             next_actions = sweep_attention_reasons or ["检查 run 级失败诊断；如需要，修复远端代码/路径后重新 launch 或 recover-agents。"]
+        consistency_warnings = sweep_consistency_warnings(sweep) if sweep else []
         return {
             "stage": "done",
             "classification": classification,
@@ -2202,6 +2203,7 @@ class ConsoleService:
                 "result_readiness": result_readiness,
                 "sweep_attention": sweep_attention,
                 "sweep_attention_reasons": sweep_attention_reasons,
+                "consistency_warnings": consistency_warnings,
                 "queue": queue_state,
             },
             "degraded": degraded,
@@ -3568,6 +3570,9 @@ def compact_sweep_status(sweep: dict[str, Any], *, include_runs: bool = False) -
         "finished_runs": sweep.get("finished_runs"),
         "running_runs": sweep.get("running_runs"),
         "failed_runs": sweep.get("failed_runs"),
+        "raw_run_state_counts": sweep.get("raw_run_state_counts"),
+        "run_state_counts_source": sweep.get("run_state_counts_source"),
+        "run_state_counts_consistency": sweep.get("run_state_counts_consistency"),
         "last_sync_at": sweep.get("last_sync_at"),
         "speed_per_hour": sweep.get("speed_per_hour"),
         "eta_seconds": sweep.get("eta_seconds"),
@@ -3597,6 +3602,13 @@ def parse_wandb_json_field(value: Any) -> dict[str, Any]:
         except Exception:
             return {}
     return {}
+
+
+def sweep_consistency_warnings(sweep: dict[str, Any]) -> list[str]:
+    consistency = sweep.get("run_state_counts_consistency")
+    if consistency == "terminal_run_edges_stale":
+        return ["W&B sweep 已终态，但 run edge 状态仍滞后；Console 已使用终态规范化计数。"]
+    return []
 
 
 def compact_error(exc: Exception, max_chars: int = 500) -> str:

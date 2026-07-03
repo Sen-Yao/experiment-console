@@ -234,6 +234,25 @@ h3 {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
+.consistencyHint {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  margin-top: 8px;
+  color: #715415;
+  background: #fff7df;
+  border: 1px solid #ead291;
+  border-radius: 999px;
+  padding: 4px 8px;
+  font-size: 12px;
+  font-weight: 720;
+}
+
+.consistencyHint.compact {
+  margin-top: 4px;
+  border-radius: 6px;
+}
+
 .stateBadge {
   align-self: flex-start;
   color: #245b47;
@@ -460,6 +479,11 @@ h3 {
   color: #5d6961;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.sweepRow .consistencyHint {
+  color: #715415;
+  text-overflow: clip;
 }
 
 code {

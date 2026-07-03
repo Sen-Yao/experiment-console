@@ -48,6 +48,13 @@ type Sweep = {
   finished_runs?: number
   running_runs?: number
   failed_runs?: number
+  raw_run_state_counts?: {
+    finished?: number
+    running?: number
+    failed?: number
+  }
+  run_state_counts_source?: string
+  run_state_counts_consistency?: string
   speed_per_hour?: number
   eta_seconds?: number | null
   last_sync_at?: string
@@ -203,6 +210,7 @@ function HeroSweepPanel({ sweep, loading }: { sweep?: Sweep; loading?: boolean }
   const running = Math.max(0, sweep.running_runs ?? 0)
   const failed = Math.max(0, sweep.failed_runs ?? 0)
   const progress = expected > 0 ? Math.min(finished / expected, 1) : Math.min(sweep.progress || 0, 1)
+  const consistency = sweepConsistencyText(sweep)
 
   return (
     <section className={`heroPanel tone-${toneForStatus(sweep.state)}`}>
@@ -211,6 +219,7 @@ function HeroSweepPanel({ sweep, loading }: { sweep?: Sweep; loading?: boolean }
           <span className="sectionLabel">主 Sweep</span>
           <h2>{sweep.name || sweep.id}</h2>
           <p>{sweep.entity}/{sweep.project}</p>
+          {consistency ? <span className="consistencyHint">{consistency}</span> : null}
         </div>
         <span className="stateBadge">{statusText(sweep.state)}</span>
       </div>
@@ -273,11 +282,13 @@ function SweepRow({ sweep }: { sweep: Sweep }) {
   const expected = sweep.expectedRunCount || 0
   const finished = sweep.finished_runs ?? sweep.runCount ?? 0
   const pct = expected ? Math.min(finished / expected, 1) : sweep.progress || 0
+  const consistency = sweepConsistencyText(sweep)
   return (
     <div className="sweepRow">
       <div>
         <strong>{sweep.name || sweep.id}</strong>
         <span>{sweep.entity}/{sweep.project}</span>
+        {consistency ? <span className="consistencyHint compact">{consistency}</span> : null}
       </div>
       <span className={`smallBadge tone-${toneForStatus(sweep.state)}`}>{statusText(sweep.state)}</span>
       <code>{finished}/{expected || '-'}</code>
@@ -414,6 +425,14 @@ function statusText(status: string) {
   if (s === 'attention') return '需关注'
   if (s === 'stalled') return '已悬挂'
   return status || '未知'
+}
+
+function sweepConsistencyText(sweep: Sweep) {
+  const consistency = sweep.run_state_counts_consistency
+  if (!consistency || consistency === 'consistent') return ''
+  if (consistency === 'terminal_run_edges_stale') return 'W&B run 状态滞后'
+  if (consistency === 'fallback_from_sweep_count') return 'W&B run 明细未展开'
+  return 'W&B run 状态待核对'
 }
 
 function formatterParts(formatter: Intl.DateTimeFormat, date: Date): TimePartMap {

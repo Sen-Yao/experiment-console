@@ -62,18 +62,31 @@ def compute_sweep_telemetry(
     state = str(sweep.get("state") or "").lower()
 
     if runs:
-        finished = sum(1 for run in runs if _run_state(run) in FINISHED_STATES)
-        failed = sum(1 for run in runs if _run_state(run) in FAILED_STATES)
-        running = sum(1 for run in runs if _run_state(run) in RUNNING_STATES)
+        raw_finished = sum(1 for run in runs if _run_state(run) in FINISHED_STATES)
+        raw_failed = sum(1 for run in runs if _run_state(run) in FAILED_STATES)
+        raw_running = sum(1 for run in runs if _run_state(run) in RUNNING_STATES)
         source = "wandb_runs"
     else:
         if state == "finished":
-            finished = expected or run_count
+            raw_finished = expected or run_count
         else:
-            finished = 0
-        failed = 0
-        running = 0
+            raw_finished = 0
+        raw_failed = 0
+        raw_running = 0
         source = "wandb_sweep_runCount"
+
+    finished = raw_finished
+    failed = raw_failed
+    running = raw_running
+    consistency = "consistent"
+    if state == "finished" and source == "wandb_runs" and expected > 0 and run_count >= expected:
+        normalized_finished = max(raw_finished, expected - raw_failed)
+        if raw_running or normalized_finished != raw_finished:
+            consistency = "terminal_run_edges_stale"
+        finished = normalized_finished
+        running = 0
+    elif source == "wandb_sweep_runCount":
+        consistency = "fallback_from_sweep_count"
 
     typical_run_seconds = _typical_finished_run_seconds(runs)
     speed = _duration_based_speed_per_hour(typical_run_seconds, running) or _speed_per_hour(previous, finished, stamp)
@@ -95,6 +108,12 @@ def compute_sweep_telemetry(
         "speed_per_hour": speed,
         "eta_seconds": eta,
         "run_state_counts_source": source,
+        "raw_run_state_counts": {
+            "finished": raw_finished,
+            "running": raw_running,
+            "failed": raw_failed,
+        },
+        "run_state_counts_consistency": consistency,
     }
     history = {
         "entity": sweep.get("entity"),
@@ -105,6 +124,8 @@ def compute_sweep_telemetry(
         "finished_runs": finished,
         "running_runs": running,
         "failed_runs": failed,
+        "raw_run_state_counts": telemetry["raw_run_state_counts"],
+        "run_state_counts_consistency": consistency,
         "observed_at": stamp,
     }
     return telemetry, history

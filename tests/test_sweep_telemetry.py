@@ -137,6 +137,29 @@ def test_terminal_sweep_does_not_emit_eta():
     assert telemetry["eta_seconds"] is None
 
 
+def test_terminal_sweep_normalizes_stale_run_edges():
+    sweep = {
+        "id": "s1",
+        "entity": "e",
+        "project": "p",
+        "state": "FINISHED",
+        "runCount": 15,
+        "expectedRunCount": 15,
+        "runs": [
+            *[{"name": f"run-{index}", "state": "finished"} for index in range(14)],
+            {"name": "run-14", "state": "running"},
+        ],
+    }
+
+    telemetry, _ = compute_sweep_telemetry(sweep, observed_at="2026-06-17T01:00:00+00:00")
+
+    assert telemetry["finished_runs"] == 15
+    assert telemetry["running_runs"] == 0
+    assert telemetry["raw_run_state_counts"]["finished"] == 14
+    assert telemetry["raw_run_state_counts"]["running"] == 1
+    assert telemetry["run_state_counts_consistency"] == "terminal_run_edges_stale"
+
+
 def test_non_terminal_sweep_without_runs_does_not_guess_completion():
     sweep = {
         "id": "s1",

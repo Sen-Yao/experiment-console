@@ -1475,6 +1475,60 @@ def test_status_returns_sweep_telemetry(tmp_path):
     assert "heartbeat" not in forbidden_text
 
 
+def test_status_normalizes_finished_sweep_with_stale_run_edges(tmp_path):
+    class StaleFinishedWandB(FakeWandB):
+        def get_sweep_state(self, entity, project, sweep_id):
+            return {
+                "id": sweep_id,
+                "entity": entity,
+                "project": project,
+                "state": "FINISHED",
+                "runCount": 15,
+                "expectedRunCount": 15,
+                "runs": [
+                    *[{"name": f"run-{index}", "state": "finished"} for index in range(14)],
+                    {"name": "run-14", "state": "running"},
+                ],
+            }
+
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=StaleFinishedWandB(), ssh=FakeSSH())
+    service.store.upsert_job(JobRecord(
+        job_id="job_stale_edges",
+        name="stale-edges",
+        status=JobStatus.running,
+        entity="my-team",
+        project="my-project",
+        sweep_id="abc123",
+        remote_host="gpu-host-1",
+        remote_cwd="/tmp/demo",
+        monitor={
+            "last_result_snapshot": {
+                "readiness": "complete",
+                "expected_runs": 15,
+                "discovered_runs": 15,
+                "fetched_runs": 15,
+                "valid_runs": 15,
+                "missing_runs": 0,
+                "failed_runs": 0,
+                "complete": True,
+            },
+        },
+    ))
+
+    response = service.runner_command(IntentType.status_query, {"job_id": "job_stale_edges"})
+    sweep = response.result["sweep"]
+
+    assert response.result["state"]["wandb_sweep_status"] == "FINISHED"
+    assert response.result["state"]["job_status"] == "finished"
+    assert response.result["state"]["result_readiness"] == "complete"
+    assert response.result["state"]["consistency_warnings"]
+    assert sweep["finished_runs"] == 15
+    assert sweep["running_runs"] == 0
+    assert sweep["raw_run_state_counts"] == {"finished": 14, "running": 1, "failed": 0}
+    assert sweep["run_state_counts_consistency"] == "terminal_run_edges_stale"
+
+
 def test_status_returns_compact_sweep_without_run_payloads(tmp_path):
     class VerboseWandB(FakeWandB):
         def get_sweep_state(self, entity, project, sweep_id):
