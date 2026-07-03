@@ -734,18 +734,124 @@ class ConsoleService:
             return None
         queued_jobs = self.store.list_queued_jobs(str(queue_group))
         blocker = self.store.active_queue_blocker(str(queue_group), exclude_job_id=job.job_id)
+        blocker_assessment = self._assess_queue_blocker(blocker) if blocker else None
         position = None
         for index, queued in enumerate(queued_jobs, start=1):
             if queued.job_id == job.job_id:
                 position = index
                 break
         blocked_by = queue.get("blocked_by_job_id") or (blocker.job_id if blocker else None)
-        return {
+        result = {
             "queue_group": queue_group,
             "queue_position": position,
             "blocked_by_job_id": blocked_by,
             "queued_count": len(queued_jobs),
         }
+        if blocker_assessment:
+            result.update({
+                "blocked_by_classification": blocker_assessment["classification"],
+                "blocker_classification": blocker_assessment["classification"],
+                "blocker_unblockable": blocker_assessment["unblockable"],
+                "recommended_action": blocker_assessment["recommended_action"],
+            })
+        return result
+
+    def _assess_queue_blocker(self, job: JobRecord | None) -> dict[str, Any]:
+        if job is None:
+            return {
+                "classification": "no_blocker",
+                "unblockable": False,
+                "recommended_action": None,
+                "evidence": {},
+            }
+        if job.status in TERMINAL_JOB_STATUSES:
+            return {
+                "classification": "remote_terminal_reconciled",
+                "unblockable": False,
+                "recommended_action": None,
+                "evidence": {"job_status": job.status.value},
+            }
+        missing: list[str] = []
+        if infer_job_kind(job) == "sweep":
+            for key, value in {
+                "sweep_id": job.sweep_id,
+                "entity": job.entity,
+                "project": job.project,
+                "remote_host": job.remote_host,
+                "remote_cwd": job.remote_cwd,
+            }.items():
+                if not value:
+                    missing.append(key)
+        if missing:
+            return {
+                "classification": "metadata_corrupt_blocker",
+                "unblockable": True,
+                "recommended_action": "Run advance-queue with auto_unblock_stale=true, or stop-job with ledger_only=true.",
+                "evidence": {
+                    "job_id": job.job_id,
+                    "job_status": job.status.value,
+                    "missing": missing,
+                    "kind": infer_job_kind(job),
+                },
+            }
+        if job.status == JobStatus.unknown:
+            return {
+                "classification": "ambiguous_blocker",
+                "unblockable": False,
+                "recommended_action": "Run status/watchdog-once before deciding whether to ledger-only cancel this job.",
+                "evidence": {"job_id": job.job_id, "job_status": job.status.value},
+            }
+        return {
+            "classification": "active_real_blocker",
+            "unblockable": False,
+            "recommended_action": "Wait for the blocker to finish, or use status/watchdog-once to diagnose it.",
+            "evidence": {"job_id": job.job_id, "job_status": job.status.value, "kind": infer_job_kind(job)},
+        }
+
+    def _ledger_only_cancel_job(
+        self,
+        job: JobRecord,
+        *,
+        requested_by: str,
+        reason: str | None,
+        classification: str,
+        evidence: dict[str, Any] | None = None,
+    ) -> tuple[JobRecord, dict[str, Any]]:
+        previous_status = job.status.value
+        stop_result = {
+            "ledger_only": True,
+            "reason": reason or "Ledger-only cancellation requested.",
+            "remote_side_effects": False,
+        }
+        queue_hygiene = {
+            "unblocked_at": utc_now(),
+            "unblocked_by": requested_by,
+            "reason": reason or classification,
+            "previous_status": previous_status,
+            "evidence": evidence or {},
+        }
+        patch = {
+            "classification": classification,
+            "stop_result": stop_result,
+            "queue_hygiene": queue_hygiene,
+        }
+        updated = self.store.update_job_status(job.job_id, JobStatus.cancelled, patch)
+        result = {
+            "job_id": updated.job_id,
+            "previous_status": previous_status,
+            "status": updated.status.value,
+            "classification": classification,
+            "ledger_only": True,
+            "reason": stop_result["reason"],
+            "evidence": evidence or {},
+        }
+        self.store.write_audit(AuditEvent(
+            event_type="job_ledger_only_cancelled",
+            job_id=updated.job_id,
+            message="Job was cancelled in Console ledger without remote side effects.",
+            detail=result,
+        ))
+        return updated, result
 
     def _queued_replay_result(self, job: JobRecord) -> dict[str, Any]:
         return {
@@ -1425,64 +1531,95 @@ class ConsoleService:
         groups = [payload.queue_group] if payload.queue_group else self.store.queue_groups()
         advanced: list[dict[str, Any]] = []
         blocked: list[dict[str, Any]] = []
+        unblocked: list[dict[str, Any]] = []
         idle: list[str] = []
         for queue_group in [str(group) for group in groups if group]:
-            blocker = self.store.active_queue_blocker(queue_group)
-            if blocker:
-                blocked.append({
+            while True:
+                blocker = self.store.active_queue_blocker(queue_group)
+                if blocker:
+                    assessment = self._assess_queue_blocker(blocker)
+                    if payload.auto_unblock_stale and assessment["unblockable"]:
+                        _, hygiene = self._ledger_only_cancel_job(
+                            blocker,
+                            requested_by=requested_by,
+                            reason=f"Auto-unblocked stale queue blocker for {queue_group}.",
+                            classification="metadata_corrupt_cancelled",
+                            evidence=assessment["evidence"],
+                        )
+                        unblocked.append({"queue_group": queue_group, **hygiene})
+                        continue
+                    blocked.append({
+                        "queue_group": queue_group,
+                        "blocked_by_job_id": blocker.job_id,
+                        "blocked_by_status": blocker.status.value,
+                        "blocked_by_classification": assessment["classification"],
+                        "blocker_classification": assessment["classification"],
+                        "unblockable": assessment["unblockable"],
+                        "recommended_action": assessment["recommended_action"],
+                        "evidence": assessment["evidence"],
+                    })
+                    break
+                queued = self.store.next_queued_job(queue_group)
+                if not queued:
+                    idle.append(queue_group)
+                    break
+                queue_meta = queued.monitor.get("queue") if isinstance(queued.monitor.get("queue"), dict) else {}
+                raw_payload = queue_meta.get("payload")
+                if not isinstance(raw_payload, dict):
+                    queued.monitor.update({
+                        "stage": "queue_failed",
+                        "classification": "queued_payload_missing",
+                        "error": "queued launch payload is missing",
+                        "queue_hygiene": {
+                            "unblocked_at": utc_now(),
+                            "unblocked_by": requested_by,
+                            "reason": "queued launch payload is missing",
+                            "previous_status": queued.status.value,
+                            "evidence": {"job_id": queued.job_id, "queue_group": queue_group},
+                        },
+                    })
+                    queued.status = JobStatus.failed
+                    self.store.upsert_job(queued)
+                    unblocked.append({
+                        "queue_group": queue_group,
+                        "job_id": queued.job_id,
+                        "previous_status": JobStatus.queued.value,
+                        "status": JobStatus.failed.value,
+                        "classification": "queued_payload_missing",
+                        "ledger_only": True,
+                        "reason": "queued launch payload is missing",
+                        "evidence": {"job_id": queued.job_id, "queue_group": queue_group},
+                    })
+                    continue
+                launch_payload = LaunchSweepPayload.model_validate({
+                    **raw_payload,
                     "queue_group": queue_group,
-                    "blocked_by_job_id": blocker.job_id,
-                    "blocked_by_status": blocker.status.value,
                 })
-                continue
-            queued = self.store.next_queued_job(queue_group)
-            if not queued:
-                idle.append(queue_group)
-                continue
-            queue_meta = queued.monitor.get("queue") if isinstance(queued.monitor.get("queue"), dict) else {}
-            raw_payload = queue_meta.get("payload")
-            if not isinstance(raw_payload, dict):
-                queued.status = JobStatus.failed
-                queued.monitor.update({
-                    "stage": "queue_failed",
-                    "classification": "queued_payload_missing",
-                    "error": "queued launch payload is missing",
-                })
-                self.store.upsert_job(queued)
-                blocked.append({
+                launch_operation_id = operation_id or self._operation_identity(IntentType.launch_sweep, launch_payload.model_dump(mode="json"))[0]
+                launch_idempotency_key = idempotency_key or self._operation_identity(IntentType.launch_sweep, launch_payload.model_dump(mode="json"))[1]
+                result, started_job = self._launch_sweep_now(
+                    launch_payload,
+                    requested_by=requested_by,
+                    operation_id=launch_operation_id,
+                    idempotency_key=launch_idempotency_key,
+                    queue_group=queue_group,
+                    queued_job=queued,
+                )
+                advanced.append({
                     "queue_group": queue_group,
-                    "blocked_by_job_id": queued.job_id,
-                    "blocked_by_status": queued.status.value,
-                    "classification": "queued_payload_missing",
+                    "job_id": started_job.job_id,
+                    "classification": result.get("classification"),
+                    "stage": result.get("stage"),
+                    "created_new_sweep": result.get("created_new_sweep"),
                 })
-                continue
-            launch_payload = LaunchSweepPayload.model_validate({
-                **raw_payload,
-                "queue_group": queue_group,
-            })
-            launch_operation_id = operation_id or self._operation_identity(IntentType.launch_sweep, launch_payload.model_dump(mode="json"))[0]
-            launch_idempotency_key = idempotency_key or self._operation_identity(IntentType.launch_sweep, launch_payload.model_dump(mode="json"))[1]
-            result, started_job = self._launch_sweep_now(
-                launch_payload,
-                requested_by=requested_by,
-                operation_id=launch_operation_id,
-                idempotency_key=launch_idempotency_key,
-                queue_group=queue_group,
-                queued_job=queued,
-            )
-            advanced.append({
-                "queue_group": queue_group,
-                "job_id": started_job.job_id,
-                "classification": result.get("classification"),
-                "stage": result.get("stage"),
-                "created_new_sweep": result.get("created_new_sweep"),
-            })
-        classification = "advanced" if advanced else "blocked" if blocked else "idle"
+                break
+        classification = "advanced" if advanced else "blocked" if blocked else "unblocked" if unblocked else "idle"
         return {
             "stage": "done",
             "classification": classification,
             "advanced": advanced,
             "blocked": blocked,
+            "unblocked": unblocked,
             "idle": idle,
             "next_actions": [
                 "Monitor any advanced job with status/watchdog-once.",
@@ -1970,7 +2107,21 @@ class ConsoleService:
             ]
         elif job and job.status == JobStatus.queued:
             classification = "queued"
-            next_actions = ["Queued only: W&B sweep has not been created. Wait for the blocker to finish, then run advance-queue."]
+            blocker_classification = queue_state.get("blocker_classification") if isinstance(queue_state, dict) else None
+            if blocker_classification == "metadata_corrupt_blocker":
+                next_actions = [
+                    "Queued only: W&B sweep has not been created. The blocker has corrupt ledger metadata; run advance-queue with auto_unblock_stale=true or stop-job with ledger_only=true.",
+                ]
+            elif blocker_classification == "active_real_blocker":
+                next_actions = [
+                    "Queued only: W&B sweep has not been created. Wait for the active blocker to finish, or monitor it with status/watchdog-once.",
+                ]
+            elif blocker_classification == "ambiguous_blocker":
+                next_actions = [
+                    "Queued only: W&B sweep has not been created. Run status/watchdog-once for the blocker before deciding whether ledger-only cancellation is safe.",
+                ]
+            else:
+                next_actions = ["Queued only: W&B sweep has not been created. Wait for the blocker to finish, then run advance-queue."]
         elif degraded:
             classification = "degraded"
             next_actions = ["稍后重试 status；如持续 degraded，检查 W&B/API 网络与本地 WANDB_API_KEY。"]
@@ -2022,10 +2173,26 @@ class ConsoleService:
         job = self._require_job(payload.job_id)
         is_single_run = job.monitor.get("kind") == "single_run"
         is_queued = job.status == JobStatus.queued
-        if not is_single_run and not is_queued and (not job.sweep_id or not job.entity or not job.project or not job.remote_host):
-            raise ValueError("job lacks sweep/remote metadata required for stop")
+        metadata_missing = False
+        metadata_evidence: dict[str, Any] = {"job_id": job.job_id, "job_status": job.status.value, "kind": infer_job_kind(job), "missing": []}
+        if not is_single_run and not is_queued:
+            missing = [
+                key
+                for key, value in {
+                    "sweep_id": job.sweep_id,
+                    "entity": job.entity,
+                    "project": job.project,
+                    "remote_host": job.remote_host,
+                }.items()
+                if not value
+            ]
+            metadata_missing = bool(missing)
+            metadata_evidence["missing"] = missing
         if is_single_run and not job.remote_host:
-            raise ValueError("job lacks remote metadata required for stop")
+            metadata_missing = True
+            metadata_evidence["missing"] = ["remote_host"]
+        if metadata_missing and not payload.ledger_only:
+            raise ValueError("job lacks sweep/remote metadata required for stop")
         operation_id = operation_id or self._operation_identity(IntentType.stop_job, payload.model_dump(mode="json"))[0]
         idempotency_key = idempotency_key or self._operation_identity(IntentType.stop_job, payload.model_dump(mode="json"))[1]
         self._record_operation(
@@ -2040,6 +2207,38 @@ class ConsoleService:
             result={"stage": "accepted", "classification": "accepted", "job_id": job.job_id},
             retry_after_seconds=2,
         )
+        if payload.ledger_only and not is_queued:
+            classification = "metadata_corrupt_cancelled" if metadata_missing else "ledger_stale_cancelled"
+            job, hygiene = self._ledger_only_cancel_job(
+                job,
+                requested_by=requested_by,
+                reason=payload.reason,
+                classification=classification,
+                evidence=metadata_evidence,
+            )
+            result = {
+                "stage": "done",
+                "classification": classification,
+                "job_id": job.job_id,
+                "cancel_wandb_requested": payload.cancel_wandb,
+                "cancel_wandb_implemented": False,
+                "ledger_only": True,
+                "remote_side_effects": False,
+                "queue_hygiene": job.monitor.get("queue_hygiene"),
+                **hygiene,
+            }
+            self._record_operation(
+                job,
+                operation_id=operation_id,
+                intent=IntentType.stop_job,
+                requested_by=requested_by,
+                idempotency_key=idempotency_key,
+                stage="done",
+                classification=classification,
+                status=OperationStatus.succeeded.value,
+                result=result,
+            )
+            return result, job
         result = {"cancel_wandb_requested": payload.cancel_wandb, "cancel_wandb_implemented": False}
         if is_queued:
             result["queued_cancelled"] = True

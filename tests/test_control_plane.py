@@ -542,6 +542,157 @@ def test_advance_queue_starts_next_job_after_blocker_finishes(tmp_path):
     assert started.monitor["queue"]["started_from_queue"] is True
 
 
+def test_stop_job_requires_ledger_only_for_corrupt_sweep_metadata(tmp_path):
+    class CountingSSH(FakeSSH):
+        def __init__(self):
+            super().__init__()
+            self.stop_agent_calls = 0
+
+        def stop_agents(self, *, host, sweep_path, pids=None):
+            self.stop_agent_calls += 1
+            return super().stop_agents(host=host, sweep_path=sweep_path, pids=pids)
+
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = CountingSSH()
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
+    service.store.upsert_job(JobRecord(
+        job_id="job_corrupt_stop",
+        name="corrupt_stop",
+        status=JobStatus.attention,
+        entity="my-team",
+        project="my-project",
+        remote_cwd="/tmp/demo",
+        monitor={"kind": "sweep", "queue": {"queue_group": "gpu-host-1:/tmp/demo"}},
+    ))
+
+    with pytest.raises(ValueError):
+        service.runner_command(IntentType.stop_job, {"job_id": "job_corrupt_stop"})
+
+    stopped = service.runner_command(IntentType.stop_job, {
+        "job_id": "job_corrupt_stop",
+        "ledger_only": True,
+        "reason": "old corrupt ledger blocker",
+    })
+
+    assert stopped.classification == "metadata_corrupt_cancelled"
+    assert stopped.result["ledger_only"] is True
+    assert stopped.result["remote_side_effects"] is False
+    assert ssh.stop_agent_calls == 0
+    job = service.store.get_job("job_corrupt_stop")
+    assert job.status == JobStatus.cancelled
+    assert job.monitor["classification"] == "metadata_corrupt_cancelled"
+    assert job.monitor["queue_hygiene"]["previous_status"] == "attention"
+
+
+def test_advance_queue_auto_unblocks_metadata_corrupt_blocker(tmp_path):
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = FakeSSH()
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
+    config_b = write_sweep_config(tmp_path / "b.yaml")
+    service.store.upsert_job(JobRecord(
+        job_id="job_corrupt_blocker",
+        name="corrupt_blocker",
+        status=JobStatus.attention,
+        entity="my-team",
+        project="my-project",
+        monitor={"kind": "sweep", "queue": {"queue_group": "gpu-host-1:/tmp/demo"}},
+    ))
+    queued = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "after_corrupt",
+        "config_path": config_b,
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "idempotency_key": "after-corrupt",
+    })
+    assert queued.classification == "queued"
+
+    advanced = service.runner_command(IntentType.advance_queue, {"queue_group": "gpu-host-1:/tmp/demo"})
+
+    assert advanced.classification == "advanced"
+    assert advanced.result["unblocked"][0]["job_id"] == "job_corrupt_blocker"
+    assert advanced.result["unblocked"][0]["classification"] == "metadata_corrupt_cancelled"
+    assert advanced.result["advanced"][0]["job_id"] == queued.job_id
+    assert service.store.get_job("job_corrupt_blocker").status == JobStatus.cancelled
+    assert service.store.get_job(queued.job_id).status == JobStatus.running
+
+
+def test_advance_queue_can_leave_metadata_corrupt_blocker_blocked(tmp_path):
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=FakeSSH())
+    config_b = write_sweep_config(tmp_path / "b.yaml")
+    service.store.upsert_job(JobRecord(
+        job_id="job_corrupt_blocker",
+        name="corrupt_blocker",
+        status=JobStatus.attention,
+        entity="my-team",
+        project="my-project",
+        monitor={"kind": "sweep", "queue": {"queue_group": "gpu-host-1:/tmp/demo"}},
+    ))
+    queued = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "after_corrupt",
+        "config_path": config_b,
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "idempotency_key": "after-corrupt-disabled",
+    })
+
+    blocked = service.runner_command(IntentType.advance_queue, {
+        "queue_group": "gpu-host-1:/tmp/demo",
+        "auto_unblock_stale": False,
+    })
+
+    assert blocked.classification == "blocked"
+    assert blocked.result["blocked"][0]["blocker_classification"] == "metadata_corrupt_blocker"
+    assert blocked.result["blocked"][0]["unblockable"] is True
+    assert service.store.get_job("job_corrupt_blocker").status == JobStatus.attention
+    assert service.store.get_job(queued.job_id).status == JobStatus.queued
+
+
+def test_queued_job_status_reports_metadata_corrupt_blocker(tmp_path):
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=FakeSSH())
+    config_b = write_sweep_config(tmp_path / "b.yaml")
+    service.store.upsert_job(JobRecord(
+        job_id="job_corrupt_blocker",
+        name="corrupt_blocker",
+        status=JobStatus.attention,
+        entity="my-team",
+        project="my-project",
+        monitor={"kind": "sweep", "queue": {"queue_group": "gpu-host-1:/tmp/demo"}},
+    ))
+    queued = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "after_corrupt",
+        "config_path": config_b,
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "idempotency_key": "after-corrupt-status",
+    })
+
+    status = service.runner_command(IntentType.status_query, {"job_id": queued.job_id})
+
+    assert status.classification == "queued"
+    assert status.result["queue"]["blocker_classification"] == "metadata_corrupt_blocker"
+    assert status.result["queue"]["blocker_unblockable"] is True
+    assert "ledger_only" in status.result["next_actions"][0]
+
+
+def test_advance_queue_marks_missing_payload_queued_job_failed(tmp_path):
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=FakeSSH())
+    service.store.upsert_job(JobRecord(
+        job_id="job_missing_payload",
+        name="missing_payload",
+        status=JobStatus.queued,
+        monitor={"kind": "sweep", "queue": {"queue_group": "gpu-host-1:/tmp/demo"}},
+    ))
+
+    response = service.runner_command(IntentType.advance_queue, {"queue_group": "gpu-host-1:/tmp/demo"})
+
+    assert response.classification == "unblocked"
+    assert response.result["unblocked"][0]["classification"] == "queued_payload_missing"
+    assert service.store.get_job("job_missing_payload").status == JobStatus.failed
+
+
 def test_queued_job_status_and_stop_do_not_touch_wandb_or_agents(tmp_path):
     settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
     ssh = FakeSSH()
@@ -566,6 +717,8 @@ def test_queued_job_status_and_stop_do_not_touch_wandb_or_agents(tmp_path):
     status = service.runner_command(IntentType.status_query, {"job_id": second.job_id})
     assert status.classification == "queued"
     assert status.result["queue"]["blocked_by_job_id"] == first.job_id
+    assert status.result["queue"]["blocker_classification"] == "active_real_blocker"
+    assert status.result["queue"]["blocker_unblockable"] is False
     assert status.result["queue"]["queue_position"] == 1
     stop = service.runner_command(IntentType.stop_job, {"job_id": second.job_id})
     assert stop.classification == "job_cancelled"

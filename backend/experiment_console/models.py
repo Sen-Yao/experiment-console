@@ -174,6 +174,8 @@ class StopJobPayload(BaseModel):
     job_id: str
     kill_agents: bool = True
     cancel_wandb: bool = False
+    ledger_only: bool = False
+    reason: str | None = None
     idempotency_key: str | None = None
 
 
@@ -234,6 +236,7 @@ class WatchdogOncePayload(BaseModel):
 
 class AdvanceQueuePayload(BaseModel):
     queue_group: str | None = None
+    auto_unblock_stale: bool = True
     idempotency_key: str | None = None
 
 
