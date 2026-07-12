@@ -41,7 +41,9 @@ def test_compose_is_nonroot_loopback_only_and_uses_readonly_secrets():
 
 def test_dockerfile_builds_amd64_target_and_drops_root():
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-    assert "FROM --platform=$TARGETPLATFORM python:" in dockerfile
+    assert "ARG BASE_REGISTRY=docker.m.daocloud.io/library" in dockerfile
+    assert "FROM --platform=$TARGETPLATFORM ${BASE_REGISTRY}/python:" in dockerfile
+    assert "FROM --platform=$BUILDPLATFORM ${BASE_REGISTRY}/node:" in dockerfile
     assert "USER console:console" in dockerfile
     assert "openssh-client" in dockerfile
     assert "WANDB_API_KEY=" not in dockerfile

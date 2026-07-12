@@ -7,6 +7,7 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
+        BASE_REGISTRY: ${EXPERIMENT_CONSOLE_BASE_REGISTRY:-docker.m.daocloud.io/library}
         CONSOLE_UID: ${EXPERIMENT_CONSOLE_UID:-10001}
         CONSOLE_GID: ${EXPERIMENT_CONSOLE_GID:-10001}
     image: experiment-console:${EXPERIMENT_CONSOLE_IMAGE_TAG:-production}

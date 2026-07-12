@@ -1,6 +1,6 @@
-# syntax=docker/dockerfile:1.7
+ARG BASE_REGISTRY=docker.m.daocloud.io/library
 
-FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS frontend-build
+FROM --platform=$BUILDPLATFORM ${BASE_REGISTRY}/node:22-bookworm-slim AS frontend-build
 
 WORKDIR /build/frontend
 COPY frontend/package.json frontend/package-lock.json ./
@@ -8,7 +8,7 @@ RUN npm ci --no-audit --no-fund
 COPY frontend/ ./
 RUN npm run build
 
-FROM --platform=$TARGETPLATFORM python:3.13-slim-bookworm AS runtime
+FROM --platform=$TARGETPLATFORM ${BASE_REGISTRY}/python:3.13-slim-bookworm AS runtime
 
 ARG CONSOLE_UID=10001
 ARG CONSOLE_GID=10001
