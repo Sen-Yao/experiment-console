@@ -1,10 +1,16 @@
-# Experiment Console Local Run
+# Experiment Console Local Development Runbook
 
-Last verified: 2026-06-17 on Oliver's MacBook Pro via Codex.
+Last legacy-runtime verification: 2026-07-12 on Oliver's MacBook Pro via Codex.
+
+> Production does not run here. Yggdrasil owns the authoritative Console and
+> Codex Desktop uses `127.0.0.1:5174` as an SSH forward. Use this runbook only
+> for isolated development or smoke testing after stopping the Desktop bridge.
+> Never run a local mutating Console alongside production, and never use a
+> local Console or Codex heartbeat as an experiment monitor.
 
 ## Scope
 
-This is the local control-plane handoff for Experiment Console. The stable local project path is:
+This is the isolated development handoff for Experiment Console. The stable project path is:
 
 ```bash
 /Users/oliver/Developer/experiment-console
@@ -12,17 +18,18 @@ This is the local control-plane handoff for Experiment Console. The stable local
 
 Use this path instead of `/Users/oliver/Documents/Experiment Console`. The Documents checkout has shown macOS `dataless` placeholder behavior, which caused Python imports, git reads, and script reads to time out.
 
-The local Console is intentionally a lightweight control-plane runtime:
+The local development Console:
 
 - exposes the runner-facing API on `http://127.0.0.1:5174`
 - reads W&B auth from a repo-external secret file
 - can register/query/launch W&B sweeps through SSH on HCCS-25
 - can launch managed single-run jobs from single-run configs
-- keeps local runtime state in `/private/tmp/experiment-console-runtime`
+- keeps disposable runtime state in `/private/tmp/experiment-console-runtime`
 - defaults remote W&B agent execution to the `DualRefGAD` conda environment
 
 ## Prerequisites
 
+- The production Desktop bridge/SSH forward is stopped so port `5174` is free.
 - SSH alias `HCCS-25` works.
 - Bitwarden has already been used once to create the local secret file.
 - Python dependencies are available either in `.local_deps` or `/private/tmp/experiment-console-deps`.

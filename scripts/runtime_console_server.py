@@ -3,12 +3,8 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 from pathlib import Path
-from typing import Any
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 
@@ -22,8 +18,8 @@ os.environ.setdefault("EXPERIMENT_CONSOLE_DEFAULT_CONDA_ENV", "DualRefGAD")
 ROOT_DIR = Path(__file__).resolve().parents[1]
 FRONTEND_DIST = ROOT_DIR / "frontend" / "dist"
 
-from backend.experiment_console.api import app as backend_app, service  # noqa: E402
-from backend.experiment_console.models import JobRecord  # noqa: E402
+from experiment_console.api import app, service  # noqa: E402
+from experiment_console.models import JobRecord  # noqa: E402
 
 
 def migrate_legacy_state() -> None:
@@ -52,37 +48,19 @@ def migrate_legacy_state() -> None:
 migrate_legacy_state()
 
 
-app = FastAPI(title="Experiment Console Runtime", version="runtime-2026-06-15")
-app.state.started_at = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(timespec="seconds")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://127.0.0.1:5174", "http://localhost:5174"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+for route in app.routes:
+    if getattr(route, "path", None) != "/health":
+        continue
+    backend_health = route.endpoint
 
+    def runtime_health():
+        payload = backend_health()
+        payload["runtime"] = "experiment_console_runtime"
+        return payload
 
-@app.get("/health")
-def health() -> dict[str, Any]:
-    try:
-        git_sha = subprocess.run(["git", "-C", str(ROOT_DIR), "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=2).stdout.strip()
-    except Exception:
-        git_sha = None
-    return {
-        "status": "ok",
-        "runtime": "experiment_console_runtime",
-        "cwd": str(ROOT_DIR),
-        "repo_root": str(ROOT_DIR),
-        "git_sha": git_sha,
-        "state_dir": str(STATE_DIR),
-        "contract": "runner_console_agent_v1",
-        "contract_version": "runner_console_agent_v1",
-        "started_at": getattr(app.state, "started_at", None),
-        "wandb_api_key_present": bool(os.environ.get("WANDB_API_KEY")),
-    }
-
-
-app.include_router(backend_app.router)
+    route.endpoint = runtime_health
+    route.dependant.call = runtime_health
+    break
 
 if FRONTEND_DIST.exists():
     app.mount("/", StaticFiles(directory=str(FRONTEND_DIST), html=True), name="frontend")

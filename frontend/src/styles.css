@@ -313,7 +313,7 @@ h3 {
 
 .telemetryStrip {
   display: grid;
-  grid-template-columns: minmax(130px, 0.9fr) minmax(190px, 1.35fr) minmax(130px, 0.9fr);
+  grid-template-columns: minmax(120px, 0.85fr) minmax(170px, 1.1fr) minmax(120px, 0.85fr) minmax(220px, 1.7fr);
   gap: 1px;
   margin-top: 20px;
   overflow: hidden;
@@ -348,7 +348,7 @@ h3 {
   text-overflow: ellipsis;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 15px;
-  white-space: nowrap;
+  line-height: 1.25;
 }
 
 .stateLedger {

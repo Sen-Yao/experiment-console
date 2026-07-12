@@ -71,8 +71,8 @@ def build_plan(intent: IntentType, payload: dict, settings: Settings) -> Executi
             summary=f"Launch sweep {parsed.job_name} on {parsed.remote_host} for {entity}/{project}.",
             risk_level="remote_side_effect",
             commands=commands,
-            warnings=["P0 does not schedule cron/watchdog or aggregate results."],
-            expected_side_effects=["Create a W&B sweep", "Start remote wandb agent processes", "Write local job/audit state"],
+            warnings=["Durable monitoring requires both a result contract and a Codex thread id."],
+            expected_side_effects=["Create a W&B sweep", "Start remote wandb agent processes", "Write Console job/audit state"],
         )
     if isinstance(parsed, LaunchRunPayload):
         commands = [
@@ -99,7 +99,7 @@ def build_plan(intent: IntentType, payload: dict, settings: Settings) -> Executi
             summary=f"Launch single run {parsed.job_name} on {parsed.remote_host or settings.default_remote_host}.",
             risk_level="remote_side_effect",
             commands=commands,
-            expected_side_effects=["Start one remote training process", "Write local job/audit state"],
+            expected_side_effects=["Start one remote training process", "Write Console job/audit state"],
         )
     if isinstance(parsed, RegisterExistingSweepPayload):
         return ExecutionPlan(
@@ -108,11 +108,11 @@ def build_plan(intent: IntentType, payload: dict, settings: Settings) -> Executi
             commands=[
                 CommandPreview(
                     label="register_existing_sweep",
-                    argv=["local-store", "register", parsed.sweep_id],
+                    argv=["console-ledger", "register", parsed.sweep_id],
                     reason="Bind an already-created W&B sweep to Console state without creating a duplicate sweep.",
                 )
             ],
-            expected_side_effects=["Write local job/audit state"],
+            expected_side_effects=["Write Console job/audit state"],
         )
     if isinstance(parsed, StatusQueryPayload):
         target = parsed.job_id or parsed.sweep_id
@@ -122,8 +122,8 @@ def build_plan(intent: IntentType, payload: dict, settings: Settings) -> Executi
             commands=[
                 CommandPreview(
                     label="query_status",
-                    argv=["local-store", "and", "wandb-graphql"],
-                    reason="Combine local job state with W&B sweep state when available.",
+                    argv=["console-ledger", "and", "wandb-graphql"],
+                    reason="Combine authoritative Console job state with W&B sweep state when available.",
                 )
             ],
         )
@@ -166,7 +166,7 @@ def build_plan(intent: IntentType, payload: dict, settings: Settings) -> Executi
             commands=[
                 CommandPreview(
                     label="load_existing_job",
-                    argv=["local-store", "get-job", parsed.job_id],
+                    argv=["console-ledger", "get-job", parsed.job_id],
                     reason="Recover must reuse the existing sweep id and must not create a duplicate sweep.",
                 ),
                 CommandPreview(
@@ -190,7 +190,7 @@ def build_plan(intent: IntentType, payload: dict, settings: Settings) -> Executi
             commands=[
                 CommandPreview(
                     label="repair_watchdog_metadata",
-                    argv=["local-store", "update-job", parsed.job_id, "--remote-cwd", parsed.remote_cwd],
+                    argv=["console-ledger", "update-job", parsed.job_id, "--remote-cwd", parsed.remote_cwd],
                     reason="Normalize remote path/conda metadata in Console state without creating or restarting any sweep.",
                 )
             ],
@@ -198,13 +198,13 @@ def build_plan(intent: IntentType, payload: dict, settings: Settings) -> Executi
         )
     if isinstance(parsed, ScheduleMonitorPayload):
         return ExecutionPlan(
-            summary=f"Schedule Console-owned watchdog monitor for {parsed.job_id}.",
+            summary=f"Schedule Console-owned durable monitor for {parsed.job_id}.",
             risk_level="writes_local_state",
             commands=[
                 CommandPreview(
                     label="schedule_monitor",
                     argv=["console-store", "schedule-monitor", parsed.job_id, "--every", parsed.every],
-                    reason="Record authoritative cron/watchdog metadata in Console state.",
+                    reason="Record an authoritative durable monitor schedule in the Console ledger.",
                     side_effect=True,
                 )
             ],
@@ -212,13 +212,13 @@ def build_plan(intent: IntentType, payload: dict, settings: Settings) -> Executi
         )
     if isinstance(parsed, UnscheduleMonitorPayload):
         return ExecutionPlan(
-            summary=f"Unschedule Console-owned watchdog monitor for {parsed.job_id}.",
+            summary=f"Unschedule Console-owned durable monitor for {parsed.job_id}.",
             risk_level="writes_local_state",
             commands=[
                 CommandPreview(
                     label="unschedule_monitor",
                     argv=["console-store", "unschedule-monitor", parsed.job_id],
-                    reason="Mark the Console-owned watchdog schedule inactive idempotently.",
+                    reason="Mark the Console-owned durable monitor schedule inactive idempotently.",
                     side_effect=True,
                 )
             ],
@@ -226,13 +226,13 @@ def build_plan(intent: IntentType, payload: dict, settings: Settings) -> Executi
         )
     if isinstance(parsed, WatchdogOncePayload):
         return ExecutionPlan(
-            summary=f"Run one Console-owned watchdog status check for {parsed.job_id}.",
+            summary=f"Run one Console-owned monitor status check for {parsed.job_id}.",
             risk_level="read_only",
             commands=[
                 CommandPreview(
                     label="watchdog_once",
                     argv=["console-status", parsed.job_id],
-                    reason="Map job/sweep status to a quiet or attention-worthy watchdog event.",
+                    reason="Map job/sweep status to a quiet or attention-worthy monitor event.",
                 )
             ],
         )

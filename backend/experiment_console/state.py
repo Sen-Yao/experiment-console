@@ -8,12 +8,13 @@ class InvalidTransition(ValueError):
 
 
 ALLOWED_TRANSITIONS = {
-    JobStatus.planned: {JobStatus.queued, JobStatus.validating, JobStatus.running, JobStatus.failed, JobStatus.cancelled, JobStatus.unknown},
+    JobStatus.planned: {JobStatus.queued, JobStatus.validating, JobStatus.running, JobStatus.finalizing, JobStatus.failed, JobStatus.cancelled, JobStatus.unknown},
     JobStatus.queued: {JobStatus.validating, JobStatus.failed, JobStatus.cancelled, JobStatus.unknown},
-    JobStatus.validating: {JobStatus.running, JobStatus.attention, JobStatus.failed, JobStatus.cancelled},
-    JobStatus.running: {JobStatus.attention, JobStatus.finished, JobStatus.failed, JobStatus.cancelled, JobStatus.unknown},
-    JobStatus.attention: {JobStatus.running, JobStatus.finished, JobStatus.failed, JobStatus.cancelled, JobStatus.unknown},
-    JobStatus.unknown: {JobStatus.running, JobStatus.attention, JobStatus.finished, JobStatus.failed, JobStatus.cancelled},
+    JobStatus.validating: {JobStatus.running, JobStatus.finalizing, JobStatus.attention, JobStatus.failed, JobStatus.cancelled},
+    JobStatus.running: {JobStatus.finalizing, JobStatus.attention, JobStatus.finished, JobStatus.failed, JobStatus.cancelled, JobStatus.unknown},
+    JobStatus.finalizing: {JobStatus.running, JobStatus.attention, JobStatus.finished, JobStatus.failed, JobStatus.cancelled, JobStatus.unknown},
+    JobStatus.attention: {JobStatus.running, JobStatus.finalizing, JobStatus.finished, JobStatus.failed, JobStatus.cancelled, JobStatus.unknown},
+    JobStatus.unknown: {JobStatus.running, JobStatus.finalizing, JobStatus.attention, JobStatus.finished, JobStatus.failed, JobStatus.cancelled},
     JobStatus.finished: set(),
     JobStatus.failed: set(),
     JobStatus.cancelled: set(),

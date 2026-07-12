@@ -1,0 +1,86 @@
+name: experiment-console
+
+services:
+  console:
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CONSOLE_UID: ${EXPERIMENT_CONSOLE_UID:-10001}
+        CONSOLE_GID: ${EXPERIMENT_CONSOLE_GID:-10001}
+    image: experiment-console:${EXPERIMENT_CONSOLE_IMAGE_TAG:-production}
+    restart: unless-stopped
+    init: true
+    read_only: true
+    user: "${EXPERIMENT_CONSOLE_UID:-10001}:${EXPERIMENT_CONSOLE_GID:-10001}"
+    environment:
+      EXPERIMENT_CONSOLE_STATE_DIR: /var/lib/experiment-console/state
+      EXPERIMENT_CONSOLE_DEFAULT_ENTITY: ${EXPERIMENT_CONSOLE_DEFAULT_ENTITY:-HCCS}
+      EXPERIMENT_CONSOLE_DEFAULT_PROJECT: ${EXPERIMENT_CONSOLE_DEFAULT_PROJECT:-DualRefGAD}
+      EXPERIMENT_CONSOLE_DEFAULT_REMOTE_HOST: ${EXPERIMENT_CONSOLE_DEFAULT_REMOTE_HOST:-HCCS-25}
+      EXPERIMENT_CONSOLE_DEFAULT_REMOTE_CWD: ${EXPERIMENT_CONSOLE_DEFAULT_REMOTE_CWD:-/home/linziyao/DualRefGAD}
+      EXPERIMENT_CONSOLE_DEFAULT_CONDA_ENV: ${EXPERIMENT_CONSOLE_DEFAULT_CONDA_ENV:-DualRefGAD}
+      EXPERIMENT_CONSOLE_AUTHORITY_ROLE: ${EXPERIMENT_CONSOLE_AUTHORITY_ROLE:?set EXPERIMENT_CONSOLE_AUTHORITY_ROLE to authoritative}
+      EXPERIMENT_CONSOLE_INSTANCE_ID: ${EXPERIMENT_CONSOLE_INSTANCE_ID:?set a stable EXPERIMENT_CONSOLE_INSTANCE_ID}
+      EXPERIMENT_CONSOLE_MONITOR_WORKER: "1"
+      EXPERIMENT_CONSOLE_SYNC_ERROR_CONSECUTIVE: ${EXPERIMENT_CONSOLE_SYNC_ERROR_CONSECUTIVE:-3}
+      EXPERIMENT_CONSOLE_SYNC_ERROR_GRACE_SECONDS: ${EXPERIMENT_CONSOLE_SYNC_ERROR_GRACE_SECONDS:-900}
+      EXPERIMENT_CONSOLE_ARTIFACT_SYNC_ERROR_CONSECUTIVE: ${EXPERIMENT_CONSOLE_ARTIFACT_SYNC_ERROR_CONSECUTIVE:-3}
+      EXPERIMENT_CONSOLE_ARTIFACT_SYNC_ERROR_GRACE_SECONDS: ${EXPERIMENT_CONSOLE_ARTIFACT_SYNC_ERROR_GRACE_SECONDS:-900}
+      EXPERIMENT_CONSOLE_MONITOR_EXTERNAL_ERROR_CONSECUTIVE: ${EXPERIMENT_CONSOLE_MONITOR_EXTERNAL_ERROR_CONSECUTIVE:-3}
+      EXPERIMENT_CONSOLE_MONITOR_EXTERNAL_ERROR_GRACE_SECONDS: ${EXPERIMENT_CONSOLE_MONITOR_EXTERNAL_ERROR_GRACE_SECONDS:-900}
+      EXPERIMENT_CONSOLE_HEALTH_REQUIRE_WORKER: "1"
+      EXPERIMENT_CONSOLE_HEALTH_REQUIRE_LEASE: "1"
+      EXPERIMENT_CONSOLE_HEALTH_EXPECTED_AUTHORITY_ROLE: authoritative
+      EXPERIMENT_CONSOLE_HEALTH_EXPECTED_INSTANCE_ID: ${EXPERIMENT_CONSOLE_INSTANCE_ID:?set a stable EXPERIMENT_CONSOLE_INSTANCE_ID}
+      EXPERIMENT_CONSOLE_HEALTH_URL: http://127.0.0.1:5174/health
+      WANDB_API_KEY_FILE: /run/secrets/wandb_api_key
+      EXPERIMENT_CONSOLE_API_TOKEN_FILE: /run/secrets/console_api_token
+      HCCS_SSH_KEY_FILE: /run/secrets/hccs_ssh_key
+      HCCS_SSH_CONFIG_FILE: /run/config/hccs_ssh_config
+      HCCS_KNOWN_HOSTS_FILE: /run/config/hccs_known_hosts
+    ports:
+      - "127.0.0.1:${EXPERIMENT_CONSOLE_PORT:-5174}:5174"
+    volumes:
+      - type: bind
+        source: ${EXPERIMENT_CONSOLE_STATE_PATH:?set EXPERIMENT_CONSOLE_STATE_PATH}
+        target: /var/lib/experiment-console/state
+      - type: bind
+        source: ${EXPERIMENT_CONSOLE_RESULTS_PATH:?set EXPERIMENT_CONSOLE_RESULTS_PATH}
+        target: /var/lib/experiment-console/state/results
+      - type: bind
+        source: ${EXPERIMENT_CONSOLE_HCCS_SSH_CONFIG_FILE:?set EXPERIMENT_CONSOLE_HCCS_SSH_CONFIG_FILE}
+        target: /run/config/hccs_ssh_config
+        read_only: true
+      - type: bind
+        source: ${EXPERIMENT_CONSOLE_HCCS_KNOWN_HOSTS_FILE:?set EXPERIMENT_CONSOLE_HCCS_KNOWN_HOSTS_FILE}
+        target: /run/config/hccs_known_hosts
+        read_only: true
+    secrets:
+      - wandb_api_key
+      - hccs_ssh_key
+      - console_api_token
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m,uid=${EXPERIMENT_CONSOLE_UID:-10001},gid=${EXPERIMENT_CONSOLE_GID:-10001},mode=1770
+      - /home/console/.ssh:rw,noexec,nosuid,size=1m,uid=${EXPERIMENT_CONSOLE_UID:-10001},gid=${EXPERIMENT_CONSOLE_GID:-10001},mode=0700
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    stop_grace_period: 45s
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/experiment-console-healthcheck"]
+      interval: 20s
+      timeout: 5s
+      retries: 6
+      start_period: 45s
+
+secrets:
+  wandb_api_key:
+    file: ${EXPERIMENT_CONSOLE_WANDB_SECRET_FILE:?set EXPERIMENT_CONSOLE_WANDB_SECRET_FILE}
+  hccs_ssh_key:
+    file: ${EXPERIMENT_CONSOLE_HCCS_SSH_KEY_FILE:?set EXPERIMENT_CONSOLE_HCCS_SSH_KEY_FILE}
+  console_api_token:
+    file: ${EXPERIMENT_CONSOLE_API_TOKEN_SECRET_FILE:?set EXPERIMENT_CONSOLE_API_TOKEN_SECRET_FILE}

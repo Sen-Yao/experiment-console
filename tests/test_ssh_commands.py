@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 
-from experiment_console.command import CommandResult
+import pytest
+
+import experiment_console.ssh as ssh_module
+from experiment_console.command import CommandFailed, CommandResult
 from experiment_console.config import Settings
 from experiment_console.ssh import SSHExecutor, build_failure_diagnostics, classify_argv_probe, extract_error_signals
 
@@ -19,8 +23,84 @@ class RecordingRunner:
 
 class LocalRemotePythonRunner:
     def run(self, argv, *, timeout, input_text=None):
-        completed = subprocess.run(argv[2], shell=True, text=True, capture_output=True, timeout=timeout, input=input_text)
+        completed = subprocess.run(argv[-1], shell=True, text=True, capture_output=True, timeout=timeout, input=input_text)
         return CommandResult(argv=argv, returncode=completed.returncode, stdout=completed.stdout, stderr=completed.stderr)
+
+
+class TransientThenSuccessRunner:
+    def __init__(self, success_stdout: str):
+        self.calls = []
+        self.success_stdout = success_stdout
+
+    def run(self, argv, *, timeout, input_text=None):
+        self.calls.append({"argv": argv, "timeout": timeout, "input_text": input_text})
+        if len(self.calls) == 1:
+            raise CommandFailed(CommandResult(argv=argv, returncode=255, stdout="", stderr="Connection reset by peer"))
+        return CommandResult(argv=argv, returncode=0, stdout=self.success_stdout, stderr="")
+
+
+def write_fake_cmdline(proc_root, pid: int, argv: list[str]) -> None:
+    process_dir = proc_root / str(pid)
+    process_dir.mkdir(parents=True)
+    (process_dir / "cmdline").write_bytes(b"\0".join(item.encode("utf-8") for item in argv) + b"\0")
+
+
+def write_run_config(remote_root, run_id: str, output_path: str | None = None) -> None:
+    run_files = remote_root / "wandb" / f"run-20260620_000000-{run_id}" / "files"
+    run_files.mkdir(parents=True)
+    text = "seed:\n  value: 1\n"
+    if output_path is not None:
+        text += f"out:\n  value: {output_path}\n"
+    (run_files / "config.yaml").write_text(text, encoding="utf-8")
+
+
+def test_ssh_host_rejects_leading_option_before_runner_execution(tmp_path):
+    runner = RecordingRunner()
+    ssh = SSHExecutor(Settings(state_dir=tmp_path), runner=runner)
+
+    with pytest.raises(ValueError, match="not an option"):
+        ssh.probe_gpus("-oProxyCommand=touch_/tmp/pwned")
+
+    assert runner.calls == []
+
+
+def test_read_only_probe_retries_one_transient_disconnect(tmp_path):
+    runner = TransientThenSuccessRunner("0, GPU, 10000, 100, 9900, 0\n")
+    ssh = SSHExecutor(Settings(state_dir=tmp_path), runner=runner)
+
+    result = ssh.probe_gpus("HCCS-25")
+
+    assert len(runner.calls) == 2
+    assert result["eligible_count"] == 1
+
+
+@pytest.mark.parametrize("operation", ["create_sweep", "launch_agent"])
+def test_mutating_ssh_operations_do_not_retry_after_transient_disconnect(tmp_path, operation):
+    runner = TransientThenSuccessRunner('{"ok":true,"pid":12345}\n')
+    ssh = SSHExecutor(Settings(state_dir=tmp_path), runner=runner)
+
+    with pytest.raises(CommandFailed):
+        if operation == "create_sweep":
+            ssh.create_sweep(
+                host="HCCS-25",
+                remote_cwd="/home/linziyao/DualRefGAD",
+                remote_config="/home/linziyao/DualRefGAD/config.yaml",
+                entity="HCCS",
+                project="DualRefGAD",
+                wandb_api_key="secret",
+            )
+        else:
+            ssh.launch_agent(
+                host="HCCS-25",
+                remote_cwd="/home/linziyao/DualRefGAD",
+                sweep_path="HCCS/DualRefGAD/abc123",
+                gpu_index=0,
+                conda_env="DualRefGAD",
+                conda_sh="/opt/anaconda3/etc/profile.d/conda.sh",
+                wandb_api_key="secret",
+            )
+
+    assert len(runner.calls) == 1
 
 
 def test_launch_agent_uses_conda_run_for_agent_process(tmp_path):
@@ -37,27 +117,116 @@ def test_launch_agent_uses_conda_run_for_agent_process(tmp_path):
         wandb_api_key="secret",
     )
 
-    remote = runner.calls[0]["argv"][2]
+    remote = runner.calls[0]["argv"][-1]
+    assert runner.calls[0]["argv"][:3] == ["ssh", "--", "HCCS-25"]
     assert result["pid"] == "12345"
     assert runner.calls[0]["input_text"] == "secret\n"
     assert "CUDA_VISIBLE_DEVICES=3" in remote
     assert "source /opt/anaconda3/etc/profile.d/conda.sh" in remote
     assert "conda run -n DualRefGAD" in remote
-    assert "wandb agent HCCS/DualRefGAD/abc123" in remote
+    assert "HCCS/DualRefGAD/abc123" in remote
     assert "python3 -c" in remote
 
 
-def test_stop_agents_uses_single_layer_shell_matching(tmp_path):
+def test_stop_agents_uses_exact_proc_cmdline_matching(tmp_path):
     runner = RecordingRunner()
     ssh = SSHExecutor(Settings(state_dir=tmp_path), runner=runner)
 
     ssh.stop_agents(host="HCCS-25", sweep_path="HCCS/DualRefGAD/abc123")
 
-    remote = runner.calls[0]["argv"][2]
-    assert "pgrep -af" in remote
-    assert "kill -TERM" in remote
-    assert "python3 -c" not in remote
-    assert "wandb agent HCCS/DualRefGAD/abc123" in remote
+    remote = runner.calls[0]["argv"][-1]
+    assert "python3 -c" in remote
+    assert "proc_root" in remote
+    assert "matches_sweep" in remote
+    assert "unmatched_reused_pids" in remote
+    assert "HCCS/DualRefGAD/abc123" in remote
+
+
+def test_agent_probe_and_stop_never_treat_reused_pid_as_sweep_agent(tmp_path):
+    ssh = SSHExecutor(Settings(state_dir=tmp_path), runner=LocalRemotePythonRunner())
+    unrelated = subprocess.Popen(["/bin/sleep", "30"])
+    proc_root = tmp_path / "proc"
+    write_fake_cmdline(proc_root, unrelated.pid, ["/bin/sleep", "30"])
+    try:
+        probe = ssh.check_agent_processes(
+            host="local",
+            sweep_path="HCCS/DualRefGAD/not-this-process",
+            pids=[str(unrelated.pid)],
+            proc_root=str(proc_root),
+        )
+        assert probe["alive_pids"] == []
+        assert probe["unmatched_reused_pids"] == [str(unrelated.pid)]
+
+        stopped = ssh.stop_agents(
+            host="local",
+            sweep_path="HCCS/DualRefGAD/not-this-process",
+            pids=[str(unrelated.pid)],
+            proc_root=str(proc_root),
+        )
+        assert stopped["stopped_pids"] == []
+        assert stopped["unmatched_reused_pids"] == [str(unrelated.pid)]
+        assert unrelated.poll() is None
+    finally:
+        unrelated.terminate()
+        unrelated.wait(timeout=5)
+
+
+def test_agent_probe_and_stop_match_exact_wandb_sweep_process(tmp_path):
+    wandb = tmp_path / "wandb"
+    wandb.write_text(
+        "#!/usr/bin/env python3\nimport time\ntime.sleep(30)\n",
+        encoding="utf-8",
+    )
+    wandb.chmod(0o755)
+    sweep_path = "HCCS/DualRefGAD/exact-sweep"
+    agent = subprocess.Popen([str(wandb), "agent", sweep_path])
+    ssh = SSHExecutor(Settings(state_dir=tmp_path), runner=LocalRemotePythonRunner())
+    proc_root = tmp_path / "proc"
+    write_fake_cmdline(proc_root, agent.pid, ["python3", str(wandb), "agent", sweep_path])
+    try:
+        time.sleep(0.05)
+        probe = ssh.check_agent_processes(
+            host="local", sweep_path=sweep_path, pids=[str(agent.pid)], proc_root=str(proc_root),
+        )
+        assert probe["alive_pids"] == [str(agent.pid)]
+        assert probe["unmatched_reused_pids"] == []
+
+        stopped = ssh.stop_agents(
+            host="local", sweep_path=sweep_path, pids=[str(agent.pid)], proc_root=str(proc_root),
+        )
+        assert stopped["stopped_pids"] == [str(agent.pid)]
+        agent.wait(timeout=5)
+    finally:
+        if agent.poll() is None:
+            agent.terminate()
+            agent.wait(timeout=5)
+
+
+def test_single_run_stop_requires_matching_status_receipt_and_cmdline(tmp_path):
+    unrelated = subprocess.Popen(["/bin/sleep", "30"])
+    status_path = tmp_path / "job.status.json"
+    status_path.write_text(json.dumps({
+        "job_id": "job-1",
+        "child_pid": unrelated.pid,
+        "command": ["python", "train.py"],
+    }), encoding="utf-8")
+    ssh = SSHExecutor(Settings(state_dir=tmp_path), runner=LocalRemotePythonRunner())
+    proc_root = tmp_path / "proc"
+    write_fake_cmdline(proc_root, unrelated.pid, ["/bin/sleep", "30"])
+    try:
+        result = ssh.stop_pids(
+            host="local",
+            pids=[str(unrelated.pid)],
+            status_path=str(status_path),
+            expected_job_id="job-1",
+            proc_root=str(proc_root),
+        )
+        assert result["stopped_pids"] == []
+        assert result["unmatched_reused_pids"] == [str(unrelated.pid)]
+        assert unrelated.poll() is None
+    finally:
+        unrelated.terminate()
+        unrelated.wait(timeout=5)
 
 
 def test_pull_results_reads_group_keys_from_wandb_config_yaml(tmp_path):
@@ -188,6 +357,185 @@ def test_pull_results_output_globs_fill_when_config_has_no_result_path(tmp_path)
     assert result["raw_artifacts"] == []
 
 
+def test_pull_results_rejects_absolute_wandb_config_artifact_outside_remote_cwd(tmp_path):
+    remote_root = tmp_path / "remote"
+    remote_root.mkdir()
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"final_test_auc": 0.99}\n', encoding="utf-8")
+    write_run_config(remote_root, "run-a", str(outside))
+    ssh = SSHExecutor(Settings(state_dir=tmp_path), runner=LocalRemotePythonRunner())
+
+    result = ssh.pull_results(
+        host="local",
+        remote_cwd=str(remote_root),
+        sweep_id="abc123",
+        run_ids=["run-a"],
+        budget_seconds=10,
+        max_runs=1,
+        metric_keys=["final_test_auc"],
+        group_keys=[],
+        discovery_mode="wandb_config_result_path_v1",
+        include_raw_artifacts=True,
+    )
+
+    assert result["valid_results"] == 0
+    assert result["raw_artifacts"] == []
+    assert result["discovery_sources"]["run-a"]["classification"] == "artifact_outside_remote_cwd"
+    assert result["artifact_rejections"]["run-a"][0]["path"] == str(outside)
+
+
+def test_pull_results_rejects_parent_traversal_from_wandb_config(tmp_path):
+    remote_root = tmp_path / "remote"
+    remote_root.mkdir()
+    (tmp_path / "outside.json").write_text('{"final_test_auc": 0.99}\n', encoding="utf-8")
+    write_run_config(remote_root, "run-a", "../outside.json")
+    ssh = SSHExecutor(Settings(state_dir=tmp_path), runner=LocalRemotePythonRunner())
+
+    result = ssh.pull_results(
+        host="local",
+        remote_cwd=str(remote_root),
+        sweep_id="abc123",
+        run_ids=["run-a"],
+        budget_seconds=10,
+        max_runs=1,
+        metric_keys=["final_test_auc"],
+        group_keys=[],
+        discovery_mode="wandb_config_result_path_v1",
+    )
+
+    assert result["valid_results"] == 0
+    assert result["discovery_sources"]["run-a"]["classification"] == "artifact_path_traversal"
+    assert result["artifact_rejections"]["run-a"][0]["reason"] == "artifact_path_traversal"
+
+
+def test_pull_results_rejects_glob_symlink_that_resolves_outside_remote_cwd(tmp_path):
+    remote_root = tmp_path / "remote"
+    remote_root.mkdir()
+    write_run_config(remote_root, "run-a")
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"final_test_auc": 0.99}\n', encoding="utf-8")
+    outputs = remote_root / "outputs"
+    outputs.mkdir()
+    (outputs / "run-a.json").symlink_to(outside)
+    ssh = SSHExecutor(Settings(state_dir=tmp_path), runner=LocalRemotePythonRunner())
+
+    result = ssh.pull_results(
+        host="local",
+        remote_cwd=str(remote_root),
+        sweep_id="abc123",
+        run_ids=["run-a"],
+        budget_seconds=10,
+        max_runs=1,
+        metric_keys=["final_test_auc"],
+        group_keys=[],
+        output_globs=[str(outputs / "{run_id}.json")],
+        discovery_mode="run_id_output_globs_v1",
+        include_raw_artifacts=True,
+    )
+
+    assert result["valid_results"] == 0
+    assert result["raw_artifacts"] == []
+    assert result["discovery_sources"]["run-a"]["classification"] == "artifact_outside_remote_cwd"
+
+
+def test_pull_results_rejects_single_artifact_over_file_byte_limit(monkeypatch, tmp_path):
+    monkeypatch.setattr(ssh_module, "MAX_RESULT_ARTIFACT_FILE_BYTES", 64)
+    monkeypatch.setattr(ssh_module, "MAX_RESULT_ARTIFACT_TOTAL_BYTES", 1024)
+    write_run_config(tmp_path, "run-a")
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    artifact = outputs / "run-a.json"
+    artifact.write_text(json.dumps({"final_test_auc": 0.9, "padding": "x" * 100}), encoding="utf-8")
+    ssh = SSHExecutor(Settings(state_dir=tmp_path), runner=LocalRemotePythonRunner())
+
+    result = ssh.pull_results(
+        host="local",
+        remote_cwd=str(tmp_path),
+        sweep_id="abc123",
+        run_ids=["run-a"],
+        budget_seconds=10,
+        max_runs=1,
+        metric_keys=["final_test_auc"],
+        group_keys=[],
+        output_globs=[str(outputs / "{run_id}.json")],
+        discovery_mode="run_id_output_globs_v1",
+        include_raw_artifacts=True,
+    )
+
+    assert result["valid_results"] == 0
+    assert result["raw_artifacts"] == []
+    assert result["artifact_bytes_read"] == 0
+    assert result["discovery_sources"]["run-a"]["classification"] == "artifact_file_size_limit_exceeded"
+
+
+def test_pull_results_enforces_total_artifact_byte_limit_across_runs(monkeypatch, tmp_path):
+    monkeypatch.setattr(ssh_module, "MAX_RESULT_ARTIFACT_FILE_BYTES", 1024)
+    monkeypatch.setattr(ssh_module, "MAX_RESULT_ARTIFACT_TOTAL_BYTES", 100)
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    artifact_sizes = []
+    for run_id in ["run-a", "run-b"]:
+        write_run_config(tmp_path, run_id)
+        artifact = outputs / f"{run_id}.json"
+        artifact.write_text(json.dumps({"final_test_auc": 0.9, "padding": "x" * 30}), encoding="utf-8")
+        artifact_sizes.append(artifact.stat().st_size)
+    assert artifact_sizes[0] < 100 < sum(artifact_sizes)
+    ssh = SSHExecutor(Settings(state_dir=tmp_path), runner=LocalRemotePythonRunner())
+
+    result = ssh.pull_results(
+        host="local",
+        remote_cwd=str(tmp_path),
+        sweep_id="abc123",
+        run_ids=["run-a", "run-b"],
+        budget_seconds=10,
+        max_runs=2,
+        metric_keys=["final_test_auc"],
+        group_keys=[],
+        output_globs=[str(outputs / "{run_id}.json")],
+        discovery_mode="run_id_output_globs_v1",
+        include_raw_artifacts=True,
+    )
+
+    assert result["valid_results"] == 1
+    assert result["missing_results"] == 1
+    assert result["artifact_bytes_read"] == artifact_sizes[0]
+    assert result["artifact_bytes_read"] <= result["artifact_limits"]["total_bytes"]
+    assert result["discovery_sources"]["run-b"]["classification"] == "artifact_total_size_limit_exceeded"
+
+
+def test_run_id_result_contract_rejects_canonical_path_claimed_by_two_runs(tmp_path):
+    for run_id in ["run-a", "run-b"]:
+        run_files = tmp_path / "wandb" / f"run-20260620_000000-{run_id}" / "files"
+        run_files.mkdir(parents=True)
+        (run_files / "config.yaml").write_text("seed:\n  value: 1\n", encoding="utf-8")
+    output_dir = tmp_path / "outputs"
+    output_dir.mkdir()
+    shared = output_dir / "shared.json"
+    shared.write_text('{"final_test_auc": 0.9}\n', encoding="utf-8")
+    (output_dir / "run-a.json").symlink_to(shared)
+    (output_dir / "run-b.json").symlink_to(shared)
+    ssh = SSHExecutor(Settings(state_dir=tmp_path), runner=LocalRemotePythonRunner())
+
+    result = ssh.pull_results(
+        host="local",
+        remote_cwd=str(tmp_path),
+        sweep_id="abc123",
+        run_ids=["run-a", "run-b"],
+        budget_seconds=10,
+        max_runs=2,
+        metric_keys=["final_test_auc"],
+        group_keys=[],
+        output_globs=[str(output_dir / "{run_id}.json")],
+        discovery_mode="run_id_output_globs_v1",
+        include_raw_artifacts=True,
+    )
+
+    assert result["valid_results"] == 1
+    assert result["missing_results"] == 1
+    assert result["discovery_sources"]["run-b"]["classification"] == "artifact_path_claimed_by_multiple_runs"
+    assert len(result["raw_artifacts"]) == 1
+
+
 def test_preflight_reports_remote_git_and_config_facts(tmp_path):
     subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True, text=True)
     subprocess.run(
@@ -213,6 +561,8 @@ def test_preflight_reports_remote_git_and_config_facts(tmp_path):
     assert result["git"]["head"]
     assert result["git"]["dirty"] is True
     assert any("config.yaml" in item for item in result["git"]["status_short"])
+    assert result["runtime"]["requested_conda_env"] is None
+    assert result["runtime"]["base_python"]
 
 
 def test_extract_error_signals_from_agent_log_tail():
@@ -229,6 +579,14 @@ RuntimeError: CUDA out of memory. Tried to allocate 2.00 GiB
     assert "traceback" in kinds
     assert "cuda_oom" in kinds
     assert any("CUDA out of memory" in signal["excerpt"] for signal in signals)
+
+
+def test_extract_error_signals_detects_wandb_agent_killed_runs():
+    text = "wandb: Agent received exit signal\nwandb: Killing runs and quitting\n"
+
+    signals = extract_error_signals(text, source="/tmp/agent.log")
+
+    assert any(signal["kind"] == "wandb_agent_killed_runs" for signal in signals)
 
 
 def test_build_failure_diagnostics_reports_missing_process_and_log_tail():

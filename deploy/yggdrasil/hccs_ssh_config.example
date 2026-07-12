@@ -1,0 +1,14 @@
+# Replace host names and ports from the current HCCS inventory before deployment.
+# Keep the service identity separate from the Mac tunnel identity.
+Host HCCS-25
+    HostName REPLACE_WITH_CURRENT_HCCS25_HOST
+    User linziyao
+    Port 22
+    IdentityFile ~/.ssh/id_hccs
+    IdentitiesOnly yes
+    BatchMode yes
+    StrictHostKeyChecking yes
+    UserKnownHostsFile ~/.ssh/known_hosts
+    ConnectTimeout 15
+    ServerAliveInterval 15
+    ServerAliveCountMax 2

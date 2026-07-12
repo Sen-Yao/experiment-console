@@ -5,6 +5,8 @@ import hashlib
 import os
 from pathlib import Path
 import statistics
+import zipfile
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from typing import Any
 
@@ -32,6 +34,7 @@ from .models import (
     RepairWatchdogPayload,
     RecoverAgentsPayload,
     RegisterExistingSweepPayload,
+    ResultContract,
     RunnerCommandResponse,
     ScheduleMonitorPayload,
     StatusQueryPayload,
@@ -44,6 +47,7 @@ from .models import (
     parse_payload,
 )
 from .planner import build_plan, confirmation_phrase
+from .reconcile import build_artifact_manifest, derive_execution_state, derive_result_state, update_sync_consistency
 from .redaction import redact_value
 from .ssh import SSHExecutor
 from .store import ConsoleStore, infer_job_kind
@@ -97,6 +101,11 @@ SINGLE_RUN_BOUNDARY_NEXT_ACTIONS = [
 ]
 
 
+MULTI_DATASET_TERMINAL_NEXT_ACTIONS = [
+    "如果这是多数据集实验且还有后续数据集，应已提前构建、校验并同步每个数据集的 sweep YAML；先推进队列或启动下一个数据集，确认下一个数据集开始运行后，再整理当前数据集的 pull-results/实验结果。",
+]
+
+
 TERMINAL_SWEEP_STATES = {"finished", "failed", "crashed", "killed", "canceled", "cancelled"}
 
 
@@ -106,10 +115,42 @@ def result_pull_classification(result: dict[str, Any]) -> str:
     if result.get("truncated"):
         return "truncated_results"
     if to_non_negative_int(result.get("valid_results")) <= 0:
+        if terminal_runs_missing_result_artifacts(result):
+            return "terminal_runs_missing_result_artifacts"
         return "no_scientific_results_yet"
     if not result.get("complete"):
         return "partial_results"
     return "ok"
+
+
+def terminal_runs_missing_result_artifacts(result: dict[str, Any]) -> bool:
+    if str(result.get("sweep_state") or "").lower() not in TERMINAL_SWEEP_STATES:
+        return False
+    rows = result.get("rows") if isinstance(result.get("rows"), list) else []
+    if not rows:
+        return False
+    if any(isinstance(row, dict) and row.get("has_scientific_result") for row in rows):
+        return False
+    discovery = result.get("discovery_sources") if isinstance(result.get("discovery_sources"), dict) else {}
+    if not discovery:
+        return False
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        run_id = str(row.get("run_id") or "")
+        item = discovery.get(run_id) if isinstance(discovery.get(run_id), dict) else {}
+        if item.get("selected_paths"):
+            return False
+    return True
+
+
+def next_actions_for_result_pull(classification: str) -> list[str]:
+    if classification == "terminal_runs_missing_result_artifacts":
+        return [
+            "W&B sweep 已终态但没有最终科学结果 JSON；不要解读为方法结果。",
+            "检查 agent log、progress JSON 和调度生命周期；修复控制面或脚本写出路径后，对既有 job recover 或启动有界重跑。",
+        ]
+    return []
 
 
 def classify_result_readiness(result: dict[str, Any] | None, sweep_state: str | None = None) -> str:
@@ -318,9 +359,16 @@ def safe_filename(value: str, default: str = "artifact") -> str:
     return text.strip("._") or default
 
 
-def write_json_file(path: Path, payload: dict[str, Any]) -> None:
+def write_json_file(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_text_file(path, json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+
+
+def write_text_file(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{new_id('tmp')}.tmp")
+    temporary.write_text(text, encoding="utf-8")
+    os.replace(temporary, path)
 
 
 def render_result_summary_markdown(summary: dict[str, Any]) -> str:
@@ -367,9 +415,26 @@ class ConsoleService:
         ssh: SSHExecutor | None = None,
     ):
         self.settings = settings or Settings()
-        self.store = store or ConsoleStore(self.settings.sqlite_path, self.settings.audit_path)
+        self.store = store or ConsoleStore(
+            self.settings.sqlite_path,
+            self.settings.audit_path,
+            audit_max_bytes=self.settings.audit_max_bytes,
+            audit_backup_count=self.settings.audit_backup_count,
+        )
         self.wandb = wandb or WandBClient(self.settings)
         self.ssh = ssh or SSHExecutor(self.settings)
+        self._launch_owner_id = new_id("launch_owner")
+
+    @contextmanager
+    def _serialized_job(self, job_id: str, *, queue_group: str | None = None):
+        existing = self.store.get_job(job_id)
+        queue = existing.monitor.get("queue") if existing and isinstance(existing.monitor.get("queue"), dict) else {}
+        resolved_group = queue_group or queue.get("queue_group")
+        with ExitStack() as stack:
+            if resolved_group:
+                stack.enter_context(self.store.named_lock(f"queue:{resolved_group}"))
+            stack.enter_context(self.store.named_lock(f"job:{job_id}"))
+            yield
 
     def _enrich_sweeps_with_telemetry(self, sweeps: list[dict[str, Any]], *, observed_at: str | None = None) -> list[dict[str, Any]]:
         cache = load_telemetry_cache(self.settings.sweep_telemetry_cache_path)
@@ -459,6 +524,10 @@ class ConsoleService:
         classification = result_pull_classification(enriched)
         enriched["classification"] = classification
         enriched["readiness"] = readiness
+        if not enriched.get("next_actions"):
+            next_actions = next_actions_for_result_pull(classification)
+            if next_actions:
+                enriched["next_actions"] = next_actions
         snapshot_id = new_id("result_snapshot", job.job_id if job else (sweep_id or "unknown"))
         snapshot_key = job.job_id if job else (sweep_id or "unknown")
         safe_key = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in snapshot_key)
@@ -483,6 +552,7 @@ class ConsoleService:
         }
         if include_artifacts:
             raw_dir.mkdir(parents=True, exist_ok=True)
+            seen_raw_artifacts: set[tuple[str, str]] = set()
             for artifact in result.get("raw_artifacts") or []:
                 if not isinstance(artifact, dict) or "content" not in artifact:
                     continue
@@ -491,7 +561,13 @@ class ConsoleService:
                 filename = f"{run_id}__{basename}"
                 raw_path = raw_dir / filename
                 content = artifact.get("content")
-                if isinstance(content, dict):
+                content_text = json.dumps(content, ensure_ascii=False, sort_keys=True, separators=(",", ":")) if isinstance(content, (dict, list)) else str(content)
+                content_sha = hashlib.sha256(content_text.encode("utf-8")).hexdigest()
+                artifact_key = (str(artifact.get("path") or ""), content_sha)
+                if artifact_key in seen_raw_artifacts:
+                    continue
+                seen_raw_artifacts.add(artifact_key)
+                if isinstance(content, (dict, list)):
                     write_json_file(raw_path, content)
                 else:
                     raw_path.write_text(str(content), encoding="utf-8")
@@ -500,6 +576,7 @@ class ConsoleService:
                     "source_path": artifact.get("path"),
                     "path": str(raw_path),
                     "basename": basename,
+                    "sha256": content_sha,
                 }
                 artifact_bundle["raw_files"].append(raw_record)
             if export_dir:
@@ -525,6 +602,21 @@ class ConsoleService:
         for key_name in ["remote_error", "wandb_error"]:
             if result.get(key_name):
                 provenance[key_name] = result[key_name]
+        generated_at = utc_now()
+        artifact_manifest = build_artifact_manifest(
+            source=result.get("source"),
+            expected_runs=expected_runs,
+            rows=rows,
+            raw_artifacts=[item for item in (result.get("raw_artifacts") or []) if isinstance(item, dict)],
+            discovery_sources=result.get("discovery_sources") if isinstance(result.get("discovery_sources"), dict) else {},
+            discovery_mode=str(result.get("discovery_mode") or "legacy_auto_v1"),
+            complete=complete,
+            truncated=truncated,
+            missing_runs=missing_runs,
+            failed_runs=failed_runs,
+            generated_at=generated_at,
+        )
+        enriched["artifact_manifest"] = artifact_manifest
         snapshot = {
             "identity": {
                 "snapshot_id": snapshot_id,
@@ -533,7 +625,7 @@ class ConsoleService:
                 "project": project,
                 "sweep_id": sweep_id,
                 "source": result.get("source"),
-                "generated_at": utc_now(),
+                "generated_at": generated_at,
             },
             "completeness": {
                 "expected_runs": expected_runs,
@@ -553,11 +645,13 @@ class ConsoleService:
             "comparison_summaries": comparison_summaries,
             "metric_matrix": metric_matrix,
             "artifact_bundle": artifact_bundle,
+            "artifact_manifest": artifact_manifest,
             "provenance": provenance,
             "classification": classification,
             "readiness": readiness,
+            "next_actions": enriched.get("next_actions"),
         }
-        snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        write_json_file(snapshot_path, snapshot)
         summary = summarize_result_pull({
             **enriched,
             "snapshot_id": snapshot_id,
@@ -567,14 +661,77 @@ class ConsoleService:
         summary["path"] = str(snapshot_path)
         if include_artifacts:
             write_json_file(summary_json_path, summary)
-            summary_md_path.write_text(render_result_summary_markdown(summary), encoding="utf-8")
+            write_text_file(summary_md_path, render_result_summary_markdown(summary))
             if export_dir:
                 write_json_file(export_dir / "result_snapshot.json", snapshot)
                 write_json_file(export_dir / "summary.json", summary)
-                (export_dir / "summary.md").write_text(render_result_summary_markdown(summary), encoding="utf-8")
+                write_text_file(export_dir / "summary.md", render_result_summary_markdown(summary))
         enriched["snapshot"] = summary
+        enriched["snapshot_id"] = snapshot_id
+        enriched["snapshot_path"] = str(snapshot_path)
         enriched["artifact_bundle"] = artifact_bundle
         return enriched, summary
+
+    def _artifact_snapshot_storage_state(
+        self,
+        job: JobRecord | None,
+        snapshot: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        manifest = snapshot.get("artifact_manifest") if isinstance(snapshot, dict) else None
+        if not isinstance(manifest, dict) or not manifest.get("protocol_valid"):
+            return {"ready": False, "classification": "manifest_not_ready"}
+        snapshot_id = str(snapshot.get("snapshot_id") or "")
+        if not job or not snapshot_id or safe_filename(snapshot_id, "") != snapshot_id:
+            return {"ready": False, "classification": "snapshot_identity_invalid"}
+        safe_key = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in job.job_id)
+        snapshot_root = self.settings.results_dir / safe_key
+        bundle_dir = snapshot_root / snapshot_id
+        snapshot_path = snapshot_root / f"{snapshot_id}.json"
+        summary_path = bundle_dir / "summary.json"
+        raw_dir = bundle_dir / "raw"
+
+        def regular(path: Path) -> bool:
+            return path.is_file() and not path.is_symlink()
+
+        if not all((regular(snapshot_path), regular(summary_path), raw_dir.is_dir(), not raw_dir.is_symlink())):
+            return {"ready": False, "classification": "artifact_bundle_missing"}
+        try:
+            stored_snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            stored_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"ready": False, "classification": "artifact_bundle_json_invalid"}
+        stored_identity = stored_snapshot.get("identity") if isinstance(stored_snapshot, dict) else None
+        if not isinstance(stored_identity, dict) or stored_identity.get("snapshot_id") != snapshot_id:
+            return {"ready": False, "classification": "artifact_bundle_identity_mismatch"}
+        if not isinstance(stored_summary, dict) or stored_summary.get("snapshot_id") != snapshot_id:
+            return {"ready": False, "classification": "artifact_summary_identity_mismatch"}
+        stored_manifest = stored_snapshot.get("artifact_manifest") if isinstance(stored_snapshot, dict) else None
+        if not isinstance(stored_manifest, dict) or stored_manifest.get("manifest_sha256") != manifest.get("manifest_sha256"):
+            return {"ready": False, "classification": "artifact_manifest_digest_mismatch"}
+        bundle = snapshot.get("artifact_bundle") if isinstance(snapshot.get("artifact_bundle"), dict) else {}
+        raw_records = bundle.get("raw_files") if isinstance(bundle.get("raw_files"), list) else []
+        expected = to_non_negative_int(manifest.get("expected_artifacts"))
+        if expected <= 0 or len(raw_records) != expected:
+            return {"ready": False, "classification": "artifact_inventory_count_mismatch"}
+        seen_names: set[str] = set()
+        for record in raw_records:
+            if not isinstance(record, dict):
+                return {"ready": False, "classification": "artifact_inventory_invalid"}
+            filename = Path(str(record.get("path") or "")).name
+            if not filename or filename in seen_names or safe_filename(filename, "") != filename:
+                return {"ready": False, "classification": "artifact_inventory_invalid"}
+            seen_names.add(filename)
+            raw_path = raw_dir / filename
+            if not regular(raw_path):
+                return {"ready": False, "classification": "artifact_file_missing"}
+            try:
+                content = json.loads(raw_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return {"ready": False, "classification": "artifact_file_json_invalid"}
+            canonical = json.dumps(content, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            if hashlib.sha256(canonical.encode("utf-8")).hexdigest() != record.get("sha256"):
+                return {"ready": False, "classification": "artifact_file_digest_mismatch"}
+        return {"ready": True, "classification": "artifact_bundle_verified", "snapshot_id": snapshot_id}
 
     def _current_operation(self, job: JobRecord | None) -> dict[str, Any] | None:
         if not job:
@@ -589,7 +746,152 @@ class ConsoleService:
             return []
         return list(job.operation_log or [])[-limit:]
 
-    def _record_operation(
+    def _set_launch_phase(
+        self,
+        job: JobRecord,
+        phase: str,
+        *,
+        operation_id: str,
+        classification: str | None = None,
+        sweep_receipt: dict[str, Any] | None = None,
+        agent_launches: list[dict[str, Any]] | None = None,
+    ) -> None:
+        previous = job.monitor.get("launch") if isinstance(job.monitor.get("launch"), dict) else {}
+        launch = {
+            **previous,
+            "phase": phase,
+            "operation_id": operation_id,
+            "owner_id": self._launch_owner_id,
+            "updated_at": utc_now(),
+        }
+        if classification:
+            launch["classification"] = classification
+        if sweep_receipt is not None:
+            launch["sweep_receipt"] = compact_sweep_receipt(sweep_receipt)
+        if agent_launches is not None:
+            launch["agent_launches"] = [compact_agent_launch(item) for item in agent_launches]
+        job.monitor["launch"] = launch
+        job.monitor["launch_phase"] = phase
+
+    def _launch_replay_is_stale(self, job: JobRecord, operation: dict[str, Any]) -> bool:
+        launch = job.monitor.get("launch") if isinstance(job.monitor.get("launch"), dict) else {}
+        phase = str(launch.get("phase") or job.monitor.get("launch_phase") or job.monitor.get("stage") or "")
+        if phase not in {"creating_sweep", "sweep_created", "launching_agents"}:
+            return False
+        owner_id = str(launch.get("owner_id") or "")
+        if not owner_id or owner_id != self._launch_owner_id:
+            return True
+        updated_at = str(launch.get("updated_at") or operation.get("updated_at") or "")
+        try:
+            parsed = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            age_seconds = (datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds()
+        except Exception:
+            return True
+        return age_seconds >= max(60, self.settings.command_timeout_seconds + 30)
+
+    def _enqueue_launch_attention(
+        self,
+        job: JobRecord,
+        *,
+        operation_id: str,
+        classification: str,
+        summary: str,
+    ) -> None:
+        schedule = self.store.get_monitor_schedule(job.job_id) or {}
+        thread_id = str(schedule.get("thread_id") or "").strip()
+        if not thread_id:
+            return
+        self.store.enqueue_wake_event(
+            dedupe_key=f"{job.job_id}:attention:{classification}:{operation_id}",
+            job_id=job.job_id,
+            thread_id=thread_id,
+            kind="attention",
+            summary=summary,
+            payload={
+                "classification": classification,
+                "operation_id": operation_id,
+                "launch": job.monitor.get("launch"),
+            },
+        )
+
+    def _fail_closed_launch_replay(
+        self,
+        job: JobRecord,
+        operation: dict[str, Any] | None,
+        *,
+        requested_by: str,
+        operation_id: str,
+        idempotency_key: str,
+        receipt_missing: bool = False,
+    ) -> tuple[JobRecord, dict[str, Any]]:
+        existing_classification = str((operation or {}).get("classification") or "")
+        if existing_classification in {"launch_outcome_unknown", "launch_recovery_required"}:
+            return job, operation or {}
+
+        sweep_id = str(job.sweep_id or "") or None
+        classification = "launch_recovery_required" if sweep_id else "launch_outcome_unknown"
+        interrupted_phase = str(
+            ((job.monitor.get("launch") or {}).get("phase") if isinstance(job.monitor.get("launch"), dict) else None)
+            or job.monitor.get("launch_phase")
+            or job.monitor.get("stage")
+            or "unknown"
+        )
+        if sweep_id:
+            next_actions = [
+                "The W&B sweep receipt is durable; do not create another sweep.",
+                "Reconcile the recorded sweep and exact agent receipts, then use recover-agents only for missing capacity.",
+            ]
+            summary = f"job {job.job_id} launch stopped after sweep {sweep_id} was recorded"
+        else:
+            next_actions = [
+                "The W&B create outcome is unknown; do not retry launch-sweep automatically.",
+                "Inspect W&B for a sweep created by this launch, then register/reconcile it or explicitly close the incident.",
+            ]
+            summary = f"job {job.job_id} W&B sweep creation outcome is unknown"
+        if receipt_missing:
+            next_actions.insert(0, "The job row matched this idempotency key but its operation receipt was missing.")
+
+        job.status = JobStatus.attention
+        self._set_launch_phase(
+            job,
+            "attention",
+            operation_id=operation_id,
+            classification=classification,
+        )
+        job.monitor["launch"]["interrupted_phase"] = interrupted_phase
+        result = {
+            "stage": "attention",
+            "classification": classification,
+            "job_id": job.job_id,
+            "sweep_id": sweep_id,
+            "created_new_sweep": None,
+            "agent_launches": list((job.monitor.get("launch") or {}).get("agent_launches") or []),
+            "next_actions": next_actions,
+        }
+        self._record_operation(
+            job,
+            operation_id=operation_id,
+            intent=IntentType.launch_sweep,
+            requested_by=requested_by,
+            idempotency_key=idempotency_key,
+            stage="attention",
+            classification=classification,
+            status=OperationStatus.failed.value,
+            result=result,
+        )
+        persisted = self.store.get_job(job.job_id) or job
+        current = self._current_operation(persisted) or {}
+        self._enqueue_launch_attention(
+            persisted,
+            operation_id=operation_id,
+            classification=classification,
+            summary=summary,
+        )
+        return persisted, current
+
+    def _set_operation(
         self,
         job: JobRecord,
         *,
@@ -611,11 +913,12 @@ class ConsoleService:
                 break
         stamp = utc_now()
         transitions = list(previous.get("transitions") or []) if isinstance(previous, dict) else []
+        persisted_result = compact_operation({"result": result}).get("result") if result is not None else None
         transitions.append({
             "stage": stage,
             "classification": classification,
             "status": status,
-            "result": redact_value(result) if result is not None else None,
+            "result": redact_value(persisted_result) if persisted_result is not None else None,
             "updated_at": stamp,
         })
         operation = {
@@ -626,7 +929,7 @@ class ConsoleService:
             "stage": stage,
             "classification": classification,
             "status": status,
-            "result": redact_value(result) if result is not None else None,
+            "result": redact_value(persisted_result) if persisted_result is not None else None,
             "retry_after_seconds": retry_after_seconds,
             "created_at": previous.get("created_at") if isinstance(previous, dict) and previous.get("created_at") else stamp,
             "updated_at": stamp,
@@ -641,6 +944,34 @@ class ConsoleService:
         job.monitor["operation_log"] = job.operation_log[-10:]
         job.monitor["stage"] = stage
         job.monitor["classification"] = classification
+        return job
+
+    def _record_operation(
+        self,
+        job: JobRecord,
+        *,
+        operation_id: str,
+        intent: IntentType,
+        requested_by: str,
+        idempotency_key: str,
+        stage: str,
+        classification: str,
+        status: str,
+        result: dict[str, Any] | None = None,
+        retry_after_seconds: int | None = None,
+    ) -> JobRecord:
+        self._set_operation(
+            job,
+            operation_id=operation_id,
+            intent=intent,
+            requested_by=requested_by,
+            idempotency_key=idempotency_key,
+            stage=stage,
+            classification=classification,
+            status=status,
+            result=result,
+            retry_after_seconds=retry_after_seconds,
+        )
         return self.store.upsert_job(job)
 
     def _find_operation_replay(self, intent: IntentType, idempotency_key: str) -> tuple[JobRecord, dict[str, Any]] | None:
@@ -668,22 +999,24 @@ class ConsoleService:
         if not replay:
             return
         job, op = replay
-        self._record_operation(
-            job,
-            operation_id=str(op.get("operation_id") or operation_id),
-            intent=intent,
-            requested_by=requested_by,
-            idempotency_key=idempotency_key,
-            stage="failed",
-            classification="control_plane_error",
-            status=OperationStatus.failed.value,
-            result={
-                "stage": "failed",
-                "classification": "control_plane_error",
-                "error": compact_error(exc),
-                "next_actions": ["使用 status 查询 ledger；修复环境后用相同 idempotency_key 重试会回放该 operation。"],
-            },
-        )
+        with self._serialized_job(job.job_id):
+            job = self.store.get_job(job.job_id) or job
+            self._record_operation(
+                job,
+                operation_id=str(op.get("operation_id") or operation_id),
+                intent=intent,
+                requested_by=requested_by,
+                idempotency_key=idempotency_key,
+                stage="failed",
+                classification="control_plane_error",
+                status=OperationStatus.failed.value,
+                result={
+                    "stage": "failed",
+                    "classification": "control_plane_error",
+                    "error": compact_error(exc),
+                    "next_actions": ["使用 status 查询 ledger；修复环境后用相同 idempotency_key 重试会回放该 operation。"],
+                },
+            )
 
     def _fail_launch_job(
         self,
@@ -867,6 +1200,33 @@ class ConsoleService:
             replay_job = self._find_operation_replay(intent, idempotency_key)
             if replay_job:
                 replay_job, op = replay_job
+                if (
+                    intent == IntentType.launch_sweep
+                    and str(op.get("status") or "") in OPEN_OPERATION_STATUSES
+                    and self._launch_replay_is_stale(replay_job, op)
+                ):
+                    with self.store.named_lock(f"job:{replay_job.job_id}"):
+                        replay_job = self.store.get_job(replay_job.job_id) or replay_job
+                        refreshed_op = next(
+                            (
+                                item
+                                for item in reversed(replay_job.operation_log or [])
+                                if item.get("intent") == intent.value and item.get("idempotency_key") == idempotency_key
+                            ),
+                            op,
+                        )
+                        if (
+                            str(refreshed_op.get("status") or "") in OPEN_OPERATION_STATUSES
+                            and self._launch_replay_is_stale(replay_job, refreshed_op)
+                        ):
+                            replay_job, refreshed_op = self._fail_closed_launch_replay(
+                                replay_job,
+                                refreshed_op,
+                                requested_by=requested_by,
+                                operation_id=str(refreshed_op.get("operation_id") or operation_id),
+                                idempotency_key=idempotency_key,
+                            )
+                        op = refreshed_op
                 replay_result = op.get("result") if isinstance(op.get("result"), dict) else {}
                 return RunnerCommandResponse(
                     command=intent,
@@ -888,6 +1248,40 @@ class ConsoleService:
                     retry_after_seconds=op.get("retry_after_seconds"),
                     accepted=str(op.get("status") or "") in OPEN_OPERATION_STATUSES,
                 )
+            if intent == IntentType.launch_sweep:
+                row_match = self.store.find_job_by_idempotency_key(idempotency_key)
+                if row_match:
+                    with self.store.named_lock(f"job:{row_match.job_id}"):
+                        row_match = self.store.get_job(row_match.job_id) or row_match
+                        row_match, op = self._fail_closed_launch_replay(
+                            row_match,
+                            None,
+                            requested_by=requested_by,
+                            operation_id=str(row_match.operation_id or operation_id),
+                            idempotency_key=idempotency_key,
+                            receipt_missing=True,
+                        )
+                    replay_result = op.get("result") if isinstance(op.get("result"), dict) else {}
+                    return RunnerCommandResponse(
+                        command=intent,
+                        requested_by=requested_by,
+                        result=redact_value(replay_result or {}),
+                        operation_id=str(op.get("operation_id") or operation_id),
+                        idempotency_key=idempotency_key,
+                        job_id=row_match.job_id,
+                        job=row_match,
+                        stage=str(op.get("stage") or "attention"),
+                        classification=str(op.get("classification") or "launch_outcome_unknown"),
+                        next_actions=list(replay_result.get("next_actions") or []),
+                        provenance={
+                            "source": "experiment_console",
+                            "generated_at": utc_now(),
+                            "replayed": True,
+                            "row_receipt_missing": True,
+                            "operation_id": str(op.get("operation_id") or operation_id),
+                        },
+                        accepted=False,
+                    )
         stage = "done"
         classification = "ok"
         next_actions: list[str] = []
@@ -997,6 +1391,22 @@ class ConsoleService:
                 "recommended_action": blocker_assessment["recommended_action"],
             })
         return result
+
+    def _bind_monitor_schedule(self, job: JobRecord, *, thread_id: str | None, every: str, timeout_seconds: int) -> JobRecord:
+        if not thread_id or not isinstance(job.monitor.get("result_contract"), dict):
+            return self.store.upsert_job(job)
+        return self.store.upsert_job_with_monitor_schedule(
+            job,
+            interval_seconds=parse_monitor_interval(every),
+            timeout_seconds=timeout_seconds,
+            thread_id=thread_id,
+        )
+
+    def _require_production_monitor_binding(self, *, result_contract: Any, thread_id: str | None, operation: str) -> None:
+        if self.settings.authority_role != "authoritative":
+            return
+        if result_contract is None or not str(thread_id or "").strip():
+            raise ValueError(f"authoritative Console requires result_contract and thread_id before {operation}")
 
     def _assess_queue_blocker(self, job: JobRecord | None) -> dict[str, Any]:
         if job is None:
@@ -1152,6 +1562,7 @@ class ConsoleService:
                 ],
                 "preflight": preflight,
                 "validation": validation,
+                "result_contract": result_contract_dict(payload.result_contract, validation),
                 "queue": {
                     "queue_group": queue_group,
                     "queue_policy": payload.queue_policy,
@@ -1162,7 +1573,25 @@ class ConsoleService:
                 },
             },
         )
-        self.store.upsert_job(job)
+        self._set_launch_phase(job, "queued", operation_id=operation_id, classification="queued")
+        self._set_operation(
+            job,
+            operation_id=operation_id,
+            intent=IntentType.launch_sweep,
+            requested_by=requested_by,
+            idempotency_key=idempotency_key,
+            stage="queued",
+            classification="queued",
+            status=OperationStatus.accepted.value,
+            result={"stage": "queued", "classification": "queued", "created_new_sweep": False},
+            retry_after_seconds=30,
+        )
+        job = self._bind_monitor_schedule(
+            job,
+            thread_id=payload.thread_id,
+            every=payload.monitor_every,
+            timeout_seconds=payload.monitor_timeout_seconds,
+        )
         queue_state = self._queue_position(job) or {"queue_group": queue_group, "blocked_by_job_id": blocker.job_id}
         result = {
             "stage": "queued",
@@ -1263,6 +1692,23 @@ class ConsoleService:
         }
 
     def _launch_sweep(self, payload: LaunchSweepPayload, *, requested_by: str = "experiment-runner", operation_id: str | None = None, idempotency_key: str | None = None) -> tuple[dict[str, Any], JobRecord]:
+        self._require_production_monitor_binding(
+            result_contract=payload.result_contract,
+            thread_id=payload.thread_id,
+            operation="launch-sweep",
+        )
+        remote_host = payload.remote_host or self.settings.default_remote_host
+        remote_cwd = payload.remote_cwd or self.settings.default_remote_cwd
+        queue_group = self._queue_group_for(remote_host=remote_host, remote_cwd=remote_cwd, payload=payload)
+        with self.store.named_lock(f"queue:{queue_group}"):
+            return self._launch_sweep_locked(
+                payload,
+                requested_by=requested_by,
+                operation_id=operation_id,
+                idempotency_key=idempotency_key,
+            )
+
+    def _launch_sweep_locked(self, payload: LaunchSweepPayload, *, requested_by: str = "experiment-runner", operation_id: str | None = None, idempotency_key: str | None = None) -> tuple[dict[str, Any], JobRecord]:
         entity = payload.entity or self.settings.default_entity
         project = payload.project or self.settings.default_project
         remote_host = payload.remote_host or self.settings.default_remote_host
@@ -1271,6 +1717,7 @@ class ConsoleService:
         remote_config_path = payload.config_path
         operation_id = operation_id or self._operation_identity(IntentType.launch_sweep, payload.model_dump(mode="json"))[0]
         idempotency_key = idempotency_key or self._operation_identity(IntentType.launch_sweep, payload.model_dump(mode="json"))[1]
+        queue_group = self._queue_group_for(remote_host=remote_host, remote_cwd=remote_cwd, payload=payload)
         matching_jobs = self.store.find_jobs_by_launch_identity(
             name=payload.job_name,
             config_path=str(remote_config_path),
@@ -1280,33 +1727,34 @@ class ConsoleService:
         conflicting_jobs = [job for job in matching_jobs if infer_job_kind(job) not in {"sweep"}]
         existing = next((job for job in matching_jobs if infer_job_kind(job) == "sweep"), None)
         if existing:
-            if existing.status == JobStatus.queued:
-                return self._queued_replay_result(existing), existing
-            if not self._current_operation(existing):
-                self._record_operation(
-                    existing,
-                    operation_id=operation_id,
-                    intent=IntentType.launch_sweep,
-                    requested_by=requested_by,
-                    idempotency_key=idempotency_key,
-                    stage="idempotent_replay",
-                    classification="existing_sweep_reused",
-                    status=OperationStatus.succeeded.value,
-                    result={
-                        "stage": "idempotent_replay",
-                        "classification": "existing_sweep_reused",
-                        "created_new_sweep": False,
-                        "next_actions": ["使用 recover-agents 为既有 sweep 补 agent，而不是重新创建 sweep。"],
-                    },
-                )
-            return {
-                "stage": "idempotent_replay",
-                "classification": "existing_sweep_reused",
-                "created_new_sweep": False,
-                "job": existing.model_dump(mode="json"),
-                "next_actions": ["使用 recover-agents 为既有 sweep 补 agent，而不是重新创建 sweep。"],
-            }, existing
-        queue_group = self._queue_group_for(remote_host=remote_host, remote_cwd=remote_cwd, payload=payload)
+            with self._serialized_job(existing.job_id, queue_group=queue_group):
+                existing = self._require_job(existing.job_id)
+                if existing.status == JobStatus.queued:
+                    return self._queued_replay_result(existing), existing
+                if not self._current_operation(existing):
+                    self._record_operation(
+                        existing,
+                        operation_id=operation_id,
+                        intent=IntentType.launch_sweep,
+                        requested_by=requested_by,
+                        idempotency_key=idempotency_key,
+                        stage="idempotent_replay",
+                        classification="existing_sweep_reused",
+                        status=OperationStatus.succeeded.value,
+                        result={
+                            "stage": "idempotent_replay",
+                            "classification": "existing_sweep_reused",
+                            "created_new_sweep": False,
+                            "next_actions": ["使用 recover-agents 为既有 sweep 补 agent，而不是重新创建 sweep。"],
+                        },
+                    )
+                return {
+                    "stage": "idempotent_replay",
+                    "classification": "existing_sweep_reused",
+                    "created_new_sweep": False,
+                    "job": existing.model_dump(mode="json"),
+                    "next_actions": ["使用 recover-agents 为既有 sweep 补 agent，而不是重新创建 sweep。"],
+                }, existing
         blocker = self.store.get_job(payload.queue_after_job_id) if payload.queue_after_job_id else None
         if payload.queue_after_job_id and blocker is None:
             raise ValueError(f"queue_after_job_id not found: {payload.queue_after_job_id}")
@@ -1321,8 +1769,12 @@ class ConsoleService:
                 )
         if blocker and blocker.status in TERMINAL_JOB_STATUSES:
             blocker = None
-        if payload.queue_policy == "sequential" and blocker is None:
-            blocker = self.store.active_queue_blocker(queue_group)
+        if payload.queue_policy == "sequential":
+            queued_predecessors = self.store.list_queued_jobs(queue_group)
+            if queued_predecessors:
+                blocker = queued_predecessors[-1]
+            elif blocker is None:
+                blocker = self.store.active_queue_blocker(queue_group)
         if payload.queue_policy == "sequential" and blocker is not None:
             try:
                 launch_preflight = self._sweep_launch_preflight(
@@ -1438,6 +1890,41 @@ class ConsoleService:
         queued_job: JobRecord | None = None,
         conflicting_jobs: list[JobRecord] | None = None,
     ) -> tuple[dict[str, Any], JobRecord]:
+        remote_host = payload.remote_host or self.settings.default_remote_host
+        remote_cwd = payload.remote_cwd or self.settings.default_remote_cwd
+        resolved_group = queue_group or self._queue_group_for(
+            remote_host=remote_host,
+            remote_cwd=remote_cwd,
+            payload=payload,
+        )
+        job_id = queued_job.job_id if queued_job else new_id("job", payload.job_name)
+        with self._serialized_job(job_id, queue_group=resolved_group):
+            refreshed_queued_job = self.store.get_job(job_id) if queued_job else None
+            if queued_job and (not refreshed_queued_job or refreshed_queued_job.status != JobStatus.queued):
+                raise RuntimeError(f"queued job changed before launch: {job_id}")
+            return self._launch_sweep_now_locked(
+                payload,
+                requested_by=requested_by,
+                operation_id=operation_id,
+                idempotency_key=idempotency_key,
+                queue_group=resolved_group,
+                queued_job=refreshed_queued_job,
+                conflicting_jobs=conflicting_jobs,
+                job_id=job_id,
+            )
+
+    def _launch_sweep_now_locked(
+        self,
+        payload: LaunchSweepPayload,
+        *,
+        requested_by: str,
+        operation_id: str | None,
+        idempotency_key: str | None,
+        queue_group: str,
+        queued_job: JobRecord | None,
+        conflicting_jobs: list[JobRecord] | None,
+        job_id: str,
+    ) -> tuple[dict[str, Any], JobRecord]:
         entity = payload.entity or self.settings.default_entity
         project = payload.project or self.settings.default_project
         remote_host = payload.remote_host or self.settings.default_remote_host
@@ -1457,7 +1944,7 @@ class ConsoleService:
             conflicting_jobs = [job for job in matching_jobs if infer_job_kind(job) not in {"sweep"}]
         queue_group = queue_group or self._queue_group_for(remote_host=remote_host, remote_cwd=remote_cwd, payload=payload)
         job = JobRecord(
-            job_id=new_id("job", payload.job_name),
+            job_id=job_id,
             name=payload.job_name,
             status=JobStatus.validating,
             operation_id=operation_id,
@@ -1471,6 +1958,7 @@ class ConsoleService:
             monitor={
                 "kind": "sweep",
                 "stage": "validating",
+                "result_contract": result_contract_dict(payload.result_contract),
                 "queue": {
                     "queue_group": queue_group,
                     "queue_policy": payload.queue_policy,
@@ -1521,8 +2009,8 @@ class ConsoleService:
                     for conflict in conflicting_jobs[:5]
                 ],
             })
-        self.store.upsert_job(job)
-        self._record_operation(
+        self._set_launch_phase(job, "preflight", operation_id=operation_id, classification="accepted")
+        self._set_operation(
             job,
             operation_id=operation_id,
             intent=IntentType.launch_sweep,
@@ -1539,6 +2027,12 @@ class ConsoleService:
                 "next_actions": ["Console 正在执行 launch-sweep，稍后再用 status 查询进度。"],
             },
             retry_after_seconds=2,
+        )
+        job = self._bind_monitor_schedule(
+            job,
+            thread_id=payload.thread_id,
+            every=payload.monitor_every,
+            timeout_seconds=payload.monitor_timeout_seconds,
         )
         try:
             launch_preflight = self._sweep_launch_preflight(
@@ -1564,6 +2058,9 @@ class ConsoleService:
                 next_actions=["修复 sweep 配置或远端 config 路径后，再重新 launch-sweep。"],
             )
         job.monitor.update({"validation": validation, "stage": "validating"})
+        contract = result_contract_dict(payload.result_contract, validation)
+        if contract:
+            job.monitor["result_contract"] = contract
         self.store.upsert_job(job)
         if launch_preflight["classification"] != "preflight_ok":
             classification = "entrypoint_probe_failed"
@@ -1619,19 +2116,19 @@ class ConsoleService:
                 next_actions=["修复远端环境、路径或依赖后，再重新 launch-sweep。"],
                 extra_result={"validation": validation},
             )
-        job.monitor.update({"preflight": preflight, "stage": "creating_sweep"})
-        self.store.upsert_job(job)
+        job.monitor["preflight"] = preflight
+        self._set_launch_phase(job, "creating_sweep", operation_id=operation_id, classification="accepted")
         self._record_operation(
             job,
             operation_id=operation_id,
             intent=IntentType.launch_sweep,
             requested_by=requested_by,
             idempotency_key=idempotency_key,
-            stage="preflight",
+            stage="creating_sweep",
             classification="accepted",
             status=OperationStatus.executing.value,
             result={
-                "stage": "preflight",
+                "stage": "creating_sweep",
                 "classification": "accepted",
                 "preflight": preflight,
                 "next_actions": ["Console 正在创建 sweep。"],
@@ -1641,23 +2138,63 @@ class ConsoleService:
         try:
             sweep = self._create_sweep(remote_config_path, entity=entity, project=project, payload=payload)
         except Exception as exc:
-            return self._fail_launch_job(
+            job.monitor["launch"]["error"] = compact_error(exc)
+            job, operation = self._fail_closed_launch_replay(
                 job,
-                intent=IntentType.launch_sweep,
-                operation_id=operation_id,
                 requested_by=requested_by,
+                operation_id=operation_id,
                 idempotency_key=idempotency_key,
-                stage="create_sweep_failed",
-                classification="control_plane_error",
-                exc=exc,
-                next_actions=["检查 W&B sweep 创建错误和远端 config 后，再重新 launch-sweep。"],
-                extra_result={"validation": validation, "preflight": preflight},
+                operation=self._current_operation(job),
             )
+            return dict(operation.get("result") or {}), job
         job.sweep_id = sweep["sweep_id"]
-        existing_sweep_job = self.store.find_job_by_sweep(entity, project, job.sweep_id)
-        if existing_sweep_job and existing_sweep_job.job_id != job.job_id:
+        sweep_path = f"{entity}/{project}/{job.sweep_id}"
+        job.monitor["sweep_path"] = sweep_path
+        self._set_launch_phase(
+            job,
+            "sweep_created",
+            operation_id=operation_id,
+            classification="sweep_created",
+            sweep_receipt=sweep,
+            agent_launches=[],
+        )
+        self._record_operation(
+            job,
+            operation_id=operation_id,
+            intent=IntentType.launch_sweep,
+            requested_by=requested_by,
+            idempotency_key=idempotency_key,
+            stage="sweep_created",
+            classification="sweep_created",
+            status=OperationStatus.executing.value,
+            result={
+                "stage": "sweep_created",
+                "classification": "sweep_created",
+                "created_new_sweep": True,
+                "sweep": sweep,
+                "agent_launches": [],
+                "next_actions": ["The W&B sweep receipt is durable; Console is preparing agents."],
+            },
+            retry_after_seconds=2,
+        )
+        existing_sweep_job = self.store.find_other_job_by_sweep(
+            entity,
+            project,
+            job.sweep_id,
+            exclude_job_id=job.job_id,
+        )
+        if existing_sweep_job:
+            job.status = JobStatus.cancelled
+            self._set_launch_phase(
+                job,
+                "done",
+                operation_id=operation_id,
+                classification="existing_sweep_reused",
+                sweep_receipt=sweep,
+                agent_launches=[],
+            )
             self._record_operation(
-                existing_sweep_job,
+                job,
                 operation_id=operation_id,
                 intent=IntentType.launch_sweep,
                 requested_by=requested_by,
@@ -1669,33 +2206,67 @@ class ConsoleService:
                     "stage": "idempotent_replay",
                     "classification": "existing_sweep_reused",
                     "created_new_sweep": False,
+                    "job_id": job.job_id,
                     "sweep": sweep,
+                    "existing_job_id": existing_sweep_job.job_id,
                     "next_actions": ["既有 job 已登记该 sweep；如需 agent 请 recover-agents。"],
                 },
             )
+            self.store.disable_monitor_schedule(job.job_id)
             return {
                 "stage": "idempotent_replay",
                 "classification": "existing_sweep_reused",
                 "created_new_sweep": False,
+                "job_id": job.job_id,
                 "sweep": sweep,
+                "existing_job_id": existing_sweep_job.job_id,
                 "next_actions": ["既有 job 已登记该 sweep；如需 agent 请 recover-agents。"],
-            }, existing_sweep_job
+            }, job
         try:
             gpu_probe = self.ssh.probe_gpus(remote_host)
             eligible = [gpu for gpu in gpu_probe["gpus"] if gpu["eligible"]]
             if payload.max_agents is not None:
                 eligible = eligible[:payload.max_agents]
-            launches = []
-            sweep_path = f"{entity}/{project}/{job.sweep_id}"
+            launches: list[dict[str, Any]] = []
             wandb_api_key = self._wandb_api_key()
             auth = self.ssh.auth_check(
                 host=remote_host,
                 remote_cwd=remote_cwd,
                 sweep_path=sweep_path,
                 wandb_api_key=wandb_api_key,
+                conda_env=conda_env,
+                conda_sh=conda_sh,
+            )
+            self._set_launch_phase(
+                job,
+                "launching_agents",
+                operation_id=operation_id,
+                classification="launching_agents",
+                sweep_receipt=sweep,
+                agent_launches=launches,
+            )
+            job.monitor.update({"gpu_probe": gpu_probe, "auth": auth})
+            self._record_operation(
+                job,
+                operation_id=operation_id,
+                intent=IntentType.launch_sweep,
+                requested_by=requested_by,
+                idempotency_key=idempotency_key,
+                stage="launching_agents",
+                classification="launching_agents",
+                status=OperationStatus.executing.value,
+                result={
+                    "stage": "launching_agents",
+                    "classification": "launching_agents",
+                    "created_new_sweep": True,
+                    "sweep": sweep,
+                    "agent_launches": [],
+                    "next_actions": ["Console is launching the planned agent capacity."],
+                },
+                retry_after_seconds=2,
             )
             for gpu in eligible:
-                launches.append(self.ssh.launch_agent(
+                launch = self.ssh.launch_agent(
                     host=remote_host,
                     remote_cwd=remote_cwd,
                     sweep_path=sweep_path,
@@ -1703,8 +2274,47 @@ class ConsoleService:
                     conda_env=conda_env,
                     conda_sh=conda_sh,
                     wandb_api_key=wandb_api_key,
-                ))
+                )
+                launches.append(launch)
+                if launch.get("pid"):
+                    job.agent_pids = sorted(set([*job.agent_pids, str(launch["pid"])]))
+                self._set_launch_phase(
+                    job,
+                    "launching_agents",
+                    operation_id=operation_id,
+                    classification="launching_agents",
+                    sweep_receipt=sweep,
+                    agent_launches=launches,
+                )
+                job.monitor["agent_launches"] = [compact_agent_launch(item) for item in launches]
+                self._record_operation(
+                    job,
+                    operation_id=operation_id,
+                    intent=IntentType.launch_sweep,
+                    requested_by=requested_by,
+                    idempotency_key=idempotency_key,
+                    stage="launching_agents",
+                    classification="launching_agents",
+                    status=OperationStatus.executing.value,
+                    result={
+                        "stage": "launching_agents",
+                        "classification": "launching_agents",
+                        "created_new_sweep": True,
+                        "sweep": sweep,
+                        "agent_launches": launches,
+                        "next_actions": ["Console is launching the remaining planned agent capacity."],
+                    },
+                    retry_after_seconds=2,
+                )
         except Exception as exc:
+            self._set_launch_phase(
+                job,
+                "attention",
+                operation_id=operation_id,
+                classification="agent_launch_failed",
+                sweep_receipt=sweep,
+                agent_launches=launches if "launches" in locals() else [],
+            )
             return self._fail_launch_job(
                 job,
                 intent=IntentType.launch_sweep,
@@ -1714,15 +2324,32 @@ class ConsoleService:
                 stage="agent_launch_failed",
                 classification="control_plane_error",
                 exc=exc,
-                next_actions=["检查 GPU 探测、W&B auth 或 agent 启动错误；修复后使用 recover-agents 或重新 launch-sweep。"],
+                next_actions=["检查 GPU 探测、W&B auth 或 agent 启动错误；只对这个既有 sweep 使用 recover-agents 补足缺失容量。"],
                 status=JobStatus.attention,
-                extra_result={"validation": validation, "preflight": preflight, "sweep": sweep},
+                extra_result={
+                    "validation": validation,
+                    "preflight": preflight,
+                    "sweep": sweep,
+                    "agent_launches": launches if "launches" in locals() else [],
+                },
             )
-        job.agent_pids = [item["pid"] for item in launches if item.get("pid")]
+        job.agent_pids = sorted(set([*job.agent_pids, *[str(item["pid"]) for item in launches if item.get("pid")]]))
         job.status = JobStatus.running if launches else JobStatus.attention
         classification = classify_launch(auth, launches)
-        job.monitor.update({"gpu_probe": gpu_probe, "auth": auth, "agent_launches": launches, "sweep_path": sweep_path, "stage": "done", "classification": classification})
-        self.store.upsert_job(job)
+        job.monitor.update({
+            "gpu_probe": gpu_probe,
+            "auth": auth,
+            "agent_launches": [compact_agent_launch(item) for item in launches],
+            "sweep_path": sweep_path,
+        })
+        self._set_launch_phase(
+            job,
+            "done",
+            operation_id=operation_id,
+            classification=classification,
+            sweep_receipt=sweep,
+            agent_launches=launches,
+        )
         self._record_operation(
             job,
             operation_id=operation_id,
@@ -1771,6 +2398,25 @@ class ConsoleService:
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         groups = [payload.queue_group] if payload.queue_group else self.store.queue_groups()
+        with ExitStack() as stack:
+            for queue_group in sorted(str(group) for group in groups if group):
+                stack.enter_context(self.store.named_lock(f"queue:{queue_group}"))
+            return self._advance_queue_locked(
+                payload,
+                requested_by=requested_by,
+                operation_id=operation_id,
+                idempotency_key=idempotency_key,
+            )
+
+    def _advance_queue_locked(
+        self,
+        payload: AdvanceQueuePayload,
+        *,
+        requested_by: str = "experiment-runner",
+        operation_id: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        groups = [payload.queue_group] if payload.queue_group else self.store.queue_groups()
         advanced: list[dict[str, Any]] = []
         blocked: list[dict[str, Any]] = []
         unblocked: list[dict[str, Any]] = []
@@ -1779,28 +2425,32 @@ class ConsoleService:
             while True:
                 blocker = self.store.active_queue_blocker(queue_group)
                 if blocker:
-                    assessment = self._assess_queue_blocker(blocker)
-                    if payload.auto_unblock_stale and assessment["unblockable"]:
-                        _, hygiene = self._ledger_only_cancel_job(
-                            blocker,
-                            requested_by=requested_by,
-                            reason=f"Auto-unblocked stale queue blocker for {queue_group}.",
-                            classification="metadata_corrupt_cancelled",
-                            evidence=assessment["evidence"],
-                        )
-                        unblocked.append({"queue_group": queue_group, **hygiene})
-                        continue
-                    blocked.append({
-                        "queue_group": queue_group,
-                        "blocked_by_job_id": blocker.job_id,
-                        "blocked_by_status": blocker.status.value,
-                        "blocked_by_classification": assessment["classification"],
-                        "blocker_classification": assessment["classification"],
-                        "unblockable": assessment["unblockable"],
-                        "recommended_action": assessment["recommended_action"],
-                        "evidence": assessment["evidence"],
-                    })
-                    break
+                    with self._serialized_job(blocker.job_id, queue_group=queue_group):
+                        blocker = self.store.get_job(blocker.job_id)
+                        if not blocker or blocker.status in TERMINAL_JOB_STATUSES:
+                            continue
+                        assessment = self._assess_queue_blocker(blocker)
+                        if payload.auto_unblock_stale and assessment["unblockable"]:
+                            _, hygiene = self._ledger_only_cancel_job(
+                                blocker,
+                                requested_by=requested_by,
+                                reason=f"Auto-unblocked stale queue blocker for {queue_group}.",
+                                classification="metadata_corrupt_cancelled",
+                                evidence=assessment["evidence"],
+                            )
+                            unblocked.append({"queue_group": queue_group, **hygiene})
+                            continue
+                        blocked.append({
+                            "queue_group": queue_group,
+                            "blocked_by_job_id": blocker.job_id,
+                            "blocked_by_status": blocker.status.value,
+                            "blocked_by_classification": assessment["classification"],
+                            "blocker_classification": assessment["classification"],
+                            "unblockable": assessment["unblockable"],
+                            "recommended_action": assessment["recommended_action"],
+                            "evidence": assessment["evidence"],
+                        })
+                        break
                 queued = self.store.next_queued_job(queue_group)
                 if not queued:
                     idle.append(queue_group)
@@ -1808,30 +2458,32 @@ class ConsoleService:
                 queue_meta = queued.monitor.get("queue") if isinstance(queued.monitor.get("queue"), dict) else {}
                 raw_payload = queue_meta.get("payload")
                 if not isinstance(raw_payload, dict):
-                    queued.monitor.update({
-                        "stage": "queue_failed",
-                        "classification": "queued_payload_missing",
-                        "error": "queued launch payload is missing",
-                        "queue_hygiene": {
-                            "unblocked_at": utc_now(),
-                            "unblocked_by": requested_by,
+                    with self._serialized_job(queued.job_id, queue_group=queue_group):
+                        queued = self._require_job(queued.job_id)
+                        queued.monitor.update({
+                            "stage": "queue_failed",
+                            "classification": "queued_payload_missing",
+                            "error": "queued launch payload is missing",
+                            "queue_hygiene": {
+                                "unblocked_at": utc_now(),
+                                "unblocked_by": requested_by,
+                                "reason": "queued launch payload is missing",
+                                "previous_status": queued.status.value,
+                                "evidence": {"job_id": queued.job_id, "queue_group": queue_group},
+                            },
+                        })
+                        queued.status = JobStatus.failed
+                        self.store.upsert_job(queued)
+                        unblocked.append({
+                            "queue_group": queue_group,
+                            "job_id": queued.job_id,
+                            "previous_status": JobStatus.queued.value,
+                            "status": JobStatus.failed.value,
+                            "classification": "queued_payload_missing",
+                            "ledger_only": True,
                             "reason": "queued launch payload is missing",
-                            "previous_status": queued.status.value,
                             "evidence": {"job_id": queued.job_id, "queue_group": queue_group},
-                        },
-                    })
-                    queued.status = JobStatus.failed
-                    self.store.upsert_job(queued)
-                    unblocked.append({
-                        "queue_group": queue_group,
-                        "job_id": queued.job_id,
-                        "previous_status": JobStatus.queued.value,
-                        "status": JobStatus.failed.value,
-                        "classification": "queued_payload_missing",
-                        "ledger_only": True,
-                        "reason": "queued launch payload is missing",
-                        "evidence": {"job_id": queued.job_id, "queue_group": queue_group},
-                    })
+                        })
                     continue
                 launch_payload = LaunchSweepPayload.model_validate({
                     **raw_payload,
@@ -2026,6 +2678,8 @@ class ConsoleService:
                 remote_cwd=remote_cwd,
                 sweep_path=None,
                 wandb_api_key=self._wandb_api_key(),
+                conda_env=conda_env,
+                conda_sh=conda_sh,
             )
         except Exception as exc:
             return self._fail_launch_job(
@@ -2141,6 +2795,11 @@ class ConsoleService:
         }, job
 
     def _register_existing_sweep(self, payload: RegisterExistingSweepPayload, *, requested_by: str = "experiment-runner", operation_id: str | None = None, idempotency_key: str | None = None) -> tuple[dict[str, Any], JobRecord]:
+        self._require_production_monitor_binding(
+            result_contract=payload.result_contract,
+            thread_id=payload.thread_id,
+            operation="register-existing-sweep",
+        )
         entity = payload.entity or self.settings.default_entity
         project = payload.project or self.settings.default_project
         operation_id = operation_id or self._operation_identity(IntentType.register_existing_sweep, payload.model_dump(mode="json"))[0]
@@ -2187,9 +2846,16 @@ class ConsoleService:
                 "stage": "registered_existing_sweep",
                 "expected_total": payload.expected_total,
                 "created_new_sweep": False,
+                "result_contract": result_contract_dict(payload.result_contract, {"expected_run_count": payload.expected_total}),
             },
         )
         self.store.upsert_job(job)
+        job = self._bind_monitor_schedule(
+            job,
+            thread_id=payload.thread_id,
+            every=payload.monitor_every,
+            timeout_seconds=payload.monitor_timeout_seconds,
+        )
         self._record_operation(
             job,
             operation_id=operation_id,
@@ -2220,7 +2886,16 @@ class ConsoleService:
         return {"stage": "registered", "classification": "existing_sweep_registered", "created_new_sweep": False}, job
 
     def _status(self, payload: StatusQueryPayload) -> dict[str, Any]:
+        if payload.job_id:
+            with self._serialized_job(payload.job_id):
+                return self._status_locked(payload)
+        return self._status_locked(payload)
+
+    def _status_locked(self, payload: StatusQueryPayload) -> dict[str, Any]:
         job = self.store.get_job(payload.job_id) if payload.job_id else None
+        reconcile_id = new_id("reconcile", payload.job_id or payload.sweep_id or "status")
+        observed_at = utc_now()
+        ledger_status_before = job.status.value if job else None
         missing_requested_job = bool(payload.job_id and not job)
         entity = (job.entity if job else None) or self.settings.default_entity
         project = (job.project if job else None) or self.settings.default_project
@@ -2254,14 +2929,8 @@ class ConsoleService:
             except Exception as exc:
                 degraded = str(exc)
         if job and sweep:
-            next_status = map_wandb_state_to_job_status(sweep.get("state"))
             sweep = self._enrich_single_sweep_with_telemetry(sweep)
-            cached_status = compact_sweep_status(sweep, include_runs=True)
-            try:
-                job = self.store.update_job_status(job.job_id, next_status, {"last_wandb_status": cached_status})
-            except Exception:
-                job.monitor["last_wandb_status"] = cached_status
-                self.store.upsert_job(job)
+        execution_state = derive_execution_state(sweep)
         current_operation = self._current_operation(job)
         operation_history = self._operation_history(job)
         agent_launches = []
@@ -2283,7 +2952,6 @@ class ConsoleService:
                     pids=job.agent_pids,
                 )
                 job.monitor["last_agent_probe"] = compact_agent_probe(agent_probe)
-                self.store.upsert_job(job)
             except Exception as exc:
                 agent_probe = {"classification": "agent_probe_unavailable", "error": compact_error(exc)}
         agent_health = "unknown"
@@ -2302,15 +2970,19 @@ class ConsoleService:
         elif job and isinstance(agent_probe, dict) and not agent_probe.get("classification"):
             if agent_probe.get("alive_pids") or agent_probe.get("pgrep"):
                 agent_health = "running"
-            elif job.status == JobStatus.running and agent_launches:
+            elif execution_state.get("queue_releasable"):
+                agent_health = "terminal"
+            elif job.status in {JobStatus.running, JobStatus.finalizing} and agent_launches:
                 agent_health = "missing"
-            elif job.status == JobStatus.running and sweep and str(sweep.get("state") or "").lower() == "running":
+            elif job.status in {JobStatus.running, JobStatus.finalizing} and sweep and str(sweep.get("state") or "").lower() == "running":
                 agent_health = "running"
             elif job.status in TERMINAL_JOB_STATUSES:
                 agent_health = "terminal"
             else:
                 agent_health = "unknown"
-        elif job and job.status == JobStatus.running:
+        elif job and isinstance(agent_probe, dict) and agent_probe.get("classification"):
+            agent_health = "unknown"
+        elif job and job.status in {JobStatus.running, JobStatus.finalizing}:
             agent_health = "running" if agent_launches or (sweep and str(sweep.get("state") or "").lower() == "running") else "missing"
         elif job and job.status in TERMINAL_JOB_STATUSES:
             agent_health = "terminal"
@@ -2320,15 +2992,13 @@ class ConsoleService:
         sweep_attention_reasons: list[str] = []
         if job and job.monitor.get("kind") != "single_run" and sweep:
             sweep_attention, sweep_attention_reasons = sweep_requires_attention(sweep, result_for_readiness)
-            if sweep_attention and job.status == JobStatus.running:
-                try:
-                    job = self.store.update_job_status(job.job_id, JobStatus.attention, {"sweep_attention_reasons": sweep_attention_reasons})
-                except Exception:
-                    job.status = JobStatus.attention
-                    job.monitor["sweep_attention_reasons"] = sweep_attention_reasons
-                    self.store.upsert_job(job)
+        artifact_consistency = job.monitor.get("artifact_consistency") if job and isinstance(job.monitor.get("artifact_consistency"), dict) else {}
+        result_artifact_attention = bool(
+            terminal_result_artifact_attention(sweep, result_for_readiness)
+            and artifact_consistency.get("classification") == "sync_error"
+        )
         failure_diagnostics = None
-        if should_collect_failure_diagnostics(job, sweep, agent_health, degraded, sweep_attention=sweep_attention):
+        if should_collect_failure_diagnostics(job, sweep, agent_health, degraded, sweep_attention=sweep_attention or result_artifact_attention):
             failure_diagnostics = self._collect_failure_diagnostics(
                 job=job,
                 agent_launches=agent_launches,
@@ -2336,10 +3006,155 @@ class ConsoleService:
             )
             if failure_diagnostics:
                 job.monitor["last_failure_diagnostics"] = compact_failure_diagnostics(failure_diagnostics)
-                self.store.upsert_job(job)
         elif job and isinstance(job.monitor.get("last_failure_diagnostics"), dict):
             failure_diagnostics = job.monitor["last_failure_diagnostics"]
         result_readiness = classify_result_readiness(result_for_readiness, sweep.get("state") if sweep else None)
+        artifact_storage = self._artifact_snapshot_storage_state(job, result_snapshot)
+        snapshot_manifest = result_snapshot.get("artifact_manifest") if isinstance(result_snapshot, dict) else None
+        if (
+            result_readiness in {"complete", "complete_with_failures"}
+            and isinstance(snapshot_manifest, dict)
+            and snapshot_manifest.get("protocol_valid")
+            and not artifact_storage["ready"]
+        ):
+            result_readiness = "artifact_storage_missing"
+        sync_state = {
+            "classification": "consistent",
+            "signature": None,
+            "consecutive": 0,
+            "observed_at": observed_at,
+        }
+        gates = {
+            "queue_releasable": False,
+            "result_ready": False,
+            "artifact_manifest_ready": False,
+            "artifact_storage": artifact_storage,
+            "raw_gate": execution_state.get("raw_gate"),
+            "blocked_reasons": [],
+        }
+        source_observations: list[dict[str, Any]] = []
+        if job and sweep and job.monitor.get("kind") != "single_run":
+            mismatches = list(execution_state.get("mismatches") or [])
+            contract = job.monitor.get("result_contract") if isinstance(job.monitor.get("result_contract"), dict) else {}
+            contract_expected = to_non_negative_int(contract.get("expected_runs"))
+            observed_expected = to_non_negative_int((execution_state.get("raw_gate") or {}).get("expected"))
+            if contract_expected > 0 and observed_expected != contract_expected:
+                mismatches.append(
+                    "wandb_expected_count_missing"
+                    if observed_expected == 0
+                    else "wandb_expected_count_contract_mismatch"
+                )
+            if execution_state.get("queue_releasable") and agent_health == "running":
+                mismatches.append("remote_process_alive_after_raw_complete")
+            elif execution_state.get("queue_releasable") and agent_health != "terminal":
+                mismatches.append("remote_process_unverified_after_raw_complete")
+            if execution_state.get("lifecycle") == "running" and agent_health == "missing":
+                mismatches.append("remote_process_missing_while_raw_active")
+            sync_state = update_sync_consistency(
+                job.monitor.get("sync_consistency"),
+                mismatches,
+                observed_at=observed_at,
+                consecutive_threshold=self.settings.sync_error_consecutive_threshold,
+                grace_seconds=self.settings.sync_error_grace_seconds,
+            )
+            queue_releasable = bool(execution_state.get("queue_releasable"))
+            blocked_reasons: list[str] = []
+            if mismatches:
+                queue_releasable = False
+                blocked_reasons.append("source_mismatch_reconciling")
+            if sync_state["classification"] == "sync_error":
+                queue_releasable = False
+                blocked_reasons.append("sync_error")
+            if execution_state.get("queue_releasable") and agent_health != "terminal":
+                queue_releasable = False
+                blocked_reasons.append("remote_process_not_terminal")
+            if sweep_attention or result_artifact_attention:
+                queue_releasable = False
+                blocked_reasons.append("attention")
+            result_state = derive_result_state({**execution_state, "queue_releasable": queue_releasable}, result_snapshot)
+            if result_state["artifact_manifest_ready"] and not artifact_storage["ready"]:
+                result_state["artifact_manifest_ready"] = False
+                result_state["result_ready"] = False
+            gates = {
+                "queue_releasable": queue_releasable,
+                "result_ready": result_state["result_ready"],
+                "artifact_manifest_ready": result_state["artifact_manifest_ready"],
+                "artifact_manifest": result_state["artifact_manifest"],
+                "artifact_storage": artifact_storage,
+                "raw_gate": execution_state.get("raw_gate"),
+                "blocked_reasons": blocked_reasons,
+            }
+            desired_status = execution_state["job_status"]
+            if sweep_attention or result_artifact_attention or sync_state["classification"] == "sync_error":
+                desired_status = JobStatus.attention
+            cached_status = compact_sweep_status(sweep, include_runs=True)
+            artifact_observed_at = str(
+                ((gates.get("artifact_manifest") or {}).get("generated_at") if isinstance(gates.get("artifact_manifest"), dict) else None)
+                or (result_snapshot.get("generated_at") if isinstance(result_snapshot, dict) else None)
+                or observed_at
+            )
+            artifact_freshness = timestamp_freshness(
+                artifact_observed_at,
+                observed_at,
+                max_age_seconds=self.settings.observation_fresh_seconds,
+            ) if isinstance(result_snapshot, dict) else "unavailable"
+            source_observations = [
+                {
+                    "source": "wandb",
+                    "reconcile_id": reconcile_id,
+                    "observed_at": observed_at,
+                    "freshness": "fresh",
+                    "payload": {
+                        "state": sweep.get("state"),
+                        "raw_run_state_counts": sweep.get("raw_run_state_counts"),
+                        "expected_run_count": sweep.get("expectedRunCount"),
+                        "consistency": sweep.get("run_state_counts_consistency"),
+                    },
+                },
+                {
+                    "source": "remote_process",
+                    "reconcile_id": reconcile_id,
+                    "observed_at": observed_at,
+                    "freshness": "fresh" if isinstance(agent_probe, dict) and not agent_probe.get("classification") else "unavailable",
+                    "payload": {"health": agent_health, "probe": compact_agent_probe(agent_probe)},
+                },
+                {
+                    "source": "artifact_manifest",
+                    "reconcile_id": reconcile_id,
+                    "observed_at": artifact_observed_at,
+                    "freshness": artifact_freshness,
+                    "payload": {
+                        "manifest": gates.get("artifact_manifest"),
+                        "storage": artifact_storage,
+                        "readiness": result_readiness,
+                    },
+                },
+                {
+                    "source": "ledger",
+                    "reconcile_id": reconcile_id,
+                    "observed_at": observed_at,
+                    "freshness": "fresh",
+                    "payload": {"status_before": ledger_status_before, "derived_status": desired_status.value},
+                },
+            ]
+            job = self.store.reconcile_job(
+                job,
+                desired_status,
+                {
+                    "last_wandb_status": cached_status,
+                    "sweep_attention_reasons": sweep_attention_reasons,
+                    "sync_consistency": sync_state,
+                    "execution_gates": gates,
+                    "reconcile": {
+                        "reconcile_id": reconcile_id,
+                        "observed_at": observed_at,
+                        "lifecycle": execution_state.get("lifecycle"),
+                        "ledger_status_before": ledger_status_before,
+                        "ledger_status_after": desired_status.value,
+                    },
+                },
+                source_observations,
+            )
         classification = "ok"
         next_actions: list[str] = []
         if missing_requested_job:
@@ -2367,6 +3182,9 @@ class ConsoleService:
         elif degraded:
             classification = "degraded"
             next_actions = ["稍后重试 status；如持续 degraded，检查 W&B/API 网络与本地 WANDB_API_KEY。"]
+        elif sync_state.get("classification") == "sync_error":
+            classification = "sync_error"
+            next_actions = ["多源状态持续不一致；队列已阻塞。检查 W&B run edges、远端进程和 artifact manifest 的 reconcile 证据。"]
         elif job and (job.status in {JobStatus.attention, JobStatus.failed} or agent_health in {"failed", "missing"}):
             classification = "attention"
             if job.monitor.get("kind") == "single_run":
@@ -2376,6 +3194,14 @@ class ConsoleService:
         elif sweep_attention:
             classification = "attention"
             next_actions = sweep_attention_reasons or ["检查 run 级失败诊断；如需要，修复远端代码/路径后重新 launch 或 recover-agents。"]
+        elif result_artifact_attention:
+            classification = "attention"
+            next_actions = next_actions_for_result_pull(str(result_for_readiness.get("classification") or ""))
+        elif execution_state.get("lifecycle") == "finalizing":
+            classification = "finalizing"
+            next_actions = ["等待 W&B raw run edges 与顶层 sweep 状态收敛；finalizing 期间不得推进队列。"]
+        elif job and job.status == JobStatus.finished and job.monitor.get("kind") != "single_run":
+            next_actions = list(MULTI_DATASET_TERMINAL_NEXT_ACTIONS)
         consistency_warnings = sweep_consistency_warnings(sweep) if sweep else []
         return {
             "stage": "done",
@@ -2405,15 +3231,45 @@ class ConsoleService:
                 "result_readiness": result_readiness,
                 "sweep_attention": sweep_attention,
                 "sweep_attention_reasons": sweep_attention_reasons,
+                "result_artifact_attention": result_artifact_attention,
+                "artifact_consistency": artifact_consistency,
+                "lifecycle": execution_state.get("lifecycle"),
+                "gates": gates,
+                "sync_consistency": sync_state,
+                "reconcile_id": reconcile_id,
+                "source_observations": [
+                    {
+                        "source": item["source"],
+                        "observed_at": item["observed_at"],
+                        "freshness": item["freshness"],
+                    }
+                    for item in source_observations
+                ],
                 "consistency_warnings": consistency_warnings,
                 "queue": queue_state,
             },
             "degraded": degraded,
+            "reconcile": {
+                "reconcile_id": reconcile_id,
+                "observed_at": observed_at,
+                "lifecycle": execution_state.get("lifecycle"),
+                "gates": gates,
+                "sync_consistency": sync_state,
+            },
             "next_actions": next_actions,
             "generated_at": utc_now(),
         }
 
     def _stop(self, payload: StopJobPayload, *, requested_by: str = "experiment-runner", operation_id: str | None = None, idempotency_key: str | None = None) -> tuple[dict[str, Any], JobRecord]:
+        with self._serialized_job(payload.job_id):
+            return self._stop_locked(
+                payload,
+                requested_by=requested_by,
+                operation_id=operation_id,
+                idempotency_key=idempotency_key,
+            )
+
+    def _stop_locked(self, payload: StopJobPayload, *, requested_by: str = "experiment-runner", operation_id: str | None = None, idempotency_key: str | None = None) -> tuple[dict[str, Any], JobRecord]:
         job = self._require_job(payload.job_id)
         is_single_run = job.monitor.get("kind") == "single_run"
         is_queued = job.status == JobStatus.queued
@@ -2489,7 +3345,13 @@ class ConsoleService:
             result["note"] = "Queued job had no W&B sweep or agents."
         elif payload.kill_agents:
             if is_single_run:
-                result["stop_run"] = self.ssh.stop_pids(host=job.remote_host, pids=job.agent_pids)
+                run_meta = job.monitor.get("run") if isinstance(job.monitor.get("run"), dict) else {}
+                result["stop_run"] = self.ssh.stop_pids(
+                    host=job.remote_host,
+                    pids=job.agent_pids,
+                    status_path=run_meta.get("status_path"),
+                    expected_job_id=job.job_id,
+                )
             else:
                 result["stop_agents"] = self.ssh.stop_agents(host=job.remote_host, sweep_path=f"{job.entity}/{job.project}/{job.sweep_id}", pids=job.agent_pids)
         job = self.store.update_job_status(job.job_id, JobStatus.cancelled, {"stop_result": result})
@@ -2607,6 +3469,15 @@ class ConsoleService:
         }
 
     def _recover(self, payload: RecoverAgentsPayload, *, requested_by: str = "experiment-runner", operation_id: str | None = None, idempotency_key: str | None = None) -> tuple[dict[str, Any], JobRecord]:
+        with self._serialized_job(payload.job_id):
+            return self._recover_locked(
+                payload,
+                requested_by=requested_by,
+                operation_id=operation_id,
+                idempotency_key=idempotency_key,
+            )
+
+    def _recover_locked(self, payload: RecoverAgentsPayload, *, requested_by: str = "experiment-runner", operation_id: str | None = None, idempotency_key: str | None = None) -> tuple[dict[str, Any], JobRecord]:
         job = self._require_job(payload.job_id)
         if not job.sweep_id or not job.entity or not job.project or not job.remote_host or not job.remote_cwd:
             raise ValueError("job lacks sweep/remote metadata required for recover")
@@ -2633,7 +3504,14 @@ class ConsoleService:
         conda_env = job.conda_env or self.settings.default_conda_env
         if conda_env and not job.conda_env:
             job.conda_env = conda_env
-        auth = self.ssh.auth_check(host=job.remote_host, remote_cwd=job.remote_cwd, sweep_path=sweep_path, wandb_api_key=wandb_api_key)
+        auth = self.ssh.auth_check(
+            host=job.remote_host,
+            remote_cwd=job.remote_cwd,
+            sweep_path=sweep_path,
+            wandb_api_key=wandb_api_key,
+            conda_env=conda_env,
+            conda_sh=payload.conda_sh,
+        )
         launches = [
             self.ssh.launch_agent(
                 host=job.remote_host,
@@ -2681,6 +3559,15 @@ class ConsoleService:
         }, job
 
     def _repair_watchdog(self, payload: RepairWatchdogPayload, *, requested_by: str = "experiment-runner", operation_id: str | None = None, idempotency_key: str | None = None) -> tuple[dict[str, Any], JobRecord]:
+        with self._serialized_job(payload.job_id):
+            return self._repair_watchdog_locked(
+                payload,
+                requested_by=requested_by,
+                operation_id=operation_id,
+                idempotency_key=idempotency_key,
+            )
+
+    def _repair_watchdog_locked(self, payload: RepairWatchdogPayload, *, requested_by: str = "experiment-runner", operation_id: str | None = None, idempotency_key: str | None = None) -> tuple[dict[str, Any], JobRecord]:
         job = self._require_job(payload.job_id)
         operation_id = operation_id or self._operation_identity(IntentType.repair_watchdog, payload.model_dump(mode="json"))[0]
         idempotency_key = idempotency_key or self._operation_identity(IntentType.repair_watchdog, payload.model_dump(mode="json"))[1]
@@ -2761,7 +3648,21 @@ class ConsoleService:
         }, job
 
     def _schedule_monitor(self, payload: ScheduleMonitorPayload, *, requested_by: str = "experiment-runner", operation_id: str | None = None, idempotency_key: str | None = None) -> tuple[dict[str, Any], JobRecord]:
+        with self._serialized_job(payload.job_id):
+            return self._schedule_monitor_locked(
+                payload,
+                requested_by=requested_by,
+                operation_id=operation_id,
+                idempotency_key=idempotency_key,
+            )
+
+    def _schedule_monitor_locked(self, payload: ScheduleMonitorPayload, *, requested_by: str = "experiment-runner", operation_id: str | None = None, idempotency_key: str | None = None) -> tuple[dict[str, Any], JobRecord]:
         job = self._require_job(payload.job_id)
+        self._require_production_monitor_binding(
+            result_contract=payload.result_contract or job.monitor.get("result_contract"),
+            thread_id=payload.thread_id,
+            operation="schedule-monitor",
+        )
         operation_id = operation_id or self._operation_identity(IntentType.schedule_monitor, payload.model_dump(mode="json"))[0]
         idempotency_key = idempotency_key or self._operation_identity(IntentType.schedule_monitor, payload.model_dump(mode="json"))[1]
         self._record_operation(
@@ -2776,27 +3677,18 @@ class ConsoleService:
             result={"stage": "accepted", "classification": "accepted", "job_id": job.job_id},
             retry_after_seconds=2,
         )
-        notify = dict(job.monitor.get("notify") or {})
-        if payload.notify_channel:
-            notify["channel"] = payload.notify_channel
-        if payload.notify_target:
-            notify["target"] = payload.notify_target
-        cron = dict(job.monitor.get("cron") or {})
-        cron_id = cron.get("cron_id") or f"exp-watchdog-{job.job_id}"
-        script = cron.get("script") or f"experiment-runner-watchdog-{job.job_id}.sh"
-        cron.update({
-            "cron_id": cron_id,
-            "script": script,
-            "every": payload.every,
-            "timeout_seconds": payload.timeout_seconds,
-            "command": f"experiment.py watchdog-once --job-id {job.job_id}",
-            "owner": "experiment_console",
-            "active": True,
-            "updated_at": utc_now(),
-        })
-        job.monitor["cron"] = cron
-        if notify:
-            job.monitor["notify"] = notify
+        interval_seconds = parse_monitor_interval(payload.every)
+        if payload.result_contract:
+            job.monitor["result_contract"] = payload.result_contract.model_dump(mode="json")
+        schedule = self.store.upsert_monitor_schedule(
+            job_id=job.job_id,
+            interval_seconds=interval_seconds,
+            timeout_seconds=payload.timeout_seconds,
+            thread_id=payload.thread_id,
+        )
+        job.monitor.pop("cron", None)
+        job.monitor.pop("notify", None)
+        job.monitor["monitor_schedule"] = compact_monitor_schedule(schedule)
         job.monitor["stage"] = "monitor_scheduled"
         job = self.store.upsert_job(job)
         self._record_operation(
@@ -2813,9 +3705,8 @@ class ConsoleService:
                 "classification": "monitor_scheduled",
                 "success": True,
                 "job_id": job.job_id,
-                "cron": cron,
-                "notify": notify,
-                "next_actions": ["Hermes/cron 调度由 Console metadata 驱动；runner 不再创建本地 job store cron。"],
+                "monitor_schedule": compact_monitor_schedule(schedule),
+                "next_actions": ["Console monitor worker will reconcile this job without model calls and emit only deduplicated actionable events."],
             },
         )
         return {
@@ -2823,12 +3714,20 @@ class ConsoleService:
             "classification": "monitor_scheduled",
             "success": True,
             "job_id": job.job_id,
-            "cron": cron,
-            "notify": notify,
-            "next_actions": ["Hermes/cron 调度由 Console metadata 驱动；runner 不再创建本地 job store cron。"],
+            "monitor_schedule": compact_monitor_schedule(schedule),
+            "next_actions": ["Console monitor worker will reconcile this job without model calls and emit only deduplicated actionable events."],
         }, job
 
     def _unschedule_monitor(self, payload: UnscheduleMonitorPayload, *, requested_by: str = "experiment-runner", operation_id: str | None = None, idempotency_key: str | None = None) -> tuple[dict[str, Any], JobRecord]:
+        with self._serialized_job(payload.job_id):
+            return self._unschedule_monitor_locked(
+                payload,
+                requested_by=requested_by,
+                operation_id=operation_id,
+                idempotency_key=idempotency_key,
+            )
+
+    def _unschedule_monitor_locked(self, payload: UnscheduleMonitorPayload, *, requested_by: str = "experiment-runner", operation_id: str | None = None, idempotency_key: str | None = None) -> tuple[dict[str, Any], JobRecord]:
         job = self._require_job(payload.job_id)
         operation_id = operation_id or self._operation_identity(IntentType.unschedule_monitor, payload.model_dump(mode="json"))[0]
         idempotency_key = idempotency_key or self._operation_identity(IntentType.unschedule_monitor, payload.model_dump(mode="json"))[1]
@@ -2844,14 +3743,13 @@ class ConsoleService:
             result={"stage": "accepted", "classification": "accepted", "job_id": job.job_id},
             retry_after_seconds=2,
         )
-        cron = dict(job.monitor.get("cron") or {})
-        had_cron = bool(cron)
-        cron.update({
-            "active": False,
-            "unscheduled_at": utc_now(),
-            "owner": cron.get("owner") or "experiment_console",
-        })
-        job.monitor["cron"] = cron
+        schedule, was_active = self.store.disable_monitor_schedule(job.job_id)
+        job.monitor.pop("cron", None)
+        job.monitor.pop("notify", None)
+        if schedule:
+            job.monitor["monitor_schedule"] = compact_monitor_schedule(schedule)
+        else:
+            job.monitor.pop("monitor_schedule", None)
         job.monitor["stage"] = "monitor_unscheduled"
         job = self.store.upsert_job(job)
         self._record_operation(
@@ -2861,27 +3759,36 @@ class ConsoleService:
             requested_by=requested_by,
             idempotency_key=idempotency_key,
             stage="done",
-            classification="monitor_unscheduled" if had_cron else "monitor_not_scheduled",
+            classification="monitor_unscheduled" if was_active else "monitor_not_scheduled",
             status=OperationStatus.succeeded.value,
             result={
                 "stage": "done",
-                "classification": "monitor_unscheduled" if had_cron else "monitor_not_scheduled",
+                "classification": "monitor_unscheduled" if was_active else "monitor_not_scheduled",
                 "success": True,
                 "job_id": job.job_id,
-                "cron": cron,
-                "idempotent": not had_cron,
+                "monitor_schedule": compact_monitor_schedule(schedule) if schedule else None,
+                "idempotent": not was_active,
             },
         )
         return {
             "stage": "done",
-            "classification": "monitor_unscheduled" if had_cron else "monitor_not_scheduled",
+            "classification": "monitor_unscheduled" if was_active else "monitor_not_scheduled",
             "success": True,
             "job_id": job.job_id,
-            "cron": cron,
-            "idempotent": not had_cron,
+            "monitor_schedule": compact_monitor_schedule(schedule) if schedule else None,
+            "idempotent": not was_active,
         }, job
 
     def _watchdog_once(self, payload: WatchdogOncePayload, *, requested_by: str = "experiment-runner", operation_id: str | None = None, idempotency_key: str | None = None) -> dict[str, Any]:
+        with self._serialized_job(payload.job_id):
+            return self._watchdog_once_locked(
+                payload,
+                requested_by=requested_by,
+                operation_id=operation_id,
+                idempotency_key=idempotency_key,
+            )
+
+    def _watchdog_once_locked(self, payload: WatchdogOncePayload, *, requested_by: str = "experiment-runner", operation_id: str | None = None, idempotency_key: str | None = None) -> dict[str, Any]:
         status_result = self._status(StatusQueryPayload(job_id=payload.job_id))
         job = status_result.get("job") or {}
         sweep = status_result.get("sweep") or {}
@@ -2892,26 +3799,35 @@ class ConsoleService:
         agent_health = str(state.get("agent_health") or "unknown").lower()
         sweep_attention = bool(state.get("sweep_attention"))
         sweep_attention_reasons = state.get("sweep_attention_reasons") or []
+        reconcile = status_result.get("reconcile") if isinstance(status_result.get("reconcile"), dict) else {}
+        gates = reconcile.get("gates") if isinstance(reconcile.get("gates"), dict) else {}
+        sync_consistency = reconcile.get("sync_consistency") if isinstance(reconcile.get("sync_consistency"), dict) else {}
         run_count = sweep.get("runCount")
         expected = sweep.get("expectedRunCount")
-        is_terminal = job_status in {"finished", "failed", "cancelled"} or sweep_state in {"finished", "failed", "cancelled"}
-        is_attention = bool(degraded) or sweep_attention or job_status in {"attention", "failed"} or sweep_state in {"failed", "crashed", "killed"} or agent_health in {"missing", "degraded"}
-        is_running = job_status == "running" or sweep_state == "running"
+        queue_releasable = bool(gates.get("queue_releasable"))
+        result_ready = bool(gates.get("result_ready"))
+        is_terminal = queue_releasable
+        is_attention = bool(degraded) or sweep_attention or sync_consistency.get("classification") == "sync_error" or job_status in {"attention", "failed"} or sweep_state in {"failed", "crashed", "killed"} or agent_health in {"missing", "degraded"}
+        is_running = job_status in {"running", "finalizing"} or sweep_state in {"running", "finished"}
         classification = "healthy_running"
         silent = True
         event = "healthy"
         message = ""
-        if is_terminal:
-            classification = "terminal"
-            event = "terminal"
+        if result_ready:
+            classification = "result_ready"
+            event = "result_ready"
             silent = False
-            message = f"job {payload.job_id} terminal: job={job_status}, sweep={sweep_state or '-'}"
+            message = f"job {payload.job_id} results ready: raw execution and artifact manifest gates satisfied"
         elif is_attention:
-            classification = "attention"
-            event = "attention"
+            classification = "sync_error" if sync_consistency.get("classification") == "sync_error" else "attention"
+            event = classification
             silent = False
             reason_text = "; ".join(str(item) for item in sweep_attention_reasons) if sweep_attention_reasons else degraded or "-"
             message = f"job {payload.job_id} needs attention: job={job_status}, sweep={sweep_state or '-'}, degraded={reason_text}"
+        elif is_terminal:
+            classification = "execution_complete"
+            event = "execution_complete"
+            silent = True
         elif not is_running:
             classification = "unknown"
             event = "unknown"
@@ -2932,12 +3848,16 @@ class ConsoleService:
             "sweep_attention": sweep_attention,
             "sweep_attention_reasons": sweep_attention_reasons,
             "terminal_disable_requested": payload.terminal_disable,
+            "queue_releasable": queue_releasable,
+            "result_ready": result_ready,
+            "sync_consistency": sync_consistency,
             "operation": status_result.get("operation"),
             "operation_history": status_result.get("operation_history"),
             "failure_diagnostics": status_result.get("failure_diagnostics"),
+            "next_actions": status_result.get("next_actions"),
             "status_result": status_result,
         }
-        if is_terminal:
+        if queue_releasable:
             queue_group = ((status_result.get("queue") or {}).get("queue_group") if isinstance(status_result.get("queue"), dict) else None)
             if queue_group:
                 result["queue_advance"] = self._advance_queue(
@@ -2967,6 +3887,214 @@ class ConsoleService:
             )
             self.store.upsert_job(job_record)
         return result
+
+    def monitor_tick(self, job_id: str) -> dict[str, Any]:
+        with self._serialized_job(job_id):
+            return self._monitor_tick_locked(job_id)
+
+    def _monitor_tick_locked(self, job_id: str) -> dict[str, Any]:
+        """Run one deterministic monitor cycle without involving an agent."""
+        status_result = self._status(StatusQueryPayload(job_id=job_id))
+        job = self._require_job(job_id)
+        reconcile = status_result.get("reconcile") if isinstance(status_result.get("reconcile"), dict) else {}
+        gates = reconcile.get("gates") if isinstance(reconcile.get("gates"), dict) else {}
+        queue_advance = None
+        artifact_sync = None
+        actionable_kind = None
+        actionable_classification = None
+        summary = ""
+        artifact_episode_id = ((job.monitor.get("artifact_consistency") or {}).get("episode_id") if isinstance(job.monitor.get("artifact_consistency"), dict) else None)
+        external_mismatches = ["wandb_status_unavailable"] if status_result.get("classification") == "degraded" else []
+        previous_external_consistency = job.monitor.get("external_consistency") if isinstance(job.monitor.get("external_consistency"), dict) else None
+        external_consistency = update_sync_consistency(
+            previous_external_consistency,
+            external_mismatches,
+            observed_at=utc_now(),
+            consecutive_threshold=self.settings.monitor_external_error_consecutive_threshold,
+            grace_seconds=self.settings.monitor_external_error_grace_seconds,
+        )
+        if external_mismatches or previous_external_consistency:
+            job.monitor["external_consistency"] = external_consistency
+            self.store.upsert_job(job)
+
+        raw_gate = gates.get("raw_gate") if isinstance(gates.get("raw_gate"), dict) else {}
+        raw_execution_complete = bool(raw_gate.get("satisfied"))
+        if gates.get("queue_releasable"):
+            queue_state = status_result.get("queue") if isinstance(status_result.get("queue"), dict) else {}
+            queue_group = queue_state.get("queue_group")
+            if queue_group:
+                queue_advance = self._advance_queue(AdvanceQueuePayload(queue_group=str(queue_group)), requested_by="console-monitor")
+
+        if raw_execution_complete and not gates.get("result_ready"):
+            contract = job.monitor.get("result_contract") if isinstance(job.monitor.get("result_contract"), dict) else None
+            if not contract:
+                actionable_kind = "attention"
+                actionable_classification = "artifact_contract_missing"
+                summary = f"job {job_id} execution completed without a result contract"
+            else:
+                try:
+                    contract = ResultContract.model_validate(contract).model_dump(mode="json")
+                except Exception as exc:
+                    actionable_kind = "sync_error"
+                    actionable_classification = "artifact_contract_invalid"
+                    summary = f"job {job_id} result contract is invalid: {compact_error(exc)}"
+            if contract and not actionable_kind and to_non_negative_int(contract.get("expected_runs")) != to_non_negative_int(raw_gate.get("expected")):
+                actionable_kind = "sync_error"
+                actionable_classification = "artifact_contract_expected_mismatch"
+                summary = f"job {job_id} result contract does not match authoritative raw expected count"
+            elif contract and not actionable_kind:
+                artifact_sync = self._pull_results(PullResultsPayload(
+                        job_id=job_id,
+                        max_runs=to_non_negative_int(contract.get("max_runs") or contract.get("expected_runs")),
+                        metric_keys=list(contract.get("metric_keys") or []),
+                        group_keys=list(contract.get("group_keys") or []),
+                        metric_paths=list(contract.get("metric_paths") or []),
+                        group_paths=list(contract.get("group_paths") or []),
+                        output_globs=list(contract.get("output_globs") or []),
+                        discovery_mode=str(contract.get("discovery_mode") or "run_id_output_globs_v1"),
+                        comparison_paths=list(contract.get("comparison_paths") or []),
+                        matrix_by=list(contract.get("matrix_by") or []),
+                        allow_partial=False,
+                        export_artifacts=True,
+                ), requested_by="console-monitor")
+                status_result = self._status(StatusQueryPayload(job_id=job_id))
+                reconcile = status_result.get("reconcile") if isinstance(status_result.get("reconcile"), dict) else {}
+                gates = reconcile.get("gates") if isinstance(reconcile.get("gates"), dict) else {}
+                if gates.get("result_ready"):
+                    refreshed_job = self._require_job(job_id)
+                    refreshed_job.monitor["artifact_consistency"] = update_sync_consistency(
+                            refreshed_job.monitor.get("artifact_consistency"),
+                            [],
+                            observed_at=utc_now(),
+                            consecutive_threshold=self.settings.artifact_sync_error_consecutive_threshold,
+                            grace_seconds=self.settings.artifact_sync_error_grace_seconds,
+                    )
+                    self.store.upsert_job(refreshed_job)
+                    actionable_kind = "result_ready"
+                    actionable_classification = "result_ready"
+                    summary = f"job {job_id} final artifact manifest is complete and validated"
+                else:
+                    refreshed_job = self._require_job(job_id)
+                    artifact_state = update_sync_consistency(
+                            refreshed_job.monitor.get("artifact_consistency"),
+                            [str(artifact_sync.get("classification") or "artifact_manifest_incomplete")],
+                            observed_at=utc_now(),
+                            consecutive_threshold=self.settings.artifact_sync_error_consecutive_threshold,
+                            grace_seconds=self.settings.artifact_sync_error_grace_seconds,
+                    )
+                    refreshed_job.monitor["artifact_consistency"] = artifact_state
+                    artifact_episode_id = artifact_state.get("episode_id")
+                    self.store.upsert_job(refreshed_job)
+                    if artifact_state["classification"] == "sync_error":
+                        actionable_kind = "sync_error"
+                        actionable_classification = "artifact_sync_error"
+                        summary = f"job {job_id} final artifacts remain incomplete after the production grace window"
+
+        sync_consistency = reconcile.get("sync_consistency") if isinstance(reconcile.get("sync_consistency"), dict) else {}
+        if sync_consistency.get("classification") == "sync_error":
+            actionable_kind = "sync_error"
+            actionable_classification = "sync_error"
+            summary = f"job {job_id} source observations remain inconsistent"
+        elif external_consistency.get("classification") == "sync_error" and not actionable_kind:
+            actionable_kind = "sync_error"
+            actionable_classification = "external_unavailable"
+            summary = f"job {job_id} external status remains unavailable after the production grace window"
+        elif status_result.get("classification") == "attention" and not actionable_kind:
+            actionable_kind = "attention"
+            actionable_classification = "attention"
+            summary = f"job {job_id} requires control-plane attention"
+
+        queue_failures = []
+        if isinstance(queue_advance, dict):
+            queue_failures = [
+                item
+                for section in ["advanced", "unblocked"]
+                for item in (queue_advance.get(section) or [])
+                if isinstance(item, dict) and (
+                    item.get("classification") in {"queued_payload_missing", "validation_failed", "control_plane_error"}
+                    or item.get("stage") in {"failed", "validation_failed", "preflight_failed", "agent_launch_failed"}
+                )
+            ]
+        if queue_failures:
+            actionable_kind = "queue_failure"
+            actionable_classification = "queue_failure"
+            summary = f"job {job_id} released its queue but the next authorized job failed to start"
+
+        wake_event = None
+        event_created = False
+        monitor_disabled = False
+        if actionable_kind:
+            fingerprint_payload = {
+                "job_id": job_id,
+                "kind": actionable_kind,
+                "classification": actionable_classification,
+                "sync_signature": sync_consistency.get("signature"),
+                "sync_episode_id": sync_consistency.get("episode_id"),
+                "external_episode_id": external_consistency.get("episode_id"),
+                "artifact_episode_id": artifact_episode_id,
+                "manifest_sha256": ((gates.get("artifact_manifest") or {}).get("manifest_sha256") if isinstance(gates.get("artifact_manifest"), dict) else None),
+                "queue_failures": [item.get("job_id") for item in queue_failures],
+            }
+            fingerprint = hashlib.sha256(json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+            schedule = self.store.get_monitor_schedule(job_id) or {}
+            wake_event, event_created = self.store.enqueue_wake_event(
+                dedupe_key=f"{job_id}:{actionable_kind}:{fingerprint}",
+                job_id=job_id,
+                thread_id=schedule.get("thread_id"),
+                kind=actionable_kind,
+                summary=summary,
+                payload={
+                    "classification": actionable_classification,
+                    "reconcile": reconcile,
+                    "external_consistency": external_consistency,
+                    "queue_failure": queue_failures,
+                    "artifact_sync": summarize_result_pull(artifact_sync) if isinstance(artifact_sync, dict) else None,
+                },
+            )
+            wake_event = {key: value for key, value in wake_event.items() if key != "dedupe_key"}
+            if actionable_kind in {"result_ready", "queue_failure"} and gates.get("result_ready"):
+                _, monitor_disabled = self.store.disable_monitor_schedule(job_id)
+        return {
+            "job_id": job_id,
+            "classification": actionable_classification or str(status_result.get("classification") or "healthy"),
+            "status": status_result,
+            "queue_advance": queue_advance,
+            "artifact_sync": summarize_result_pull(artifact_sync) if isinstance(artifact_sync, dict) else None,
+            "wake_event": wake_event,
+            "event_created": event_created,
+            "monitor_disabled": monitor_disabled,
+            "silent": not event_created,
+        }
+
+    def artifact_download_path(self, snapshot_id: str) -> Path:
+        if not snapshot_id or safe_filename(snapshot_id, "") != snapshot_id or "/" in snapshot_id or "\\" in snapshot_id:
+            raise ValueError("invalid snapshot_id")
+        results_root = self.settings.results_dir.resolve()
+        matches = [path for path in self.settings.results_dir.glob(f"*/{snapshot_id}") if path.is_dir() and not path.is_symlink()]
+        if len(matches) != 1:
+            raise KeyError(f"artifact bundle not found: {snapshot_id}")
+        bundle_dir = matches[0].resolve()
+        if results_root not in bundle_dir.parents:
+            raise ValueError("artifact bundle escaped results_dir")
+        snapshot_path = bundle_dir.parent / f"{snapshot_id}.json"
+        summary_path = bundle_dir / "summary.json"
+        if not snapshot_path.is_file() or not summary_path.is_file():
+            raise ValueError("artifact bundle is incomplete")
+        download_dir = self.settings.results_dir / ".downloads"
+        download_dir.mkdir(parents=True, exist_ok=True)
+        target = download_dir / f"{snapshot_id}.zip"
+        temporary = download_dir / f".{snapshot_id}.{os.getpid()}.tmp"
+        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.write(snapshot_path, "result_snapshot.json")
+            for path in sorted(bundle_dir.rglob("*")):
+                if path.is_symlink() or not path.is_file():
+                    continue
+                resolved = path.resolve()
+                if bundle_dir not in resolved.parents:
+                    raise ValueError("artifact bundle contains an unsafe path")
+                archive.write(resolved, str(resolved.relative_to(bundle_dir)))
+        os.replace(temporary, target)
+        return target
 
     def _preflight(self, payload: PreflightPayload) -> dict[str, Any]:
         conda_env = payload.conda_env or self.settings.default_conda_env
@@ -3022,9 +4150,29 @@ class ConsoleService:
             remote_cwd=remote_cwd,
             sweep_path=sweep_path,
             wandb_api_key=self._wandb_api_key(),
+            conda_env=(job.conda_env if job else None) or self.settings.default_conda_env,
+            conda_sh=self.settings.default_conda_sh,
         )
 
     def _pull_results(self, payload: PullResultsPayload, *, requested_by: str = "experiment-runner", operation_id: str | None = None, idempotency_key: str | None = None) -> dict[str, Any]:
+        if payload.job_id:
+            with self._serialized_job(payload.job_id):
+                return self._pull_results_locked(
+                    payload,
+                    requested_by=requested_by,
+                    operation_id=operation_id,
+                    idempotency_key=idempotency_key,
+                )
+        return self._pull_results_locked(
+            payload,
+            requested_by=requested_by,
+            operation_id=operation_id,
+            idempotency_key=idempotency_key,
+        )
+
+    def _pull_results_locked(self, payload: PullResultsPayload, *, requested_by: str = "experiment-runner", operation_id: str | None = None, idempotency_key: str | None = None) -> dict[str, Any]:
+        if self.settings.authority_role == "authoritative" and payload.artifact_dir is not None:
+            raise ValueError("authoritative Console never accepts artifact_dir; download the snapshot bundle through the artifact API")
         job = self.store.get_job(payload.job_id) if payload.job_id else None
         entity = payload.entity or (job.entity if job else None) or self.settings.default_entity
         project = payload.project or (job.project if job else None) or self.settings.default_project
@@ -3119,6 +4267,7 @@ class ConsoleService:
                         "comparison_summaries": enriched.get("comparison_summaries"),
                         "metric_matrix": enriched.get("metric_matrix"),
                         "artifact_bundle": enriched.get("artifact_bundle"),
+                        "next_actions": enriched.get("next_actions"),
                     },
                 )
                 self.store.upsert_job(job)
@@ -3171,6 +4320,7 @@ class ConsoleService:
         try:
             try:
                 sweep = self.wandb.get_sweep_state(entity, project, sweep_id)
+                sweep_state = sweep.get("state")
                 all_run_ids = [
                     str(run.get("name"))
                     for run in (sweep.get("runs") or [])
@@ -3186,6 +4336,7 @@ class ConsoleService:
                 expected_runs = None
                 discovered_runs = len(run_ids) if run_ids else None
                 run_id_source = "cached_wandb_status"
+                sweep_state = None
             ssh_max_runs = payload.max_runs if payload.max_runs is not None else max(len(run_ids), 1)
             result = self.ssh.pull_results(
                 host=remote_host,
@@ -3199,10 +4350,12 @@ class ConsoleService:
                 metric_paths=payload.metric_paths,
                 group_paths=payload.group_paths,
                 output_globs=payload.output_globs,
+                discovery_mode=payload.discovery_mode,
                 comparison_paths=payload.comparison_paths,
                 include_raw_artifacts=bool(payload.export_artifacts or payload.artifact_dir),
             )
             result["run_id_source"] = run_id_source
+            result["sweep_state"] = sweep_state
             return finalize_result(
                 result,
                 expected_runs=expected_runs,
@@ -3280,6 +4433,7 @@ class ConsoleService:
             "entity": entity,
             "project": project,
             "sweep_id": sweep_id,
+            "sweep_state": sweep.get("state"),
             "rows": rows,
             "valid_results": sum(1 for row in rows if row["has_scientific_result"]),
             "missing_results": sum(1 for row in rows if not row["has_scientific_result"]),
@@ -3303,7 +4457,7 @@ class ConsoleService:
         return run_ids
 
     def _wandb_api_key(self) -> str | None:
-        return os.environ.get(self.settings.wandb_api_key_env)
+        return self.settings.wandb_api_key()
 
     def overview(self) -> dict[str, Any]:
         jobs = self.store.list_jobs()
@@ -3524,8 +4678,69 @@ def summarize_result_pull(result: dict[str, Any]) -> dict[str, Any]:
         "metric_summaries": result.get("metric_summaries"),
         "comparison_summaries": result.get("comparison_summaries"),
         "metric_matrix": result.get("metric_matrix"),
+        "next_actions": result.get("next_actions"),
         "artifact_bundle": result.get("artifact_bundle"),
+        "artifact_manifest": result.get("artifact_manifest"),
         "generated_at": utc_now(),
+    }
+
+
+def result_contract_dict(contract: Any, validation: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    if contract is not None:
+        if hasattr(contract, "model_dump"):
+            return contract.model_dump(mode="json")
+        if isinstance(contract, dict):
+            return dict(contract)
+    return None
+
+
+def parse_monitor_interval(value: str) -> int:
+    text = str(value or "").strip().lower()
+    multipliers = {"s": 1, "m": 60, "h": 3600}
+    if len(text) < 2 or text[-1] not in multipliers:
+        raise ValueError("monitor interval must use Ns, Nm, or Nh")
+    try:
+        amount = int(text[:-1])
+    except ValueError as exc:
+        raise ValueError("monitor interval must use Ns, Nm, or Nh") from exc
+    seconds = amount * multipliers[text[-1]]
+    if seconds < 5:
+        raise ValueError("monitor interval must be at least 5 seconds")
+    return seconds
+
+
+def timestamp_freshness(source_at: str, reconcile_at: str, *, max_age_seconds: int) -> str:
+    try:
+        source = datetime.fromisoformat(str(source_at).replace("Z", "+00:00"))
+        current = datetime.fromisoformat(str(reconcile_at).replace("Z", "+00:00"))
+        if source.tzinfo is None:
+            source = source.replace(tzinfo=timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        return "fresh" if (current - source).total_seconds() <= max(0, max_age_seconds) else "stale"
+    except Exception:
+        return "unknown"
+
+
+def compact_monitor_schedule(schedule: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(schedule, dict):
+        return None
+    return {
+        key: schedule.get(key)
+        for key in [
+            "job_id",
+            "interval_seconds",
+            "timeout_seconds",
+            "thread_id",
+            "active",
+            "next_run_at",
+            "last_started_at",
+            "last_finished_at",
+            "last_classification",
+            "last_error",
+            "updated_at",
+        ]
+        if key in schedule
     }
 
 
@@ -3559,6 +4774,14 @@ def should_collect_failure_diagnostics(
     if sweep_state in {"failed", "crashed", "killed"}:
         return True
     return agent_health in {"missing", "failed", "degraded"}
+
+
+def terminal_result_artifact_attention(sweep: dict[str, Any] | None, result: dict[str, Any] | None) -> bool:
+    if not isinstance(sweep, dict) or not isinstance(result, dict):
+        return False
+    if str(sweep.get("state") or "").lower() not in TERMINAL_SWEEP_STATES:
+        return False
+    return result.get("classification") == "terminal_runs_missing_result_artifacts"
 
 
 def sweep_requires_attention(sweep: dict[str, Any], result_pull: dict[str, Any] | None = None) -> tuple[bool, list[str]]:
@@ -3653,7 +4876,12 @@ def compact_job_record(job: JobRecord) -> dict[str, Any]:
         "last_result_pull",
         "last_result_snapshot",
         "last_watchdog",
-        "cron",
+        "monitor_schedule",
+        "result_contract",
+        "execution_gates",
+        "sync_consistency",
+        "artifact_consistency",
+        "reconcile",
         "watchdog",
         "kind",
         "run",
@@ -3701,6 +4929,22 @@ def compact_job_record(job: JobRecord) -> dict[str, Any]:
     }
 
 
+def compact_sweep_receipt(sweep: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: sweep.get(key)
+        for key in ["sweep_id", "entity", "project", "remote_config_path"]
+        if sweep.get(key) is not None
+    }
+
+
+def compact_agent_launch(launch: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: launch.get(key)
+        for key in ["host", "gpu_index", "pid", "log", "sweep_path", "conda_env", "classification"]
+        if launch.get(key) is not None
+    }
+
+
 def compact_operation(operation: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(operation, dict):
         return None
@@ -3733,11 +4977,25 @@ def compact_operation(operation: dict[str, Any] | None) -> dict[str, Any] | None
         "comparison_summaries",
         "metric_matrix",
         "artifact_bundle",
+        "artifact_manifest",
+        "snapshot",
+        "queue",
+        "monitor_schedule",
+        "agent_launches",
+        "existing_job_id",
     ]:
         if key in result:
-            compact_result[key] = compact_failure_diagnostics(result[key]) if key == "failure_diagnostics" else result[key]
+            if key == "failure_diagnostics":
+                compact_result[key] = compact_failure_diagnostics(result[key])
+            elif key == "agent_launches" and isinstance(result[key], list):
+                compact_result[key] = [compact_agent_launch(item) for item in result[key] if isinstance(item, dict)][:32]
+            else:
+                compact_result[key] = result[key]
     if "sweep" in result and isinstance(result["sweep"], dict):
-        compact_result["sweep"] = compact_sweep_status(result["sweep"], include_runs=True)
+        if result["sweep"].get("sweep_id"):
+            compact_result["sweep"] = compact_sweep_receipt(result["sweep"])
+        else:
+            compact_result["sweep"] = compact_sweep_status(result["sweep"], include_runs=True)
     if "auth" in result and isinstance(result["auth"], dict):
         compact_result["auth"] = {
             key: result["auth"].get(key)
@@ -3794,6 +5052,7 @@ def compact_sweep_status(sweep: dict[str, Any], *, include_runs: bool = False) -
         "last_sync_at": sweep.get("last_sync_at"),
         "speed_per_hour": sweep.get("speed_per_hour"),
         "eta_seconds": sweep.get("eta_seconds"),
+        "progress_evidence": sweep.get("progress_evidence"),
     }
     if include_runs:
         runs = []
@@ -3825,7 +5084,7 @@ def parse_wandb_json_field(value: Any) -> dict[str, Any]:
 def sweep_consistency_warnings(sweep: dict[str, Any]) -> list[str]:
     consistency = sweep.get("run_state_counts_consistency")
     if consistency == "terminal_run_edges_stale":
-        return ["W&B sweep 已终态，但 run edge 状态仍滞后；Console 已使用终态规范化计数。"]
+        return ["W&B sweep 已终态，但 raw run edges 尚未收敛；Console 保留原始计数并将 job 置为 finalizing。"]
     return []
 
 

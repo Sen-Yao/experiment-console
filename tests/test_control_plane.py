@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import threading
+from pathlib import Path
 
 import pytest
 
 from experiment_console.config import Settings
-from experiment_console.models import AuditEvent, ConfirmRequest, IntentPreviewRequest, IntentType, JobRecord, JobStatus, PullResultsPayload
+from experiment_console.models import AuditEvent, ConfirmRequest, IntentPreviewRequest, IntentType, JobRecord, JobStatus, PullResultsPayload, RepairWatchdogPayload, StatusQueryPayload
 from experiment_console.redaction import redact_value
 from experiment_console.service import ConsoleService
+from experiment_console.monitor import MonitorWorker
 from experiment_console.state import InvalidTransition, validate_job_transition
 from experiment_console.store import ConsoleStore
 
@@ -183,13 +186,13 @@ class FakeSSH:
             command={"stdout": "ok"},
         )
 
-    def stop_pids(self, *, host, pids):
+    def stop_pids(self, *, host, pids, status_path=None, expected_job_id=None):
         return {"host": host, "stopped_pids": list(pids), "missing_pids": [], "still_running_pids": []}
 
     def stop_agents(self, *, host, sweep_path, pids=None):
         return {"host": host, "stopped_pids": list(pids or ["1000"]), "sweep_path": sweep_path}
 
-    def auth_check(self, *, host, remote_cwd, sweep_path, wandb_api_key):
+    def auth_check(self, *, host, remote_cwd, sweep_path, wandb_api_key, conda_env=None, conda_sh=None):
         return {"ok": bool(wandb_api_key), "classification": "auth_ok" if wandb_api_key else "wandb_auth_missing"}
 
     def preflight(self, *, host, remote_cwd, conda_env=None, conda_sh="/opt/anaconda3/etc/profile.d/conda.sh", config_path=None):
@@ -210,7 +213,7 @@ class FakeSSH:
             "timeout_seconds": timeout_seconds,
         }
 
-    def pull_results(self, *, host, remote_cwd, sweep_id, run_ids, budget_seconds, max_runs, metric_keys, group_keys, metric_paths=None, group_paths=None, output_globs=None, comparison_paths=None, include_raw_artifacts=False):
+    def pull_results(self, *, host, remote_cwd, sweep_id, run_ids, budget_seconds, max_runs, metric_keys, group_keys, metric_paths=None, group_paths=None, output_globs=None, discovery_mode="legacy_auto_v1", comparison_paths=None, include_raw_artifacts=False):
         self.pull_results_calls.append({
             "host": host,
             "remote_cwd": remote_cwd,
@@ -232,6 +235,7 @@ class FakeSSH:
             if index == 0:
                 metrics.update({"semantic_token_dim": 256, "rwse_token_steps": 0})
             rows.append({"run_id": run_id, "metrics": metrics, "config": {}, "has_scientific_result": True})
+        selected_run_ids = [row["run_id"] for row in rows]
         return {
             "source": "remote_local_files",
             "sweep_id": sweep_id,
@@ -240,6 +244,19 @@ class FakeSSH:
             "missing_results": 0,
             "failed_results": 0,
             "partial": False,
+            "discovery_sources": {
+                run_id: {"selected_paths": [f"{remote_cwd}/outputs/result_{run_id}.json"], "classification": "ok"}
+                for run_id in selected_run_ids
+            },
+            "raw_artifacts": [
+                {
+                    "run_id": run_id,
+                    "path": f"{remote_cwd}/outputs/result_{run_id}.json",
+                    "basename": f"result_{run_id}.json",
+                    "content": {"run_id": run_id, "final_test_auc": 0.8},
+                }
+                for run_id in selected_run_ids
+            ] if include_raw_artifacts else [],
         }
 
     def pull_single_run_result(self, *, host, status_path, result_path, metric_keys, group_keys):
@@ -1100,6 +1117,182 @@ def test_launch_sweep_reuses_only_existing_sweep_job(tmp_path):
     assert replay.result["job"]["sweep_id"] == "abc123"
 
 
+def test_stale_creating_sweep_without_receipt_fails_closed_once(tmp_path):
+    class CrashAfterRemoteCreateSSH(FakeSSH):
+        def create_sweep(self, **kwargs):
+            super().create_sweep(**kwargs)
+            raise SystemExit("simulated process loss after remote W&B create")
+
+    settings = Settings(
+        state_dir=tmp_path,
+        default_entity="my-team",
+        default_project="my-project",
+        authority_role="authoritative",
+    )
+    ssh = CrashAfterRemoteCreateSSH()
+    payload = {
+        "job_name": "crash-during-create",
+        "config_path": write_sweep_config(tmp_path / "crash-create.yaml"),
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "idempotency_key": "crash-during-create",
+        "thread_id": "thread-crash-create",
+        "result_contract": {
+            "expected_runs": 5,
+            "output_globs": ["outputs/cora_{run_id}.json"],
+            "discovery_mode": "run_id_output_globs_v1",
+        },
+    }
+    first_service = ConsoleService(
+        settings=settings,
+        store=ConsoleStore(settings.sqlite_path, settings.audit_path),
+        wandb=FakeWandB(),
+        ssh=ssh,
+    )
+
+    with pytest.raises(SystemExit, match="simulated process loss"):
+        first_service.runner_command(IntentType.launch_sweep, payload)
+
+    interrupted = first_service.store.find_job_by_idempotency_key("crash-during-create")
+    assert interrupted is not None
+    assert interrupted.sweep_id is None
+    assert interrupted.monitor["launch"]["phase"] == "creating_sweep"
+    assert interrupted.operation_log[-1]["stage"] == "creating_sweep"
+    assert ssh.created_sweeps == 1
+
+    restarted = ConsoleService(
+        settings=settings,
+        store=ConsoleStore(settings.sqlite_path, settings.audit_path),
+        wandb=FakeWandB(),
+        ssh=ssh,
+    )
+    first_replay = restarted.runner_command(IntentType.launch_sweep, payload)
+    second_replay = restarted.runner_command(IntentType.launch_sweep, payload)
+    events = restarted.store.claim_wake_events(consumer_id="bridge", limit=10, lease_seconds=60)
+
+    assert first_replay.classification == "launch_outcome_unknown"
+    assert second_replay.classification == "launch_outcome_unknown"
+    assert first_replay.job.status == JobStatus.attention
+    assert first_replay.job.monitor["launch"]["interrupted_phase"] == "creating_sweep"
+    assert ssh.created_sweeps == 1
+    assert [(event["kind"], event["payload"]["classification"]) for event in events] == [
+        ("attention", "launch_outcome_unknown")
+    ]
+
+
+def test_partial_agent_launch_receipt_survives_crash_and_replay_never_refills(tmp_path):
+    class CrashOnSecondAgentSSH(FakeSSH):
+        def launch_agent(self, **kwargs):
+            if kwargs["gpu_index"] == 1:
+                raise SystemExit("simulated process loss before second agent receipt")
+            return super().launch_agent(**kwargs)
+
+    settings = Settings(
+        state_dir=tmp_path,
+        default_entity="my-team",
+        default_project="my-project",
+        authority_role="authoritative",
+    )
+    ssh = CrashOnSecondAgentSSH()
+    payload = {
+        "job_name": "crash-during-agents",
+        "config_path": write_sweep_config(tmp_path / "crash-agents.yaml"),
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "idempotency_key": "crash-during-agents",
+        "thread_id": "thread-crash-agents",
+        "result_contract": {
+            "expected_runs": 5,
+            "output_globs": ["outputs/cora_{run_id}.json"],
+            "discovery_mode": "run_id_output_globs_v1",
+        },
+    }
+    first_service = ConsoleService(
+        settings=settings,
+        store=ConsoleStore(settings.sqlite_path, settings.audit_path),
+        wandb=FakeWandB(),
+        ssh=ssh,
+    )
+
+    with pytest.raises(SystemExit, match="simulated process loss"):
+        first_service.runner_command(IntentType.launch_sweep, payload)
+
+    interrupted = first_service.store.find_job_by_idempotency_key("crash-during-agents")
+    assert interrupted is not None
+    assert interrupted.sweep_id == "abc123"
+    assert interrupted.monitor["launch"]["phase"] == "launching_agents"
+    assert interrupted.monitor["launch"]["sweep_receipt"]["sweep_id"] == "abc123"
+    assert interrupted.monitor["launch"]["agent_launches"] == [
+        {"host": "gpu-host-1", "gpu_index": 0, "pid": "1000", "sweep_path": "my-team/my-project/abc123"}
+    ]
+    assert interrupted.agent_pids == ["1000"]
+
+    restarted = ConsoleService(
+        settings=settings,
+        store=ConsoleStore(settings.sqlite_path, settings.audit_path),
+        wandb=FakeWandB(),
+        ssh=ssh,
+    )
+    first_replay = restarted.runner_command(IntentType.launch_sweep, payload)
+    second_replay = restarted.runner_command(IntentType.launch_sweep, payload)
+    events = restarted.store.claim_wake_events(consumer_id="bridge", limit=10, lease_seconds=60)
+
+    assert first_replay.classification == "launch_recovery_required"
+    assert second_replay.classification == "launch_recovery_required"
+    assert first_replay.result["sweep_id"] == "abc123"
+    assert first_replay.result["agent_launches"][0]["pid"] == "1000"
+    assert ssh.created_sweeps == 1
+    assert [item["gpu_index"] for item in ssh.launches] == [0]
+    assert [(event["kind"], event["payload"]["classification"]) for event in events] == [
+        ("attention", "launch_recovery_required")
+    ]
+
+
+def test_row_level_launch_idempotency_without_operation_receipt_fails_closed(tmp_path):
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = FakeSSH()
+    service = ConsoleService(
+        settings=settings,
+        store=ConsoleStore(settings.sqlite_path, settings.audit_path),
+        wandb=FakeWandB(),
+        ssh=ssh,
+    )
+    config_path = write_sweep_config(tmp_path / "orphan-receipt.yaml")
+    service.store.upsert_job(JobRecord(
+        job_id="job-orphan-launch-receipt",
+        name="orphan-launch-receipt",
+        status=JobStatus.validating,
+        operation_id="op_launch_sweep_orphan",
+        idempotency_key="orphan-launch-receipt",
+        entity="my-team",
+        project="my-project",
+        config_path=config_path,
+        remote_host="gpu-host-1",
+        remote_cwd="/tmp/demo",
+        monitor={"kind": "sweep", "stage": "accepted"},
+    ))
+    payload = {
+        "job_name": "orphan-launch-receipt",
+        "config_path": config_path,
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "idempotency_key": "orphan-launch-receipt",
+    }
+
+    first = service.runner_command(IntentType.launch_sweep, payload)
+    second = service.runner_command(IntentType.launch_sweep, payload)
+    persisted = service.store.get_job("job-orphan-launch-receipt")
+
+    assert first.classification == "launch_outcome_unknown"
+    assert second.classification == "launch_outcome_unknown"
+    assert first.provenance["row_receipt_missing"] is True
+    assert persisted.status == JobStatus.attention
+    assert len(persisted.operation_log) == 1
+    assert persisted.operation_log[0]["classification"] == "launch_outcome_unknown"
+    assert ssh.created_sweeps == 0
+    assert ssh.launches == []
+
+
 def test_single_run_status_stop_and_pull_results(tmp_path):
     settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
     ssh = FakeSSH()
@@ -1477,7 +1670,56 @@ def test_status_returns_sweep_telemetry(tmp_path):
     assert "heartbeat" not in forbidden_text
 
 
-def test_status_normalizes_finished_sweep_with_stale_run_edges(tmp_path):
+def test_status_returns_progress_evidence_for_active_runs(tmp_path):
+    class ActiveRunWandB(FakeWandB):
+        def get_sweep_state(self, entity, project, sweep_id):
+            return {
+                "id": sweep_id,
+                "entity": entity,
+                "project": project,
+                "state": "RUNNING",
+                "runCount": 2,
+                "expectedRunCount": 10,
+                "runs": [
+                    {
+                        "name": "run-a",
+                        "state": "running",
+                        "created_at": "2026-06-17T00:00:00+00:00",
+                        "heartbeat_at": "2026-06-17T00:20:00+00:00",
+                    },
+                    {
+                        "name": "run-b",
+                        "state": "running",
+                        "created_at": "2026-06-17T00:05:00+00:00",
+                        "heartbeat_at": "2026-06-17T00:21:00+00:00",
+                    },
+                ],
+            }
+
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=ActiveRunWandB(), ssh=FakeSSH())
+    service.store.upsert_job(JobRecord(
+        job_id="job_active_runs",
+        name="active-runs",
+        status=JobStatus.running,
+        entity="my-team",
+        project="my-project",
+        sweep_id="abc123",
+        remote_host="gpu-host-1",
+        remote_cwd="/tmp/demo",
+    ))
+
+    response = service.runner_command(IntentType.status_query, {"job_id": "job_active_runs"})
+    evidence = response.result["sweep"]["progress_evidence"]
+
+    assert response.result["sweep"]["finished_runs"] == 0
+    assert response.result["sweep"]["running_runs"] == 2
+    assert evidence["classification"] == "active_run_evidence"
+    assert evidence["active_run_count"] == 2
+    assert "W&B run(s) are active" in evidence["message"]
+
+
+def test_status_finalizes_finished_sweep_with_stale_run_edges(tmp_path):
     class StaleFinishedWandB(FakeWandB):
         def get_sweep_state(self, entity, project, sweep_id):
             return {
@@ -1498,7 +1740,7 @@ def test_status_normalizes_finished_sweep_with_stale_run_edges(tmp_path):
     service.store.upsert_job(JobRecord(
         job_id="job_stale_edges",
         name="stale-edges",
-        status=JobStatus.running,
+        status=JobStatus.finished,
         entity="my-team",
         project="my-project",
         sweep_id="abc123",
@@ -1522,13 +1764,19 @@ def test_status_normalizes_finished_sweep_with_stale_run_edges(tmp_path):
     sweep = response.result["sweep"]
 
     assert response.result["state"]["wandb_sweep_status"] == "FINISHED"
-    assert response.result["state"]["job_status"] == "finished"
+    assert response.result["state"]["job_status"] == "finalizing"
     assert response.result["state"]["result_readiness"] == "complete"
     assert response.result["state"]["consistency_warnings"]
-    assert sweep["finished_runs"] == 15
-    assert sweep["running_runs"] == 0
+    assert sweep["finished_runs"] == 14
+    assert sweep["running_runs"] == 1
     assert sweep["raw_run_state_counts"] == {"finished": 14, "running": 1, "failed": 0}
     assert sweep["run_state_counts_consistency"] == "terminal_run_edges_stale"
+    assert response.result["reconcile"]["gates"]["queue_releasable"] is False
+    assert response.result["next_actions"] == ["等待 W&B raw run edges 与顶层 sweep 状态收敛；finalizing 期间不得推进队列。"]
+    watchdog = service.runner_command(IntentType.watchdog_once, {"job_id": "job_stale_edges"})
+    assert watchdog.result["next_actions"] == response.result["next_actions"]
+    assert watchdog.result["queue_releasable"] is False
+    assert "queue_advance" not in watchdog.result
 
 
 def test_status_returns_compact_sweep_without_run_payloads(tmp_path):
@@ -1609,6 +1857,798 @@ def test_pull_results_uses_target_sweep_run_ids(tmp_path):
     assert (tmp_path / "results" / job.job_id / f"{snapshot_summary['snapshot_id']}.json").exists()
 
 
+def test_pull_results_classifies_terminal_runs_missing_result_artifacts(tmp_path):
+    class FinishedWandB(FakeWandB):
+        def get_sweep_state(self, entity, project, sweep_id):
+            return {
+                "id": sweep_id,
+                "entity": entity,
+                "project": project,
+                "state": "FINISHED",
+                "runCount": 2,
+                "expectedRunCount": 2,
+                "runs": [{"name": "run-a"}, {"name": "run-b"}],
+            }
+
+    class MissingArtifactSSH(FakeSSH):
+        def pull_results(self, *, host, remote_cwd, sweep_id, run_ids, budget_seconds, max_runs, metric_keys, group_keys, metric_paths=None, group_paths=None, output_globs=None, discovery_mode="legacy_auto_v1", comparison_paths=None, include_raw_artifacts=False):
+            rows = [
+                {"run_id": run_id, "sources": [], "config": {}, "metrics": {}, "comparisons": {}, "has_scientific_result": False}
+                for run_id in run_ids[:max_runs]
+            ]
+            return {
+                "source": "remote_local_files",
+                "sweep_id": sweep_id,
+                "rows": rows,
+                "valid_results": 0,
+                "missing_results": len(rows),
+                "failed_results": 0,
+                "partial": False,
+                "discovery_sources": {
+                    run_id: {
+                        "config_paths": [f"/tmp/{run_id}/config.yaml"],
+                        "config_candidates": [],
+                        "progress_paths": [f"/tmp/progress_{run_id}.json"],
+                        "output_globs": [],
+                        "selected_paths": [],
+                    }
+                    for run_id in run_ids[:max_runs]
+                },
+            }
+
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FinishedWandB(), ssh=MissingArtifactSSH())
+    job = JobRecord(
+        job_id="job_missing_artifacts",
+        name="missing-artifacts",
+        status=JobStatus.finished,
+        entity="my-team",
+        project="my-project",
+        sweep_id="abc123",
+        remote_host="gpu-host-1",
+        remote_cwd="/tmp/demo",
+    )
+    service.store.upsert_job(job)
+
+    result = service._pull_results(PullResultsPayload(job_id=job.job_id, max_runs=2))
+
+    assert result["classification"] == "terminal_runs_missing_result_artifacts"
+    assert result["readiness"] == "none"
+    assert result["next_actions"]
+    stored = service.store.get_job(job.job_id)
+    assert stored.monitor["last_result_snapshot"]["classification"] == "terminal_runs_missing_result_artifacts"
+
+
+def test_status_keeps_missing_terminal_artifacts_in_grace_before_attention(tmp_path):
+    class FinishedWandB(FakeWandB):
+        def get_sweep_state(self, entity, project, sweep_id):
+            return {
+                "id": sweep_id,
+                "entity": entity,
+                "project": project,
+                "state": "FINISHED",
+                "runCount": 2,
+                "expectedRunCount": 2,
+                "runs": [{"name": "run-a", "state": "finished"}, {"name": "run-b", "state": "finished"}],
+            }
+
+    ssh = FakeSSH()
+    ssh.failure_logs = [{
+        "gpu_index": 0,
+        "pid": "1000",
+        "path": "/tmp/demo/console_wandb_agent_my-team_my-project_abc123_gpu0.log",
+        "exists": True,
+        "tail": "wandb: Agent received exit signal\nwandb: Killing runs and quitting\n",
+    }]
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FinishedWandB(), ssh=ssh)
+    service.store.upsert_job(JobRecord(
+        job_id="job_missing_artifact_status",
+        name="missing-artifact-status",
+        status=JobStatus.running,
+        entity="my-team",
+        project="my-project",
+        sweep_id="abc123",
+        remote_host="gpu-host-1",
+        remote_cwd="/tmp/demo",
+        agent_pids=["1000"],
+        monitor={
+            "agent_launches": [{
+                "gpu_index": 0,
+                "pid": "1000",
+                "log": "/tmp/demo/console_wandb_agent_my-team_my-project_abc123_gpu0.log",
+            }],
+            "last_result_snapshot": {
+                "classification": "terminal_runs_missing_result_artifacts",
+                "readiness": "none",
+                "expected_runs": 2,
+                "discovered_runs": 2,
+                "fetched_runs": 2,
+                "valid_runs": 0,
+                "missing_runs": 2,
+                "failed_runs": 0,
+                "complete": True,
+            },
+        },
+    ))
+
+    response = service.runner_command(IntentType.status_query, {"job_id": "job_missing_artifact_status"})
+
+    assert response.result["classification"] != "attention"
+    assert response.result["state"]["result_artifact_attention"] is False
+    assert response.result["state"]["result_readiness"] == "none"
+    assert response.result["reconcile"]["gates"]["result_ready"] is False
+
+
+def test_sequential_launch_does_not_bypass_existing_fifo_when_blocker_finished(tmp_path):
+    service = make_service(tmp_path)
+    first = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "fifo-a", "config_path": write_sweep_config(tmp_path / "a.yaml"),
+        "remote_host": "gpu-host-1", "remote_cwd": "/tmp/demo", "idempotency_key": "fifo-a",
+    })
+    second = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "fifo-b", "config_path": write_sweep_config(tmp_path / "b.yaml"),
+        "remote_host": "gpu-host-1", "remote_cwd": "/tmp/demo", "idempotency_key": "fifo-b",
+    })
+    service.store.update_job_status(first.job_id, JobStatus.finished)
+
+    third = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "fifo-c", "config_path": write_sweep_config(tmp_path / "c.yaml"),
+        "remote_host": "gpu-host-1", "remote_cwd": "/tmp/demo", "idempotency_key": "fifo-c",
+    })
+
+    assert second.job.status == JobStatus.queued
+    assert third.job.status == JobStatus.queued
+    assert third.result["queue"]["queue_position"] == 2
+    assert third.result["queue"]["blocked_by_job_id"] == second.job_id
+
+
+def test_queued_launch_with_result_contract_and_thread_binds_monitor_schedule(tmp_path):
+    service = make_service(tmp_path)
+    service.runner_command(IntentType.launch_sweep, {
+        "job_name": "scheduled-a", "config_path": write_sweep_config(tmp_path / "a.yaml"),
+        "remote_host": "gpu-host-1", "remote_cwd": "/tmp/demo", "idempotency_key": "scheduled-a",
+    })
+    queued = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "scheduled-b", "config_path": write_sweep_config(tmp_path / "b.yaml"),
+        "remote_host": "gpu-host-1", "remote_cwd": "/tmp/demo", "idempotency_key": "scheduled-b",
+        "thread_id": "thread-cjnv", "monitor_every": "5m", "result_contract": {
+            "expected_runs": 5, "output_globs": ["outputs/cora_{run_id}.json"],
+            "discovery_mode": "run_id_output_globs_v1",
+        },
+    })
+
+    schedule = service.store.get_monitor_schedule(queued.job_id)
+    assert queued.job.status == JobStatus.queued
+    assert schedule["active"] == 1
+    assert schedule["thread_id"] == "thread-cjnv"
+    assert schedule["interval_seconds"] == 300
+
+
+def test_authoritative_console_rejects_unmonitored_new_sweep_before_side_effects(tmp_path):
+    settings = Settings(
+        state_dir=tmp_path, default_entity="my-team", default_project="my-project",
+        authority_role="authoritative",
+    )
+    ssh = FakeSSH()
+    wandb = FakeWandB()
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=wandb, ssh=ssh)
+    config_path = write_sweep_config(tmp_path / "authoritative.yaml")
+
+    with pytest.raises(ValueError, match="requires result_contract and thread_id"):
+        service.runner_command(IntentType.launch_sweep, {
+            "job_name": "unmonitored", "config_path": config_path,
+            "remote_host": "gpu-host-1", "remote_cwd": "/tmp/demo",
+        })
+    with pytest.raises(ValueError, match="requires result_contract and thread_id"):
+        service.runner_command(IntentType.register_existing_sweep, {
+            "job_name": "unmonitored-existing", "sweep_id": "abc123",
+            "remote_host": "gpu-host-1", "remote_cwd": "/tmp/demo",
+        })
+
+    assert wandb.created == 0
+    assert ssh.launches == []
+    assert service.store.list_jobs() == []
+
+
+def test_authoritative_console_rejects_monitor_schedule_without_thread(tmp_path):
+    settings = Settings(
+        state_dir=tmp_path,
+        default_entity="my-team",
+        default_project="my-project",
+        authority_role="authoritative",
+    )
+    service = ConsoleService(
+        settings=settings,
+        store=ConsoleStore(settings.sqlite_path, settings.audit_path),
+        wandb=FakeWandB(),
+        ssh=FakeSSH(),
+    )
+    service.store.upsert_job(JobRecord(
+        job_id="job-authoritative-schedule",
+        name="authoritative-schedule",
+        status=JobStatus.running,
+        monitor={
+            "result_contract": {
+                "expected_runs": 1,
+                "output_globs": ["outputs/{run_id}.json"],
+                "discovery_mode": "run_id_output_globs_v1",
+            }
+        },
+    ))
+
+    with pytest.raises(ValueError, match="requires result_contract and thread_id"):
+        service.runner_command(
+            IntentType.schedule_monitor,
+            {"job_id": "job-authoritative-schedule", "every": "5m"},
+        )
+    assert service.store.get_monitor_schedule("job-authoritative-schedule") is None
+
+
+def test_authoritative_queue_advance_accepts_migrated_binding_with_legacy_payload(tmp_path):
+    settings = Settings(
+        state_dir=tmp_path, default_entity="my-team", default_project="my-project",
+        authority_role="authoritative",
+    )
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=FakeSSH())
+    config_path = write_sweep_config(tmp_path / "migrated.yaml")
+    payload = {
+        "job_name": "migrated", "config_path": config_path,
+        "remote_host": "gpu-host-1", "remote_cwd": "/tmp/demo",
+    }
+    contract = {
+        "version": 1, "expected_runs": 5, "max_runs": 5,
+        "output_globs": ["outputs/cora_{run_id}.json"], "discovery_mode": "run_id_output_globs_v1",
+        "allow_partial": False, "export_artifacts": True,
+    }
+    service.store.upsert_job(JobRecord(
+        job_id="job-migrated", name="migrated", status=JobStatus.queued,
+        config_path=config_path, remote_host="gpu-host-1", remote_cwd="/tmp/demo",
+        monitor={"kind": "sweep", "result_contract": contract, "queue": {"queue_group": "gpu-host-1:/tmp/demo", "payload": payload}},
+    ))
+    service.store.upsert_monitor_schedule(job_id="job-migrated", interval_seconds=60, timeout_seconds=300, thread_id="thread-migrated")
+
+    response = service.runner_command(IntentType.advance_queue, {"queue_group": "gpu-host-1:/tmp/demo"})
+
+    assert response.classification == "advanced"
+    assert service.store.get_job("job-migrated").status == JobStatus.running
+    assert service.store.get_monitor_schedule("job-migrated")["thread_id"] == "thread-migrated"
+
+
+def test_persistent_stale_edges_become_sync_error_and_block_queue(tmp_path):
+    class StaleWandB(FakeWandB):
+        def get_sweep_state(self, entity, project, sweep_id):
+            return {
+                "id": sweep_id, "entity": entity, "project": project, "state": "FINISHED",
+                "runCount": 2, "expectedRunCount": 2,
+                "runs": [{"name": "a", "state": "finished"}, {"name": "b", "state": "running"}],
+            }
+
+    settings = Settings(
+        state_dir=tmp_path, default_entity="my-team", default_project="my-project",
+        sync_error_consecutive_threshold=2, sync_error_grace_seconds=0,
+    )
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=StaleWandB(), ssh=FakeSSH())
+    service.store.upsert_job(JobRecord(
+        job_id="job-sync", name="sync", status=JobStatus.finished, entity="my-team", project="my-project",
+        sweep_id="abc123", remote_host="gpu-host-1", remote_cwd="/tmp/demo",
+    ))
+
+    first = service._status(StatusQueryPayload(job_id="job-sync"))
+    second = service._status(StatusQueryPayload(job_id="job-sync"))
+
+    assert first["classification"] == "finalizing"
+    assert second["classification"] == "sync_error"
+    assert second["reconcile"]["gates"]["queue_releasable"] is False
+    assert service.store.get_job("job-sync").status == JobStatus.attention
+    observations = service.store.source_observations("job-sync")
+    assert {item["source"] for item in observations} == {"wandb", "remote_process", "artifact_manifest", "ledger"}
+    assert {item["reconcile_id"] for item in observations} == {second["reconcile"]["reconcile_id"]}
+
+
+def test_missing_wandb_expected_count_escalates_against_result_contract(tmp_path):
+    class MissingExpectedWandB(FakeWandB):
+        def get_sweep_state(self, entity, project, sweep_id):
+            return {
+                "id": sweep_id, "entity": entity, "project": project, "state": "FINISHED",
+                "runCount": 1, "expectedRunCount": 0,
+                "runs": [{"name": "run-a", "state": "finished"}],
+            }
+
+    settings = Settings(
+        state_dir=tmp_path, default_entity="my-team", default_project="my-project",
+        sync_error_consecutive_threshold=2, sync_error_grace_seconds=0,
+    )
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=MissingExpectedWandB(), ssh=FakeSSH())
+    service.store.upsert_job(JobRecord(
+        job_id="job-missing-expected", name="missing-expected", status=JobStatus.finished,
+        entity="my-team", project="my-project", sweep_id="abc123",
+        remote_host="gpu-host-1", remote_cwd="/tmp/demo",
+        monitor={"result_contract": {
+            "version": 1, "expected_runs": 1, "max_runs": 1,
+            "output_globs": ["outputs/result_{run_id}.json"],
+            "discovery_mode": "run_id_output_globs_v1", "allow_partial": False, "export_artifacts": True,
+        }},
+    ))
+
+    first = service._status(StatusQueryPayload(job_id="job-missing-expected"))
+    second = service._status(StatusQueryPayload(job_id="job-missing-expected"))
+
+    assert first["reconcile"]["sync_consistency"]["classification"] == "reconciling"
+    assert first["reconcile"]["gates"]["queue_releasable"] is False
+    assert second["classification"] == "sync_error"
+    assert "wandb_expected_count_missing" in second["reconcile"]["sync_consistency"]["mismatches"]
+
+
+@pytest.mark.parametrize("agent_probe", [
+    {"tracked_pids": ["1000"], "alive_pids": ["1000"], "pgrep": ["1000"]},
+    {"classification": "agent_probe_unavailable", "error": "network unavailable"},
+])
+@pytest.mark.parametrize("ledger_status", [JobStatus.running, JobStatus.finished])
+def test_raw_complete_queue_fails_closed_until_remote_process_is_verified_terminal(tmp_path, agent_probe, ledger_status):
+    class FinishedWandB(FakeWandB):
+        def get_sweep_state(self, entity, project, sweep_id):
+            return {
+                "id": sweep_id, "entity": entity, "project": project, "state": "FINISHED",
+                "runCount": 1, "expectedRunCount": 1,
+                "runs": [{"name": "run-a", "state": "finished"}],
+            }
+
+    ssh = FakeSSH()
+    ssh.agent_probe = agent_probe
+    settings = Settings(
+        state_dir=tmp_path, default_entity="my-team", default_project="my-project",
+        sync_error_consecutive_threshold=100, sync_error_grace_seconds=3600,
+    )
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FinishedWandB(), ssh=ssh)
+    service.store.upsert_job(JobRecord(
+        job_id="job-process-gate", name="process-gate", status=ledger_status,
+        entity="my-team", project="my-project", sweep_id="abc123",
+        remote_host="gpu-host-1", remote_cwd="/tmp/demo", agent_pids=["1000"],
+    ))
+
+    status = service._status(StatusQueryPayload(job_id="job-process-gate"))
+
+    assert status["reconcile"]["sync_consistency"]["classification"] == "reconciling"
+    assert status["reconcile"]["gates"]["queue_releasable"] is False
+    assert "remote_process_not_terminal" in status["reconcile"]["gates"]["blocked_reasons"]
+
+
+def test_monitor_artifact_grace_then_ready_emits_only_result_ready(tmp_path):
+    class FinishedWandB(FakeWandB):
+        def get_sweep_state(self, entity, project, sweep_id):
+            return {
+                "id": sweep_id, "entity": entity, "project": project, "state": "FINISHED",
+                "runCount": 2, "expectedRunCount": 2,
+                "runs": [{"name": "run-a", "state": "finished"}, {"name": "run-b", "state": "finished"}],
+            }
+
+    class EventuallyReadySSH(FakeSSH):
+        def __init__(self):
+            super().__init__()
+            self.pulls = 0
+
+        def pull_results(self, **kwargs):
+            self.pulls += 1
+            if self.pulls == 1:
+                return {
+                    "source": "remote_local_files", "sweep_id": kwargs["sweep_id"],
+                    "rows": [{"run_id": run_id, "sources": [], "config": {}, "metrics": {}, "has_scientific_result": False} for run_id in kwargs["run_ids"]],
+                    "valid_results": 0, "missing_results": 2, "failed_results": 0, "partial": False,
+                    "discovery_sources": {run_id: {"selected_paths": []} for run_id in kwargs["run_ids"]}, "raw_artifacts": [],
+                }
+            return super().pull_results(**kwargs)
+
+    settings = Settings(
+        state_dir=tmp_path, default_entity="my-team", default_project="my-project",
+        artifact_sync_error_consecutive_threshold=2, artifact_sync_error_grace_seconds=0,
+    )
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FinishedWandB(), ssh=EventuallyReadySSH())
+    contract = {
+        "version": 1, "expected_runs": 2, "max_runs": 2,
+        "output_globs": ["outputs/result_{run_id}.json"], "discovery_mode": "run_id_output_globs_v1",
+        "allow_partial": False, "export_artifacts": True,
+    }
+    service.store.upsert_job(JobRecord(
+        job_id="job-artifacts", name="artifacts", status=JobStatus.running, entity="my-team", project="my-project",
+        sweep_id="abc123", remote_host="gpu-host-1", remote_cwd="/tmp/demo", monitor={"result_contract": contract},
+    ))
+    service.store.upsert_monitor_schedule(job_id="job-artifacts", interval_seconds=60, timeout_seconds=300, thread_id="thread-1")
+
+    first = service.monitor_tick("job-artifacts")
+    artifact_grace = service.store.get_job("job-artifacts").monitor["artifact_consistency"]["classification"]
+    second = service.monitor_tick("job-artifacts")
+    events = service.store.claim_wake_events(consumer_id="bridge", limit=10, lease_seconds=60)
+
+    assert first["event_created"] is False
+    assert artifact_grace == "reconciling"
+    assert second["classification"] == "result_ready"
+    assert second["monitor_disabled"] is True
+    assert [event["kind"] for event in events] == ["result_ready"]
+    assert service.store.get_monitor_schedule("job-artifacts")["active"] == 0
+    assert "job-artifacts" not in {item["job_id"] for item in service.store.due_monitor_schedules()}
+    archive = service.artifact_download_path(second["artifact_sync"]["snapshot_id"])
+    assert archive.is_file()
+
+    Path(second["artifact_sync"]["artifact_bundle"]["summary_json_path"]).unlink()
+    after_storage_loss = service._status(StatusQueryPayload(job_id="job-artifacts"))
+    assert after_storage_loss["reconcile"]["gates"]["result_ready"] is False
+    assert after_storage_loss["reconcile"]["gates"]["artifact_storage"]["classification"] == "artifact_bundle_missing"
+    assert after_storage_loss["state"]["result_readiness"] == "artifact_storage_missing"
+
+
+def test_artifact_manifest_rejects_cross_run_duplicate_paths(tmp_path):
+    service = make_service(tmp_path)
+    rows = [
+        {"run_id": run_id, "sources": ["/tmp/shared.json"], "config": {}, "metrics": {"auc": 0.9}, "has_scientific_result": True}
+        for run_id in ["run-a", "run-b"]
+    ]
+    result, summary = service._materialize_result_snapshot(
+        job=None, entity="e", project="p", sweep_id="s", result={
+            "source": "remote_local_files", "rows": rows, "valid_results": 2, "missing_results": 0, "failed_results": 0,
+            "raw_artifacts": [
+                {"run_id": "run-a", "path": "/tmp/shared.json", "content": {"auc": 0.9}},
+                {"run_id": "run-b", "path": "/tmp/shared.json", "content": {"auc": 0.9}},
+            ],
+        }, group_keys=[], metric_keys=[], comparison_keys=[], matrix_by=[], expected_runs=2, discovered_runs=2,
+        requested_limit=2, export_artifacts=True,
+    )
+
+    assert summary["artifact_manifest"]["distinct_final_artifacts"] == 1
+    assert summary["artifact_manifest"]["protocol_valid"] is False
+    assert len(result["artifact_bundle"]["raw_files"]) == 1
+
+
+def test_authoritative_pull_results_rejects_server_side_artifact_directory(tmp_path):
+    settings = Settings(
+        state_dir=tmp_path,
+        default_entity="my-team",
+        default_project="my-project",
+        authority_role="authoritative",
+    )
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=FakeSSH())
+
+    with pytest.raises(ValueError, match="never accepts artifact_dir"):
+        service._pull_results(PullResultsPayload(
+            sweep_id="abc123",
+            artifact_dir="/Users/oliver/results",
+        ))
+
+
+def test_persistent_missing_artifacts_emit_one_deduplicated_sync_error(tmp_path):
+    class FinishedWandB(FakeWandB):
+        def get_sweep_state(self, entity, project, sweep_id):
+            return {
+                "id": sweep_id, "entity": entity, "project": project, "state": "FINISHED",
+                "runCount": 1, "expectedRunCount": 1, "runs": [{"name": "run-a", "state": "finished"}],
+            }
+
+    class MissingSSH(FakeSSH):
+        def pull_results(self, **kwargs):
+            return {
+                "source": "remote_local_files", "sweep_id": kwargs["sweep_id"],
+                "rows": [{"run_id": "run-a", "sources": [], "config": {}, "metrics": {}, "has_scientific_result": False}],
+                "valid_results": 0, "missing_results": 1, "failed_results": 0, "partial": False,
+                "discovery_sources": {"run-a": {"selected_paths": []}}, "raw_artifacts": [],
+                "discovery_mode": "run_id_output_globs_v1",
+            }
+
+    settings = Settings(
+        state_dir=tmp_path, default_entity="my-team", default_project="my-project",
+        artifact_sync_error_consecutive_threshold=2, artifact_sync_error_grace_seconds=0,
+    )
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FinishedWandB(), ssh=MissingSSH())
+    service.store.upsert_job(JobRecord(
+        job_id="job-missing", name="missing", status=JobStatus.running, entity="my-team", project="my-project",
+        sweep_id="abc123", remote_host="gpu-host-1", remote_cwd="/tmp/demo",
+        monitor={"result_contract": {
+            "version": 1, "expected_runs": 1, "max_runs": 1,
+            "output_globs": ["outputs/result_{run_id}.json"], "discovery_mode": "run_id_output_globs_v1",
+            "allow_partial": False, "export_artifacts": True,
+        }},
+    ))
+    service.store.upsert_monitor_schedule(job_id="job-missing", interval_seconds=60, timeout_seconds=300, thread_id="thread-1")
+
+    first = service.monitor_tick("job-missing")
+    second = service.monitor_tick("job-missing")
+    third = service.monitor_tick("job-missing")
+    events = service.store.claim_wake_events(consumer_id="bridge", limit=10, lease_seconds=60)
+
+    assert first["event_created"] is False
+    assert second["classification"] == "artifact_sync_error"
+    assert second["event_created"] is True
+    assert third["event_created"] is False
+    assert [(event["kind"], event["payload"]["classification"]) for event in events] == [("sync_error", "artifact_sync_error")]
+
+
+def test_monitor_batch_lease_covers_tick_longer_than_configured_global_ttl(tmp_path):
+    settings = Settings(
+        state_dir=tmp_path, monitor_lease_seconds=1, monitor_worker_poll_seconds=1,
+        default_entity="my-team", default_project="my-project",
+    )
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=FakeSSH())
+    service.store.upsert_job(JobRecord(job_id="job-lease", name="lease", status=JobStatus.running))
+    service.store.upsert_monitor_schedule(job_id="job-lease", interval_seconds=5, timeout_seconds=1, thread_id="thread-1")
+    with service.store._connect() as conn:
+        conn.execute("UPDATE monitor_schedules SET next_run_at = '2000-01-01T00:00:00+00:00' WHERE job_id = 'job-lease'")
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def blocking_tick(job_id):
+        calls.append(job_id)
+        entered.set()
+        release.wait(timeout=5)
+        return {"classification": "healthy"}
+
+    service.monitor_tick = blocking_tick
+    first_worker = MonitorWorker(service)
+    second_worker = MonitorWorker(service)
+    thread = threading.Thread(target=first_worker.run_once)
+    thread.start()
+    assert entered.wait(timeout=2)
+
+    assert second_worker.run_once() == []
+    assert calls == ["job-lease"]
+    release.set()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+
+
+def test_monitor_worker_graces_external_exception_before_single_wake(tmp_path):
+    settings = Settings(
+        state_dir=tmp_path,
+        monitor_external_error_consecutive_threshold=2,
+        monitor_external_error_grace_seconds=0,
+    )
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=FakeSSH())
+    service.store.upsert_job(JobRecord(job_id="job-external-error", name="external-error", status=JobStatus.running))
+    service.store.upsert_monitor_schedule(job_id="job-external-error", interval_seconds=60, timeout_seconds=30, thread_id="thread-1")
+
+    def unavailable(_job_id):
+        raise OSError("temporary network failure")
+
+    service.monitor_tick = unavailable
+    worker = MonitorWorker(service)
+
+    def make_due():
+        with service.store._connect() as conn:
+            conn.execute("UPDATE monitor_schedules SET next_run_at = '2000-01-01T00:00:00+00:00' WHERE job_id = 'job-external-error'")
+
+    make_due()
+    worker.run_once()
+    assert service.store.claim_wake_events(consumer_id="bridge-first", limit=10, lease_seconds=60) == []
+    assert service.store.get_monitor_schedule("job-external-error")["last_classification"] == "external_unavailable_reconciling"
+
+    make_due()
+    worker.run_once()
+    make_due()
+    worker.run_once()
+    events = service.store.claim_wake_events(consumer_id="bridge", limit=10, lease_seconds=60)
+
+    assert [(event["kind"], event["payload"]["classification"]) for event in events] == [("sync_error", "external_unavailable")]
+    assert service.store.get_monitor_schedule("job-external-error")["active"] == 1
+
+
+def test_monitor_worker_wakes_immediately_for_invariant_failure(tmp_path):
+    service = make_service(tmp_path)
+    service.store.upsert_job(JobRecord(job_id="job-invariant", name="invariant", status=JobStatus.running))
+    service.store.upsert_monitor_schedule(job_id="job-invariant", interval_seconds=60, timeout_seconds=30, thread_id="thread-1")
+    with service.store._connect() as conn:
+        conn.execute("UPDATE monitor_schedules SET next_run_at = '2000-01-01T00:00:00+00:00' WHERE job_id = 'job-invariant'")
+
+    def broken(_job_id):
+        raise ValueError("broken internal invariant")
+
+    service.monitor_tick = broken
+    MonitorWorker(service).run_once()
+    events = service.store.claim_wake_events(consumer_id="bridge", limit=10, lease_seconds=60)
+
+    assert [(event["kind"], event["payload"]["classification"]) for event in events] == [("attention", "monitor_invariant_error")]
+
+
+def test_monitor_tick_graces_degraded_wandb_status_before_wake(tmp_path):
+    class UnavailableWandB(FakeWandB):
+        def get_sweep_state(self, entity, project, sweep_id):
+            raise OSError("temporary W&B outage")
+
+    settings = Settings(
+        state_dir=tmp_path,
+        default_entity="my-team",
+        default_project="my-project",
+        monitor_external_error_consecutive_threshold=2,
+        monitor_external_error_grace_seconds=0,
+    )
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=UnavailableWandB(), ssh=FakeSSH())
+    service.store.upsert_job(JobRecord(
+        job_id="job-wandb-outage", name="wandb-outage", status=JobStatus.running,
+        entity="my-team", project="my-project", sweep_id="abc123",
+        remote_host="gpu-host-1", remote_cwd="/tmp/demo",
+    ))
+    service.store.upsert_monitor_schedule(job_id="job-wandb-outage", interval_seconds=60, timeout_seconds=30, thread_id="thread-1")
+
+    first = service.monitor_tick("job-wandb-outage")
+    second = service.monitor_tick("job-wandb-outage")
+    events = service.store.claim_wake_events(consumer_id="bridge", limit=10, lease_seconds=60)
+
+    assert first["classification"] == "degraded"
+    assert first["event_created"] is False
+    assert second["classification"] == "external_unavailable"
+    assert [(event["kind"], event["payload"]["classification"]) for event in events] == [("sync_error", "external_unavailable")]
+
+
+def test_job_serialization_preserves_reconcile_and_monitor_metadata(tmp_path):
+    entered_status = threading.Event()
+    release_status = threading.Event()
+    entered_repair = threading.Event()
+
+    class BlockingWandB(FakeWandB):
+        def get_sweep_state(self, entity, project, sweep_id):
+            entered_status.set()
+            assert release_status.wait(timeout=3)
+            return super().get_sweep_state(entity, project, sweep_id)
+
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=BlockingWandB(), ssh=FakeSSH())
+    service.store.upsert_job(JobRecord(
+        job_id="job-serialized", name="serialized", status=JobStatus.running,
+        entity="my-team", project="my-project", sweep_id="abc123",
+        remote_host="gpu-host-1", remote_cwd="/tmp/demo",
+    ))
+    original_repair = service._repair_watchdog_locked
+
+    def tracked_repair(payload, **kwargs):
+        entered_repair.set()
+        return original_repair(payload, **kwargs)
+
+    service._repair_watchdog_locked = tracked_repair
+    status_thread = threading.Thread(target=lambda: service._status(StatusQueryPayload(job_id="job-serialized")))
+    repair_thread = threading.Thread(target=lambda: service._repair_watchdog(RepairWatchdogPayload(job_id="job-serialized", remote_cwd="/tmp/repaired")))
+    status_thread.start()
+    assert entered_status.wait(timeout=2)
+    repair_thread.start()
+    assert not entered_repair.wait(timeout=0.1)
+    release_status.set()
+    status_thread.join(timeout=3)
+    repair_thread.join(timeout=3)
+
+    assert not status_thread.is_alive() and not repair_thread.is_alive()
+    final_job = service.store.get_job("job-serialized")
+    assert final_job.remote_cwd == "/tmp/repaired"
+    assert "reconcile" in final_job.monitor
+    assert final_job.monitor["watchdog"]["remote_cwd"] == "/tmp/repaired"
+
+
+def test_queue_failure_event_disables_completed_source_only(tmp_path):
+    service = make_service(tmp_path)
+    service.store.upsert_job(JobRecord(job_id="job-source", name="source", status=JobStatus.finished))
+    service.store.upsert_job(JobRecord(job_id="job-next", name="next", status=JobStatus.failed))
+    service.store.upsert_monitor_schedule(job_id="job-source", interval_seconds=60, timeout_seconds=30, thread_id="thread-source")
+    service.store.upsert_monitor_schedule(job_id="job-next", interval_seconds=60, timeout_seconds=30, thread_id="thread-next")
+    service._status = lambda _payload: {
+        "classification": "ok",
+        "queue": {"queue_group": "gpu-host:/work"},
+        "reconcile": {"gates": {
+            "queue_releasable": True,
+            "result_ready": True,
+            "raw_gate": {"satisfied": True},
+            "artifact_manifest": {"manifest_sha256": "manifest-ready"},
+        }},
+    }
+    service._advance_queue = lambda *_args, **_kwargs: {
+        "advanced": [{"job_id": "job-next", "classification": "control_plane_error", "stage": "failed"}],
+        "unblocked": [],
+    }
+
+    result = service.monitor_tick("job-source")
+    events = service.store.claim_wake_events(consumer_id="bridge", limit=10, lease_seconds=60)
+
+    assert result["classification"] == "queue_failure"
+    assert result["monitor_disabled"] is True
+    assert [event["kind"] for event in events] == ["queue_failure"]
+    assert service.store.get_monitor_schedule("job-source")["active"] == 0
+    assert service.store.get_monitor_schedule("job-next")["active"] == 1
+
+
+def test_wake_event_claim_and_ack_are_leased_and_idempotent(tmp_path):
+    service = make_service(tmp_path)
+    event, created = service.store.enqueue_wake_event(
+        dedupe_key="job:result-ready:one", job_id="job", thread_id="thread",
+        kind="result_ready", summary="ready", payload={"classification": "result_ready"},
+    )
+    duplicate, duplicate_created = service.store.enqueue_wake_event(
+        dedupe_key="job:result-ready:one", job_id="job", thread_id="thread",
+        kind="result_ready", summary="ready", payload={"classification": "result_ready"},
+    )
+    claimed = service.store.claim_wake_events(consumer_id="bridge", limit=10, lease_seconds=60)
+    ledger_id = service.store.metadata("ledger_id")
+    lease_token = claimed[0]["lease"]["token"]
+    acked, first_idempotent = service.store.ack_wake_event(
+        event["event_id"],
+        consumer_id="bridge",
+        expected_ledger_id=ledger_id,
+        lease_token=lease_token,
+    )
+    _, second_idempotent = service.store.ack_wake_event(
+        event["event_id"],
+        consumer_id="bridge",
+        expected_ledger_id=ledger_id,
+        lease_token=lease_token,
+    )
+
+    assert created is True and duplicate_created is False
+    assert duplicate["event_id"] == event["event_id"]
+    assert claimed[0]["lease"]["consumer_id"] == "bridge"
+    assert claimed[0]["lease"]["token"].startswith("lease_")
+    assert acked["acked_at"]
+    assert first_idempotent is False and second_idempotent is True
+
+
+def test_sync_error_heal_then_recur_creates_a_new_outbox_episode(tmp_path):
+    class EpisodicWandB(FakeWandB):
+        mode = "stale"
+
+        def get_sweep_state(self, entity, project, sweep_id):
+            if self.mode == "healthy":
+                return {
+                    "id": sweep_id, "entity": entity, "project": project, "state": "RUNNING",
+                    "runCount": 1, "expectedRunCount": 2,
+                    "runs": [{"name": "a", "state": "finished"}, {"name": "b", "state": "running"}],
+                }
+            return {
+                "id": sweep_id, "entity": entity, "project": project, "state": "FINISHED",
+                "runCount": 2, "expectedRunCount": 2,
+                "runs": [{"name": "a", "state": "finished"}, {"name": "b", "state": "running"}],
+            }
+
+    wandb = EpisodicWandB()
+    settings = Settings(
+        state_dir=tmp_path, default_entity="my-team", default_project="my-project",
+        sync_error_consecutive_threshold=2, sync_error_grace_seconds=0,
+    )
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=wandb, ssh=FakeSSH())
+    service.store.upsert_job(JobRecord(
+        job_id="job-episode", name="episode", status=JobStatus.running, entity="my-team", project="my-project",
+        sweep_id="abc123", remote_host="gpu-host-1", remote_cwd="/tmp/demo",
+    ))
+    service.store.upsert_monitor_schedule(job_id="job-episode", interval_seconds=60, timeout_seconds=300, thread_id="thread-1")
+
+    assert service.monitor_tick("job-episode")["event_created"] is False
+    assert service.monitor_tick("job-episode")["event_created"] is True
+    wandb.mode = "healthy"
+    assert service.monitor_tick("job-episode")["event_created"] is False
+    wandb.mode = "stale"
+    assert service.monitor_tick("job-episode")["event_created"] is False
+    assert service.monitor_tick("job-episode")["event_created"] is True
+    events = service.store.claim_wake_events(consumer_id="bridge", limit=10, lease_seconds=60)
+
+    assert [event["kind"] for event in events] == ["sync_error", "sync_error"]
+    assert events[0]["dedupe_key"] != events[1]["dedupe_key"]
+
+
+def test_artifact_download_rejects_traversal_and_incomplete_bundle(tmp_path):
+    service = make_service(tmp_path)
+    with pytest.raises(ValueError, match="invalid snapshot_id"):
+        service.artifact_download_path("../secret")
+    bundle = service.settings.results_dir / "job" / "result_snapshot_incomplete"
+    bundle.mkdir(parents=True)
+    with pytest.raises(ValueError, match="incomplete"):
+        service.artifact_download_path("result_snapshot_incomplete")
+
+
+def test_audit_rotates_and_compacts_large_status_payload(tmp_path):
+    store = ConsoleStore(tmp_path / "console.sqlite3", tmp_path / "audit.jsonl", audit_max_bytes=1024, audit_backup_count=2)
+    for index in range(8):
+        store.write_audit(AuditEvent(
+            event_type="status", message="status",
+            detail={"status_result": {"classification": "ok", "operation_history": list(range(100)), "runs": list(range(100)), "blob": "x" * 8000}, "index": index},
+        ))
+
+    assert (tmp_path / "audit.jsonl.1").exists()
+    assert "operation_history_count" not in (tmp_path / "audit.jsonl").read_text(encoding="utf-8")
+    assert (tmp_path / "audit.jsonl").stat().st_size < 6000
+
+
 def test_pull_results_default_uses_full_wandb_run_list(tmp_path):
     class ManyRunsWandB(FakeWandB):
         def get_sweep_state(self, entity, project, sweep_id):
@@ -1685,7 +2725,7 @@ def test_pull_results_explicit_max_runs_marks_truncated(tmp_path):
 
 def test_pull_results_snapshot_groups_metrics(tmp_path):
     class GroupSSH(FakeSSH):
-        def pull_results(self, *, host, remote_cwd, sweep_id, run_ids, budget_seconds, max_runs, metric_keys, group_keys, metric_paths=None, group_paths=None, output_globs=None, comparison_paths=None, include_raw_artifacts=False):
+        def pull_results(self, *, host, remote_cwd, sweep_id, run_ids, budget_seconds, max_runs, metric_keys, group_keys, metric_paths=None, group_paths=None, output_globs=None, discovery_mode="legacy_auto_v1", comparison_paths=None, include_raw_artifacts=False):
             self.pull_results_calls.append({
                 "run_ids": list(run_ids),
                 "max_runs": max_runs,

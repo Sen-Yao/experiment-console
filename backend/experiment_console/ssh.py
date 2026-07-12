@@ -12,8 +12,19 @@ from .config import Settings
 from .redaction import redact_text
 
 
+MAX_RESULT_ARTIFACT_FILE_BYTES = 8 * 1024 * 1024
+MAX_RESULT_ARTIFACT_TOTAL_BYTES = 64 * 1024 * 1024
+
+
 def quote_remote(command: str) -> str:
     return command
+
+
+def validate_ssh_host(host: str) -> str:
+    value = str(host or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value):
+        raise ValueError("SSH host must be a configured alias or hostname, not an option or command")
+    return value
 
 
 def parse_sweep_id(text: str) -> str | None:
@@ -61,24 +72,48 @@ class SSHExecutor:
         self.settings = settings
         self.runner = runner or CommandRunner()
 
-    def run(self, host: str, remote_command: str, *, timeout: int | None = None, input_text: str | None = None):
-        argv = ["ssh", host, quote_remote(remote_command)]
+    def run(
+        self,
+        host: str,
+        remote_command: str,
+        *,
+        timeout: int | None = None,
+        input_text: str | None = None,
+        read_only: bool = False,
+    ):
+        host = validate_ssh_host(host)
+        argv = ["ssh", "--", host, quote_remote(remote_command)]
         last_exc: Exception | None = None
-        for attempt in range(2):
+        attempts = 2 if read_only else 1
+        for attempt in range(attempts):
             try:
                 return self.runner.run(argv, timeout=timeout or self.settings.ssh_timeout_seconds, input_text=input_text)
             except Exception as exc:
                 last_exc = exc
-                if attempt == 1 or not is_transient_ssh_error(exc):
+                if attempt + 1 >= attempts or not is_transient_ssh_error(exc):
                     raise
         assert last_exc is not None
         raise last_exc
 
-    def run_with_wandb_key(self, host: str, remote_command: str, *, wandb_api_key: str | None, timeout: int | None = None):
+    def run_with_wandb_key(
+        self,
+        host: str,
+        remote_command: str,
+        *,
+        wandb_api_key: str | None,
+        timeout: int | None = None,
+        read_only: bool = False,
+    ):
         if not wandb_api_key:
-            return self.run(host, remote_command, timeout=timeout)
+            return self.run(host, remote_command, timeout=timeout, read_only=read_only)
         wrapped = "read -r WANDB_API_KEY; export WANDB_API_KEY; " + remote_command
-        return self.run(host, wrapped, timeout=timeout, input_text=wandb_api_key + "\n")
+        return self.run(
+            host,
+            wrapped,
+            timeout=timeout,
+            input_text=wandb_api_key + "\n",
+            read_only=read_only,
+        )
 
 
     def read_remote_file(
@@ -89,7 +124,12 @@ class SSHExecutor:
         timeout: int | None = None,
     ) -> dict[str, Any]:
         remote = f"python3 - <<'PY'\nfrom pathlib import Path\npath = Path({remote_path!r})\nprint(path.read_text(encoding=\"utf-8\"))\nPY"
-        result = self.run(host, remote, timeout=timeout or self.settings.command_timeout_seconds)
+        result = self.run(
+            host,
+            remote,
+            timeout=timeout or self.settings.command_timeout_seconds,
+            read_only=True,
+        )
         return {
             "host": host,
             "remote_path": remote_path,
@@ -112,6 +152,11 @@ cwd = __CWD__
 config_path = __CONFIG__
 conda_env = __CONDA_ENV__
 conda_sh = __CONDA_SH__
+runtime = {
+    "requested_conda_env": conda_env,
+    "conda_sh": conda_sh,
+    "base_python": shutil.which("python3"),
+}
 checks = {
     "remote_cwd_exists": os.path.isdir(cwd),
     "python3_available": shutil.which("python3") is not None,
@@ -136,23 +181,43 @@ if os.path.isdir(cwd):
         git = {"available": False, "error": str(exc)}
 python = shutil.which("python3") or "python3"
 if conda_sh and conda_env:
+    runtime_probe = (
+        "import importlib.metadata, json, shutil, sys\\n"
+        "packages = {}\\n"
+        "for name, dist in [('numpy','numpy'),('scipy','scipy'),('torch','torch'),('wandb','wandb'),('sklearn','scikit-learn')]:\\n"
+        "    try:\\n"
+        "        packages[name] = importlib.metadata.version(dist)\\n"
+        "    except Exception:\\n"
+        "        packages[name] = None\\n"
+        "print(json.dumps({'ok': True, 'python': sys.executable, 'python_on_path': shutil.which('python'), 'packages': packages}))\\n"
+    )
     probe = (
         "source " + shlex.quote(conda_sh)
         + " && conda activate " + shlex.quote(conda_env)
-        + " && python - <<'PY'\\n"
-        "import json, shutil, torch\\n"
-        "print(json.dumps({'ok': True, 'python': shutil.which('python'), 'torch': getattr(torch, '__version__', None)}))\\n"
-        "PY"
+        + " && python -c " + shlex.quote(runtime_probe)
     )
     result = subprocess.run(['bash', '-lc', probe], capture_output=True, text=True)
     checks['conda_activate_ok'] = result.returncode == 0
-    checks['torch_import_ok'] = result.returncode == 0
+    if result.returncode == 0:
+        try:
+            runtime_payload = json.loads(result.stdout.strip().splitlines()[-1])
+            runtime.update(runtime_payload)
+            packages = runtime_payload.get("packages") if isinstance(runtime_payload.get("packages"), dict) else {}
+            checks['torch_import_ok'] = bool(packages.get("torch"))
+        except Exception as exc:
+            runtime["parse_error"] = str(exc)
+            runtime["probe_stdout_tail"] = result.stdout[-1000:]
+            checks['torch_import_ok'] = False
+    else:
+        checks['torch_import_ok'] = False
     if result.returncode != 0:
         checks['conda_probe_stdout'] = result.stdout[-1000:]
         checks['conda_probe_stderr'] = result.stderr[-1000:]
+        runtime["probe_stdout_tail"] = result.stdout[-1000:]
+        runtime["probe_stderr_tail"] = result.stderr[-1000:]
 if config_path:
     checks["config_path_exists"] = os.path.isfile(config_path)
-print(json.dumps({"ok": all(v for v in checks.values() if isinstance(v, bool)), "checks": checks, "git": git}))
+print(json.dumps({"ok": all(v for v in checks.values() if isinstance(v, bool)), "checks": checks, "git": git, "runtime": runtime}))
 """
         script = (
             script.replace("__CWD__", repr(remote_cwd))
@@ -160,7 +225,12 @@ print(json.dumps({"ok": all(v for v in checks.values() if isinstance(v, bool)), 
             .replace("__CONDA_ENV__", repr(conda_env))
             .replace("__CONDA_SH__", repr(conda_sh))
         )
-        result = self.run(host, "python3 -c " + shlex.quote(script), timeout=self.settings.command_timeout_seconds)
+        result = self.run(
+            host,
+            "python3 -c " + shlex.quote(script),
+            timeout=self.settings.command_timeout_seconds,
+            read_only=True,
+        )
         payload = json.loads(result.stdout.strip().splitlines()[-1])
         classification = "ok" if payload.get("ok") else "preflight_incomplete"
         return {
@@ -221,7 +291,12 @@ print(json.dumps(payload))
             .replace("__TIMEOUT__", repr(timeout_seconds))
         )
         try:
-            result = self.run(host, "python3 -c " + shlex.quote(script), timeout=timeout_seconds + 10)
+            result = self.run(
+                host,
+                "python3 -c " + shlex.quote(script),
+                timeout=timeout_seconds + 10,
+                read_only=True,
+            )
             payload = json.loads(result.stdout.strip().splitlines()[-1])
             stdout_tail = redact_text(str(payload.get("stdout_tail") or ""))
             stderr_tail = redact_text(str(payload.get("stderr_tail") or ""))
@@ -273,7 +348,7 @@ print(json.dumps(payload))
             "nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu "
             "--format=csv,noheader,nounits"
         )
-        result = self.run(host, query)
+        result = self.run(host, query, read_only=True)
         gpus = []
         threshold_gb = min_free_gb if min_free_gb is not None else self.settings.gpu_min_free_gb
         util_limit = max_util if max_util is not None else self.settings.gpu_max_util
@@ -305,6 +380,8 @@ print(json.dumps(payload))
         remote_cwd: str | None,
         sweep_path: str | None,
         wandb_api_key: str | None,
+        conda_env: str | None = None,
+        conda_sh: str = "/opt/anaconda3/etc/profile.d/conda.sh",
     ) -> dict[str, Any]:
         if not wandb_api_key:
             return {"ok": False, "classification": "wandb_auth_missing", "has_key": False}
@@ -322,11 +399,15 @@ except Exception as exc:
 """
         script = script.replace("__SWEEP_PATH__", repr(sweep_path))
         prefix = f"cd {shlex.quote(remote_cwd)} && " if remote_cwd else ""
+        runtime = "python3"
+        if conda_env:
+            runtime = f"source {shlex.quote(conda_sh)} && conda run -n {shlex.quote(conda_env)} python3"
         result = self.run_with_wandb_key(
             host,
-            prefix + "python3 -c " + shlex.quote(script),
+            prefix + runtime + " -c " + shlex.quote(script),
             wandb_api_key=wandb_api_key,
             timeout=self.settings.command_timeout_seconds,
+            read_only=True,
         )
         payload = json.loads(result.stdout.strip().splitlines()[-1])
         payload.update({"host": host, "sweep_path": sweep_path, "command": result.summary()})
@@ -518,12 +599,20 @@ print(json.dumps(payload))
             "launcher": payload,
         }
 
-    def check_run_status(self, *, host: str, status_path: str, pids: list[str] | None = None) -> dict[str, Any]:
+    def check_run_status(
+        self,
+        *,
+        host: str,
+        status_path: str,
+        pids: list[str] | None = None,
+        proc_root: str = "/proc",
+    ) -> dict[str, Any]:
         pid_json = json.dumps([str(pid) for pid in (pids or []) if str(pid).strip()])
         script = """
-import json, os, signal
+import json, os
 status_path = __STATUS_PATH__
 pids = [int(pid) for pid in json.loads(__PIDS__) if str(pid).isdigit()]
+proc_root = __PROC_ROOT__
 status = {}
 try:
     with open(status_path, encoding="utf-8") as handle:
@@ -532,27 +621,47 @@ try:
             status = loaded
 except FileNotFoundError:
     status = {"status_path": status_path, "missing": True}
+expected_command = [str(item) for item in (status.get("command") or [])]
+
+def read_cmdline(pid):
+    try:
+        raw = open(os.path.join(proc_root, str(pid), "cmdline"), "rb").read()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    except (PermissionError, OSError):
+        return []
+    return [part.decode("utf-8", "replace") for part in raw.split(b"\\0") if part]
+
+def matches_expected(argv):
+    if not argv or not expected_command:
+        return False
+    return argv == expected_command or (len(argv) >= len(expected_command) and argv[-len(expected_command):] == expected_command)
+
 alive = []
-for pid in pids:
-    try:
-        os.kill(pid, 0)
+reused = []
+for pid in sorted(set(pids + [int(status.get("child_pid"))] if str(status.get("child_pid") or "").isdigit() else pids)):
+    argv = read_cmdline(pid)
+    if argv is None:
+        continue
+    if matches_expected(argv):
         alive.append(str(pid))
-    except ProcessLookupError:
-        pass
-    except PermissionError:
-        alive.append(str(pid))
-child_pid = status.get("child_pid")
-if child_pid:
-    try:
-        os.kill(int(child_pid), 0)
-        alive.append(str(child_pid))
-    except Exception:
-        pass
+    else:
+        reused.append(str(pid))
 status["alive_pids"] = sorted(set(alive))
+status["unmatched_reused_pids"] = sorted(set(reused))
 print(json.dumps(status))
 """
-        script = script.replace("__STATUS_PATH__", repr(status_path)).replace("__PIDS__", repr(pid_json))
-        result = self.run(host, "python3 -c " + shlex.quote(script), timeout=self.settings.command_timeout_seconds)
+        script = (
+            script.replace("__STATUS_PATH__", repr(status_path))
+            .replace("__PIDS__", repr(pid_json))
+            .replace("__PROC_ROOT__", repr(proc_root))
+        )
+        result = self.run(
+            host,
+            "python3 -c " + shlex.quote(script),
+            timeout=self.settings.command_timeout_seconds,
+            read_only=True,
+        )
         payload = json.loads(result.stdout.strip().splitlines()[-1])
         payload["host"] = host
         payload["command"] = result.summary()
@@ -564,39 +673,67 @@ print(json.dumps(status))
         host: str,
         sweep_path: str | None = None,
         pids: list[str] | None = None,
+        proc_root: str = "/proc",
     ) -> dict[str, Any]:
         pid_json = json.dumps([str(pid) for pid in (pids or []) if str(pid).strip()])
         script = """
-import json, os, subprocess
+import glob, json, os
 pids = [int(pid) for pid in json.loads(__PIDS__) if str(pid).isdigit()]
 sweep_path = __SWEEP_PATH__
-alive_pids = []
+proc_root = __PROC_ROOT__
+
+def read_cmdline(pid):
+    try:
+        raw = open(os.path.join(proc_root, str(pid), "cmdline"), "rb").read()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    except (PermissionError, OSError):
+        return []
+    return [part.decode("utf-8", "replace") for part in raw.split(b"\\0") if part]
+
+def matches_sweep(argv):
+    if not argv or not sweep_path:
+        return False
+    return any(
+        os.path.basename(argv[index]) == "wandb"
+        and argv[index + 1:index + 3] == ["agent", sweep_path]
+        for index in range(max(0, len(argv) - 2))
+    )
+
+matched = []
+tracked_alive = []
+reused = []
+all_pids = sorted({int(path.rsplit("/", 1)[-1]) for path in glob.glob(os.path.join(proc_root, "[0-9]*"))})
+for pid in all_pids:
+    argv = read_cmdline(pid)
+    if matches_sweep(argv):
+        matched.append({"pid": str(pid)})
 for pid in pids:
-    try:
-        os.kill(pid, 0)
-        alive_pids.append(str(pid))
-    except ProcessLookupError:
-        pass
-    except PermissionError:
-        alive_pids.append(str(pid))
-pgrep = []
-if sweep_path:
-    try:
-        out = subprocess.run(["pgrep", "-af", "wandb agent " + sweep_path], capture_output=True, text=True)
-        for line in out.stdout.splitlines():
-            parts = line.split(None, 1)
-            if parts and parts[0].isdigit():
-                pgrep.append({"pid": parts[0], "command": parts[1] if len(parts) > 1 else ""})
-    except Exception as exc:
-        pgrep.append({"error": str(exc)})
+    argv = read_cmdline(pid)
+    if argv is None:
+        continue
+    if matches_sweep(argv):
+        tracked_alive.append(str(pid))
+    else:
+        reused.append(str(pid))
 print(json.dumps({
     "tracked_pids": [str(pid) for pid in pids],
-    "alive_pids": sorted(set(alive_pids)),
-    "pgrep": pgrep,
+    "alive_pids": sorted(set(tracked_alive)),
+    "pgrep": matched,
+    "unmatched_reused_pids": sorted(set(reused)),
 }))
 """
-        script = script.replace("__PIDS__", repr(pid_json)).replace("__SWEEP_PATH__", repr(sweep_path))
-        result = self.run(host, "python3 -c " + shlex.quote(script), timeout=self.settings.command_timeout_seconds)
+        script = (
+            script.replace("__PIDS__", repr(pid_json))
+            .replace("__SWEEP_PATH__", repr(sweep_path))
+            .replace("__PROC_ROOT__", repr(proc_root))
+        )
+        result = self.run(
+            host,
+            "python3 -c " + shlex.quote(script),
+            timeout=self.settings.command_timeout_seconds,
+            read_only=True,
+        )
         payload = json.loads(result.stdout.strip().splitlines()[-1])
         payload.update({"host": host, "sweep_path": sweep_path, "command": result.summary()})
         return payload
@@ -676,7 +813,12 @@ for launch in payload.get("launches") or []:
 print(json.dumps({"pid_state": pid_state, "logs": logs}))
 """
         script = script.replace("__PAYLOAD__", repr(json.dumps(payload))).replace("__REMOTE_CWD__", repr(remote_cwd))
-        result = self.run(host, "python3 -c " + shlex.quote(script), timeout=self.settings.command_timeout_seconds)
+        result = self.run(
+            host,
+            "python3 -c " + shlex.quote(script),
+            timeout=self.settings.command_timeout_seconds,
+            read_only=True,
+        )
         remote_payload = json.loads(result.stdout.strip().splitlines()[-1])
         return build_failure_diagnostics(
             host=host,
@@ -688,15 +830,60 @@ print(json.dumps({"pid_state": pid_state, "logs": logs}))
             command=result.summary(),
         )
 
-    def stop_pids(self, *, host: str, pids: list[str]) -> dict[str, Any]:
+    def stop_pids(
+        self,
+        *,
+        host: str,
+        pids: list[str],
+        status_path: str | None = None,
+        expected_job_id: str | None = None,
+        proc_root: str = "/proc",
+    ) -> dict[str, Any]:
         pid_json = json.dumps([str(pid) for pid in pids if str(pid).strip()])
         script = """
 import json, os, signal
 target_pids = [int(pid) for pid in json.loads(__PIDS__) if str(pid).isdigit()]
+status_path = __STATUS_PATH__
+expected_job_id = __EXPECTED_JOB_ID__
+proc_root = __PROC_ROOT__
+status = {}
+try:
+    with open(status_path, encoding="utf-8") as handle:
+        loaded = json.load(handle)
+        if isinstance(loaded, dict):
+            status = loaded
+except (FileNotFoundError, OSError, json.JSONDecodeError):
+    pass
+expected_command = [str(item) for item in (status.get("command") or [])]
+
+def read_cmdline(pid):
+    try:
+        raw = open(os.path.join(proc_root, str(pid), "cmdline"), "rb").read()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    except (PermissionError, OSError):
+        return []
+    return [part.decode("utf-8", "replace") for part in raw.split(b"\\0") if part]
+
+def matches_receipt(pid, argv):
+    if not argv or not expected_command or status.get("job_id") != expected_job_id:
+        return False
+    if str(status.get("child_pid") or "") != str(pid):
+        return False
+    return argv == expected_command or (len(argv) >= len(expected_command) and argv[-len(expected_command):] == expected_command)
+
 stopped = []
 missing = []
 still_running = []
+unmatched_reused = []
 for pid in target_pids:
+    argv = read_cmdline(pid)
+    if argv is None:
+        missing.append(str(pid))
+        continue
+    if not matches_receipt(pid, argv):
+        unmatched_reused.append(str(pid))
+        continue
     try:
         os.kill(pid, signal.SIGTERM)
         stopped.append(str(pid))
@@ -704,24 +891,106 @@ for pid in target_pids:
         missing.append(str(pid))
     except Exception:
         still_running.append(str(pid))
-print(json.dumps({"stopped_pids": sorted(set(stopped)), "missing_pids": sorted(set(missing)), "still_running_pids": sorted(set(still_running))}))
+print(json.dumps({
+    "stopped_pids": sorted(set(stopped)),
+    "missing_pids": sorted(set(missing)),
+    "still_running_pids": sorted(set(still_running)),
+    "unmatched_reused_pids": sorted(set(unmatched_reused)),
+}))
 """
-        script = script.replace("__PIDS__", repr(pid_json))
-        result = self.run(host, "python3 -c " + shlex.quote(script), timeout=self.settings.command_timeout_seconds)
+        script = (
+            script.replace("__PIDS__", repr(pid_json))
+            .replace("__STATUS_PATH__", repr(status_path or ""))
+            .replace("__EXPECTED_JOB_ID__", repr(expected_job_id or ""))
+            .replace("__PROC_ROOT__", repr(proc_root))
+        )
+        result = self.run(
+            host,
+            "python3 -c " + shlex.quote(script),
+            timeout=self.settings.command_timeout_seconds,
+        )
         payload = json.loads(result.stdout.strip().splitlines()[-1])
         payload.update({"host": host, "command": result.summary()})
         return payload
 
-    def stop_agents(self, *, host: str, sweep_path: str, pids: list[str] | None = None) -> dict[str, Any]:
-        pid_terms = " ".join(shlex.quote(str(pid)) for pid in (pids or []) if str(pid).strip())
-        pid_kill = f"kill -TERM {pid_terms} 2>/dev/null || true; " if pid_terms else ""
-        remote = (
-            pid_kill
-            + f"pgrep -af {shlex.quote('wandb agent ' + sweep_path)} "
-            + "| awk '{print $1}' | xargs -r kill -TERM"
+    def stop_agents(
+        self,
+        *,
+        host: str,
+        sweep_path: str,
+        pids: list[str] | None = None,
+        proc_root: str = "/proc",
+    ) -> dict[str, Any]:
+        pid_json = json.dumps([str(pid) for pid in (pids or []) if str(pid).strip()])
+        script = """
+import glob, json, os, signal
+tracked_pids = [int(pid) for pid in json.loads(__PIDS__) if str(pid).isdigit()]
+sweep_path = __SWEEP_PATH__
+proc_root = __PROC_ROOT__
+
+def read_cmdline(pid):
+    try:
+        raw = open(os.path.join(proc_root, str(pid), "cmdline"), "rb").read()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    except (PermissionError, OSError):
+        return []
+    return [part.decode("utf-8", "replace") for part in raw.split(b"\\0") if part]
+
+def matches_sweep(argv):
+    if not argv:
+        return False
+    return any(
+        os.path.basename(argv[index]) == "wandb"
+        and argv[index + 1:index + 3] == ["agent", sweep_path]
+        for index in range(max(0, len(argv) - 2))
+    )
+
+matched = []
+reused = []
+missing = []
+all_pids = sorted({int(path.rsplit("/", 1)[-1]) for path in glob.glob(os.path.join(proc_root, "[0-9]*"))})
+for pid in all_pids:
+    argv = read_cmdline(pid)
+    if matches_sweep(argv):
+        matched.append(pid)
+for pid in tracked_pids:
+    argv = read_cmdline(pid)
+    if argv is None:
+        missing.append(str(pid))
+    elif not matches_sweep(argv):
+        reused.append(str(pid))
+stopped = []
+failed = []
+for pid in matched:
+    try:
+        os.kill(pid, signal.SIGTERM)
+        stopped.append(str(pid))
+    except ProcessLookupError:
+        missing.append(str(pid))
+    except Exception:
+        failed.append(str(pid))
+print(json.dumps({
+    "matched_pids": sorted({str(pid) for pid in matched}),
+    "stopped_pids": sorted(set(stopped)),
+    "missing_pids": sorted(set(missing)),
+    "still_running_pids": sorted(set(failed)),
+    "unmatched_reused_pids": sorted(set(reused)),
+}))
+"""
+        script = (
+            script.replace("__PIDS__", repr(pid_json))
+            .replace("__SWEEP_PATH__", repr(sweep_path))
+            .replace("__PROC_ROOT__", repr(proc_root))
         )
-        result = self.run(host, remote, timeout=self.settings.command_timeout_seconds)
-        return {"host": host, "sweep_path": sweep_path, "command": result.summary()}
+        result = self.run(
+            host,
+            "python3 -c " + shlex.quote(script),
+            timeout=self.settings.command_timeout_seconds,
+        )
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        payload.update({"host": host, "sweep_path": sweep_path, "command": result.summary()})
+        return payload
 
     def pull_single_run_result(
         self,
@@ -779,7 +1048,12 @@ print(json.dumps({
             .replace("__METRIC_KEYS__", repr(metric_keys))
             .replace("__GROUP_KEYS__", repr(group_keys))
         )
-        result = self.run(host, "python3 -c " + shlex.quote(script), timeout=self.settings.command_timeout_seconds)
+        result = self.run(
+            host,
+            "python3 -c " + shlex.quote(script),
+            timeout=self.settings.command_timeout_seconds,
+            read_only=True,
+        )
         payload = json.loads(result.stdout.strip().splitlines()[-1])
         payload["host"] = host
         payload["command"] = result.summary()
@@ -835,12 +1109,14 @@ print(json.dumps({
         metric_paths: list[str] | None = None,
         group_paths: list[str] | None = None,
         output_globs: list[str] | None = None,
+        discovery_mode: str = "legacy_auto_v1",
         comparison_paths: list[str] | None = None,
         include_raw_artifacts: bool = False,
     ) -> dict[str, Any]:
         script = """
-import glob, json, os, re, time
+import glob, json, os, re, stat, time
 cwd = __CWD__
+cwd_real = os.path.realpath(cwd)
 sweep_id = __SWEEP_ID__
 run_ids = __RUN_IDS__
 max_runs = __MAX_RUNS__
@@ -849,19 +1125,101 @@ group_keys = __GROUP_KEYS__
 metric_paths = __METRIC_PATHS__
 group_paths = __GROUP_PATHS__
 output_globs = __OUTPUT_GLOBS__
+discovery_mode = __DISCOVERY_MODE__
 comparison_paths = __COMPARISON_PATHS__
 include_raw_artifacts = __INCLUDE_RAW_ARTIFACTS__
+artifact_file_max_bytes = __ARTIFACT_FILE_MAX_BYTES__
+artifact_total_max_bytes = __ARTIFACT_TOTAL_MAX_BYTES__
+artifact_bytes_read = 0
+artifact_cache = {}
+artifact_rejections = {}
 deadline = time.time() + __BUDGET_SECONDS__
 if not run_ids:
     raise SystemExit("target run ids unavailable")
 
-def load_json(path):
+def reject_artifact(run_id, path, reason, source):
+    key = str(run_id or "unknown")
+    item = {"path": str(path), "reason": reason, "source": source}
+    bucket = artifact_rejections.setdefault(key, [])
+    if item not in bucket:
+        bucket.append(item)
+
+def has_parent_reference(path):
+    return ".." in str(path or "").split(os.sep)
+
+def canonical_artifact_path(path, run_id, source, *, reject_parent=True):
+    text = str(path or "").strip()
+    if not text:
+        return None
+    if reject_parent and has_parent_reference(text):
+        reject_artifact(run_id, text, "artifact_path_traversal", source)
+        return None
+    canonical = os.path.realpath(text)
     try:
-        with open(path, encoding="utf-8", errors="replace") as handle:
-            data = json.load(handle)
-        return data if isinstance(data, dict) else {}
-    except Exception:
+        contained = os.path.commonpath([cwd_real, canonical]) == cwd_real
+    except ValueError:
+        contained = False
+    if not contained:
+        reject_artifact(run_id, text, "artifact_outside_remote_cwd", source)
+        return None
+    return canonical
+
+def contained_existing_paths(paths, run_id, source):
+    safe = []
+    for path in paths:
+        canonical = canonical_artifact_path(path, run_id, source, reject_parent=False)
+        if canonical and os.path.isfile(canonical):
+            safe.append(canonical)
+    return sorted(set(safe), key=lambda path: os.path.getmtime(path), reverse=True)
+
+def load_json(path, run_id, source):
+    global artifact_bytes_read
+    canonical = canonical_artifact_path(path, run_id, source, reject_parent=False)
+    if not canonical:
         return {}
+    if canonical in artifact_cache:
+        return artifact_cache[canonical]
+    descriptor = None
+    try:
+        descriptor = os.open(canonical, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            reject_artifact(run_id, canonical, "artifact_not_regular_file", source)
+            return {}
+        if info.st_size > artifact_file_max_bytes:
+            reject_artifact(run_id, canonical, "artifact_file_size_limit_exceeded", source)
+            return {}
+        if artifact_bytes_read + info.st_size > artifact_total_max_bytes:
+            reject_artifact(run_id, canonical, "artifact_total_size_limit_exceeded", source)
+            return {}
+        chunks = []
+        remaining = artifact_file_max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > artifact_file_max_bytes:
+            reject_artifact(run_id, canonical, "artifact_file_size_limit_exceeded", source)
+            return {}
+        if artifact_bytes_read + len(raw) > artifact_total_max_bytes:
+            reject_artifact(run_id, canonical, "artifact_total_size_limit_exceeded", source)
+            return {}
+        artifact_bytes_read += len(raw)
+        data = json.loads(raw.decode("utf-8"))
+        if not isinstance(data, dict):
+            reject_artifact(run_id, canonical, "artifact_json_object_required", source)
+            return {}
+        artifact_cache[canonical] = data
+        return data
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        reject_artifact(run_id, canonical, "artifact_read_or_json_invalid", source)
+        return {}
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 def scalar_map(data):
     out = {}
@@ -946,9 +1304,12 @@ def normalize_remote_path(path, run_id):
         text = text.replace(token, run_id)
     if not text.endswith(".json"):
         return None
+    if has_parent_reference(text):
+        reject_artifact(run_id, text, "artifact_path_traversal", "wandb_config")
+        return None
     if not os.path.isabs(text):
         text = os.path.join(cwd, text)
-    return os.path.normpath(text)
+    return canonical_artifact_path(text, run_id, "wandb_config", reject_parent=False)
 
 def is_progress_path(path):
     return "progress" in os.path.basename(str(path)).lower()
@@ -971,24 +1332,38 @@ def discover_config_paths(wandb_config, run_id):
             candidates.append(item)
     return candidates, progress
 
-def expand_output_globs(patterns, run_id):
+def expand_output_globs(patterns, run_id, source="output_glob"):
     paths = []
     seen = set()
     for pattern in patterns or []:
         text = str(pattern or "")
         for token in ["${wandb.run.id}", "${wandb_run_id}", "{wandb.run.id}", "{run_id}"]:
             text = text.replace(token, run_id)
+        if has_parent_reference(text):
+            reject_artifact(run_id, text, "artifact_path_traversal", source)
+            continue
         if not os.path.isabs(text):
             text = os.path.join(cwd, text)
-        for path in glob.glob(text, recursive=True):
-            if path.endswith(".json") and path not in seen:
-                seen.add(path)
-                paths.append(path)
+        canonical_pattern = canonical_artifact_path(text, run_id, source, reject_parent=False)
+        if not canonical_pattern:
+            continue
+        for path in glob.glob(canonical_pattern, recursive=True):
+            canonical = canonical_artifact_path(path, run_id, source, reject_parent=False)
+            if canonical and canonical.endswith(".json") and canonical not in seen:
+                seen.add(canonical)
+                paths.append(canonical)
     return sorted(paths, key=lambda p: os.path.getmtime(p), reverse=True)
 
-def load_wandb_config(path):
+def load_wandb_config(path, run_id):
+    canonical = canonical_artifact_path(path, run_id, "wandb_config_file", reject_parent=False)
+    if not canonical:
+        return {}
     try:
-        text = open(path, encoding="utf-8", errors="replace").read()
+        with open(canonical, encoding="utf-8", errors="replace") as handle:
+            text = handle.read(artifact_file_max_bytes + 1)
+        if len(text.encode("utf-8")) > artifact_file_max_bytes:
+            reject_artifact(run_id, canonical, "wandb_config_size_limit_exceeded", "wandb_config_file")
+            return {}
     except Exception:
         return {}
     config = {}
@@ -1011,6 +1386,12 @@ def load_wandb_config(path):
             current_key = None
     return config
 
+def update_discovery_rejection(run_id):
+    rejections = artifact_rejections.get(str(run_id)) or []
+    if rejections and run_id in discovery_sources:
+        discovery_sources[run_id]["classification"] = rejections[0]["reason"]
+        discovery_sources[run_id]["artifact_rejections"] = rejections
+
 rows = []
 config_sources = {}
 metric_sources = {}
@@ -1020,29 +1401,55 @@ missing_metric_paths = {}
 missing_comparison_paths = {}
 discovery_sources = {}
 raw_artifacts = []
+claimed_output_paths = {}
 for run_id in run_ids[:max_runs]:
     if len(rows) >= max_runs or time.time() > deadline:
         break
-    summary_paths = glob.glob(os.path.join(cwd, "wandb", f"run-*{run_id}", "files", "wandb-summary.json"))
-    summary_paths = sorted(set(summary_paths), key=lambda p: os.path.getmtime(p), reverse=True)
-    config_paths = glob.glob(os.path.join(cwd, "wandb", f"run-*{run_id}", "files", "config.yaml"))
-    config_paths = sorted(set(config_paths), key=lambda p: os.path.getmtime(p), reverse=True)
-    wandb_config = load_wandb_config(config_paths[0]) if config_paths else {}
+    summary_paths = contained_existing_paths(
+        glob.glob(os.path.join(cwd, "wandb", f"run-*{run_id}", "files", "wandb-summary.json")),
+        run_id,
+        "wandb_summary",
+    )
+    config_paths = contained_existing_paths(
+        glob.glob(os.path.join(cwd, "wandb", f"run-*{run_id}", "files", "config.yaml")),
+        run_id,
+        "wandb_config_file",
+    )
+    wandb_config = load_wandb_config(config_paths[0], run_id) if config_paths else {}
     config_candidates, progress_candidates = discover_config_paths(wandb_config, run_id)
-    output_patterns = [
-        os.path.join(cwd, "investigations", "**", "experiments", "outputs", f"*{run_id}*.json"),
-        os.path.join(cwd, "outputs", f"*{run_id}*.json"),
-    ]
     config_output_paths = []
     for item in config_candidates:
         if item["exists"]:
             config_output_paths.append(item["path"])
-    fallback_output_paths = []
-    if not config_output_paths:
-        for pattern in output_patterns:
-            fallback_output_paths.extend(glob.glob(pattern, recursive=True))
-        fallback_output_paths.extend(expand_output_globs(output_globs, run_id))
-    raw_output_paths = config_output_paths or fallback_output_paths
+    contract_error = None
+    if discovery_mode == "run_id_output_globs_v1":
+        raw_output_paths = sorted(set(expand_output_globs(output_globs, run_id)))
+        if len(raw_output_paths) != 1:
+            contract_error = "expected_exactly_one_run_artifact"
+            raw_output_paths = []
+    elif discovery_mode == "wandb_config_result_path_v1":
+        raw_output_paths = sorted(set(os.path.realpath(path) for path in config_output_paths))
+        if len(raw_output_paths) != 1:
+            contract_error = "expected_exactly_one_config_result_path"
+            raw_output_paths = []
+    else:
+        output_patterns = [
+            os.path.join(cwd, "investigations", "**", "experiments", "outputs", f"*{run_id}*.json"),
+            os.path.join(cwd, "outputs", f"*{run_id}*.json"),
+        ]
+        fallback_output_paths = []
+        if not config_output_paths:
+            fallback_output_paths.extend(expand_output_globs(output_patterns, run_id, "default_output_glob"))
+            fallback_output_paths.extend(expand_output_globs(output_globs, run_id))
+        raw_output_paths = config_output_paths or fallback_output_paths
+    if len(raw_output_paths) == 1:
+        canonical = os.path.realpath(raw_output_paths[0])
+        previous_owner = claimed_output_paths.get(canonical)
+        if previous_owner and previous_owner != run_id:
+            contract_error = "artifact_path_claimed_by_multiple_runs"
+            raw_output_paths = []
+        else:
+            claimed_output_paths[canonical] = run_id
     progress_paths = [item["path"] for item in progress_candidates if item.get("exists")]
     progress_paths.extend(path for path in raw_output_paths if is_progress_path(path))
     output_paths = []
@@ -1060,15 +1467,22 @@ for run_id in run_ids[:max_runs]:
         "progress_paths": sorted(set(progress_paths)),
         "output_globs": list(output_globs or []),
         "selected_paths": output_paths[:3],
+        "classification": contract_error or "ok",
     }
+    update_discovery_rejection(run_id)
     data = {}
     sources = []
     if summary_paths:
-        data.update(load_json(summary_paths[0]))
-        sources.append(summary_paths[0])
+        summary_data = load_json(summary_paths[0], run_id, "wandb_summary")
+        if summary_data:
+            data.update(summary_data)
+            sources.append(summary_paths[0])
     for output_path in output_paths[:3]:
-        data.update(load_json(output_path))
-        sources.append(output_path)
+        output_data = load_json(output_path, run_id, "result_artifact")
+        if output_data:
+            data.update(output_data)
+            sources.append(output_path)
+    update_discovery_rejection(run_id)
     if not data:
         config = {key: wandb_config.get(key) for key in group_keys} if group_keys else {}
         for key in group_keys:
@@ -1140,12 +1554,16 @@ for run_id in run_ids[:max_runs]:
         comparison_sources.setdefault(run_id, {})[key] = sources[0] if sources else None
     if include_raw_artifacts:
         for output_path in output_paths[:3]:
-            raw_artifacts.append({
-                "run_id": run_id,
-                "path": output_path,
-                "basename": os.path.basename(output_path),
-                "content": load_json(output_path),
-            })
+            raw_content = load_json(output_path, run_id, "raw_result_artifact")
+            if raw_content:
+                raw_artifacts.append({
+                    "run_id": run_id,
+                    "path": output_path,
+                    "basename": os.path.basename(output_path),
+                    "content": raw_content,
+                    "valid_json": True,
+                })
+    update_discovery_rejection(run_id)
     has_result = bool(metrics)
     rows.append({"run_id": run_id, "sources": sources, "config": config, "metrics": metrics, "comparisons": comparisons, "has_scientific_result": has_result, "missing_metric_paths": missing_metric_paths.get(run_id, []), "missing_comparison_paths": missing_comparison_paths.get(run_id, [])})
 if not rows:
@@ -1166,6 +1584,13 @@ print(json.dumps({
     "missing_comparison_paths": missing_comparison_paths,
     "discovery_sources": discovery_sources,
     "raw_artifacts": raw_artifacts,
+    "discovery_mode": discovery_mode,
+    "artifact_rejections": artifact_rejections,
+    "artifact_bytes_read": artifact_bytes_read,
+    "artifact_limits": {
+        "file_bytes": artifact_file_max_bytes,
+        "total_bytes": artifact_total_max_bytes,
+    },
 }))
 """
         script = (
@@ -1178,11 +1603,19 @@ print(json.dumps({
             .replace("__METRIC_PATHS__", repr(metric_paths or []))
             .replace("__GROUP_PATHS__", repr(group_paths or []))
             .replace("__OUTPUT_GLOBS__", repr(output_globs or []))
+            .replace("__DISCOVERY_MODE__", repr(discovery_mode))
             .replace("__COMPARISON_PATHS__", repr(comparison_paths or []))
             .replace("__INCLUDE_RAW_ARTIFACTS__", repr(bool(include_raw_artifacts)))
+            .replace("__ARTIFACT_FILE_MAX_BYTES__", repr(MAX_RESULT_ARTIFACT_FILE_BYTES))
+            .replace("__ARTIFACT_TOTAL_MAX_BYTES__", repr(MAX_RESULT_ARTIFACT_TOTAL_BYTES))
             .replace("__BUDGET_SECONDS__", repr(budget_seconds))
         )
-        result = self.run(host, "python3 -c " + shlex.quote(script), timeout=budget_seconds + 10)
+        result = self.run(
+            host,
+            "python3 -c " + shlex.quote(script),
+            timeout=budget_seconds + 10,
+            read_only=True,
+        )
         payload = json.loads(result.stdout.strip().splitlines()[-1])
         payload["host"] = host
         payload["command"] = result.summary()
@@ -1210,6 +1643,7 @@ ERROR_SIGNAL_PATTERNS = [
     ("file_error", re.compile(r"(?:FileNotFoundError|No such file or directory):[^\n]+")),
     ("runtime_error", re.compile(r"RuntimeError:[^\n]+")),
     ("wandb_error", re.compile(r"(?:wandb:[^\n]*(?:ERROR|error)[^\n]*|CommError:[^\n]+|Authentication failed[^\n]*)", re.IGNORECASE)),
+    ("wandb_agent_killed_runs", re.compile(r"(?:Killing runs and quitting|killing run[s]?|agent .*quitting|received .*exit)", re.IGNORECASE)),
     ("command_error", re.compile(r"(?:command not found|No such file or directory|conda:|CondaError)[^\n]*", re.IGNORECASE)),
 ]
 
@@ -1301,6 +1735,7 @@ def summarize_failure_signals(signals: list[dict[str, Any]]) -> str:
         "import_error",
         "file_error",
         "wandb_error",
+        "wandb_agent_killed_runs",
         "command_error",
         "agent_process_missing",
         "missing_log",
@@ -1317,6 +1752,8 @@ def next_actions_for_diagnostics(signals: list[dict[str, Any]]) -> list[str]:
         return ["根据 error_signals 中的 traceback/excerpt 在本地修复代码，走 GitHub 同步后再创建新的验证 run/sweep。"]
     if "wandb_error" in kinds:
         return ["检查 WANDB_API_KEY、entity/project/sweep 权限与网络；修复后对同一 job 执行 recover-agents。"]
+    if "wandb_agent_killed_runs" in kinds:
+        return ["W&B agent 日志显示调度层中断并杀掉运行；不要解释为科学失败，先核对 agent 生命周期、max_agents/队列策略和既有 job 诊断后再决定 recover 或重跑。"]
     if "command_error" in kinds:
         return ["检查远端 conda/env/path/program 配置；修复环境后对同一 job 执行 recover-agents。"]
     if "agent_process_missing" in kinds:

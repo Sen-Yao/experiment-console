@@ -80,11 +80,8 @@ def compute_sweep_telemetry(
     running = raw_running
     consistency = "consistent"
     if state == "finished" and source == "wandb_runs" and expected > 0 and run_count >= expected:
-        normalized_finished = max(raw_finished, expected - raw_failed)
-        if raw_running or normalized_finished != raw_finished:
+        if raw_running or raw_finished != expected or raw_failed:
             consistency = "terminal_run_edges_stale"
-        finished = normalized_finished
-        running = 0
     elif source == "wandb_sweep_runCount":
         consistency = "fallback_from_sweep_count"
 
@@ -107,6 +104,14 @@ def compute_sweep_telemetry(
         "last_sync_at": stamp,
         "speed_per_hour": speed,
         "eta_seconds": eta,
+        "progress_evidence": _progress_evidence(
+            state=state,
+            runs=runs,
+            observed_at=stamp,
+            running=running,
+            finished=finished,
+            expected=expected,
+        ),
         "run_state_counts_source": source,
         "raw_run_state_counts": {
             "finished": raw_finished,
@@ -190,6 +195,67 @@ def _typical_finished_run_seconds(runs: list[dict[str, Any]]) -> float | None:
     return (durations[middle - 1] + durations[middle]) / 2
 
 
+def _progress_evidence(
+    *,
+    state: str,
+    runs: list[dict[str, Any]],
+    observed_at: str,
+    running: int,
+    finished: int,
+    expected: int,
+) -> dict[str, Any] | None:
+    if state in TERMINAL_STATES:
+        return None
+    current_at = _parse_time(observed_at)
+    active_runs = [run for run in runs if _run_state(run) in RUNNING_STATES]
+    if not active_runs:
+        if expected > 0 and finished > 0:
+            return {
+                "classification": "completed_run_evidence",
+                "message": f"{finished}/{expected} runs have completed; waiting for the next run-state change.",
+            }
+        return None
+
+    ages = []
+    heartbeat_lags = []
+    heartbeat_times = []
+    for run in active_runs:
+        started = _parse_time(run.get("created_at"))
+        if started and current_at:
+            ages.append(max(0, int(round((current_at - started).total_seconds()))))
+        heartbeat = _parse_time(run.get("heartbeat_at"))
+        if heartbeat:
+            heartbeat_times.append(heartbeat.isoformat(timespec="seconds"))
+            if current_at:
+                heartbeat_lags.append(max(0, int(round((current_at - heartbeat).total_seconds()))))
+
+    evidence: dict[str, Any] = {
+        "classification": "active_run_evidence",
+        "active_run_count": len(active_runs),
+        "message": f"{len(active_runs)} W&B run(s) are active",
+    }
+    if expected > 0:
+        evidence["expected_runs"] = expected
+    if finished > 0:
+        evidence["finished_runs"] = finished
+    if ages:
+        evidence["oldest_active_run_age_seconds"] = max(ages)
+        evidence["youngest_active_run_age_seconds"] = min(ages)
+    if heartbeat_times:
+        evidence["newest_active_run_heartbeat_at"] = max(heartbeat_times)
+    if heartbeat_lags:
+        evidence["newest_active_run_heartbeat_lag_seconds"] = min(heartbeat_lags)
+
+    details = []
+    if ages:
+        details.append(f"oldest active for {_format_duration(max(ages))}")
+    if heartbeat_lags:
+        details.append(f"last heartbeat {_format_duration(min(heartbeat_lags))} ago")
+    if details:
+        evidence["message"] = f"{evidence['message']}; " + "; ".join(details)
+    return evidence
+
+
 def _eta_seconds(
     expected: int,
     finished: int,
@@ -222,6 +288,19 @@ def _eta_seconds(
     if not speed_per_hour or speed_per_hour <= 0:
         return None
     return int(round((expected - finished) / speed_per_hour * 3600))
+
+
+def _format_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    if hours and minutes:
+        return f"{hours}h {minutes}m"
+    if hours:
+        return f"{hours}h"
+    if minutes:
+        return f"{minutes}m"
+    return f"{seconds}s"
 
 
 def _parse_time(value: Any) -> datetime | None:

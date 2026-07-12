@@ -63,6 +63,7 @@ class JobStatus(str, Enum):
     queued = "queued"
     validating = "validating"
     running = "running"
+    finalizing = "finalizing"
     attention = "attention"
     finished = "finished"
     failed = "failed"
@@ -111,6 +112,10 @@ class LaunchSweepPayload(BaseModel):
     queue_policy: Literal["sequential", "immediate"] = "sequential"
     queue_group: str | None = None
     queue_after_job_id: str | None = None
+    result_contract: "ResultContract | None" = None
+    thread_id: str | None = None
+    monitor_every: str = "10m"
+    monitor_timeout_seconds: int = 300
     idempotency_key: str | None = None
 
     @field_validator("max_agents")
@@ -167,6 +172,10 @@ class RegisterExistingSweepPayload(BaseModel):
     remote_cwd: str
     conda_env: str | None = None
     expected_total: int | None = None
+    result_contract: "ResultContract | None" = None
+    thread_id: str | None = None
+    monitor_every: str = "10m"
+    monitor_timeout_seconds: int = 300
     idempotency_key: str | None = None
 
 
@@ -207,12 +216,53 @@ class RepairWatchdogPayload(BaseModel):
     idempotency_key: str | None = None
 
 
+class ResultContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: int = 1
+    expected_runs: int
+    max_runs: int | None = None
+    metric_keys: list[str] = Field(default_factory=list)
+    group_keys: list[str] = Field(default_factory=list)
+    metric_paths: list[str] = Field(default_factory=list)
+    group_paths: list[str] = Field(default_factory=list)
+    output_globs: list[str] = Field(default_factory=list)
+    comparison_paths: list[str] = Field(default_factory=list)
+    matrix_by: list[str] = Field(default_factory=list)
+    allow_partial: bool = False
+    export_artifacts: bool = True
+    discovery_mode: Literal["run_id_output_globs_v1", "wandb_config_result_path_v1"] = "run_id_output_globs_v1"
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> "ResultContract":
+        if self.expected_runs <= 0:
+            raise ValueError("result_contract.expected_runs must be positive")
+        if self.max_runs is None:
+            self.max_runs = self.expected_runs
+        if self.max_runs is not None and self.max_runs != self.expected_runs:
+            raise ValueError("result_contract.max_runs must equal expected_runs")
+        if self.allow_partial:
+            raise ValueError("result_contract.allow_partial must be false for production monitoring")
+        if not self.export_artifacts:
+            raise ValueError("result_contract.export_artifacts must be true for atomic result sync")
+        if self.discovery_mode == "run_id_output_globs_v1":
+            globs = [str(item).strip() for item in self.output_globs if str(item).strip()]
+            if not globs:
+                raise ValueError("result_contract.output_globs must be non-empty for run-id discovery")
+            tokens = ["{run_id}", "${wandb.run.id}", "${wandb_run_id}", "{wandb.run.id}"]
+            if any(sum(pattern.count(token) for token in tokens) != 1 for pattern in globs):
+                raise ValueError("each result_contract output_glob must contain exactly one run-id token")
+        return self
+
+
 class ScheduleMonitorPayload(BaseModel):
     job_id: str
     every: str = "10m"
     timeout_seconds: int = 300
     notify_channel: str | None = None
     notify_target: str | None = None
+    thread_id: str | None = None
+    result_contract: ResultContract | None = None
     idempotency_key: str | None = None
 
     @field_validator("timeout_seconds")
@@ -226,6 +276,12 @@ class ScheduleMonitorPayload(BaseModel):
 class UnscheduleMonitorPayload(BaseModel):
     job_id: str
     idempotency_key: str | None = None
+
+
+class AckWakeEventPayload(BaseModel):
+    consumer_id: str
+    expected_ledger_id: str
+    lease_token: str
 
 
 class WatchdogOncePayload(BaseModel):
@@ -275,6 +331,7 @@ class PullResultsPayload(BaseModel):
     metric_paths: list[str] = Field(default_factory=list)
     group_paths: list[str] = Field(default_factory=list)
     output_globs: list[str] = Field(default_factory=list)
+    discovery_mode: Literal["legacy_auto_v1", "run_id_output_globs_v1", "wandb_config_result_path_v1"] = "legacy_auto_v1"
     comparison_paths: list[str] = Field(default_factory=list)
     matrix_by: list[str] = Field(default_factory=list)
     export_artifacts: bool = False

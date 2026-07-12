@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+import hmac
 from pathlib import Path
 import subprocess
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
 
 from .config import Settings
 from .models import (
     ConfirmRequest,
+    AckWakeEventPayload,
     AdvanceQueuePayload,
     AuthCheckPayload,
     CancelSweepPayload,
@@ -29,12 +33,36 @@ from .models import (
     WatchdogOncePayload,
 )
 from .service import ConsoleService
+from .monitor import MonitorWorker
+from .store import WakeEventLedgerMismatch, WakeEventLeaseConflict
 
 
 settings = Settings()
 service = ConsoleService(settings)
+monitor_worker = MonitorWorker(service)
 
-app = FastAPI(title="Experiment Console", version="0.1.0")
+
+def _configured_console_api_token() -> str | None:
+    if settings.authority_role == "authoritative" and settings.console_api_token_file is None:
+        return None
+    token = settings.console_api_token()
+    if settings.authority_role == "authoritative" and (not token or len(token) < 32):
+        return None
+    return token
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    if settings.authority_role == "authoritative" and not _configured_console_api_token():
+        raise RuntimeError("authoritative Console requires EXPERIMENT_CONSOLE_API_TOKEN_FILE")
+    monitor_worker.start()
+    try:
+        yield
+    finally:
+        monitor_worker.stop()
+
+
+app = FastAPI(title="Experiment Console", version="0.1.0", lifespan=lifespan)
 app.state.started_at = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(timespec="seconds")
 app.add_middleware(
     CORSMiddleware,
@@ -43,6 +71,44 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _protected_api_path(path: str) -> bool:
+    return (
+        path == "/api/bridge/events"
+        or path.startswith("/api/bridge/events/")
+        or path.startswith("/api/artifacts/")
+        or path == "/api/intents"
+        or path.startswith("/api/intents/")
+        or path == "/api/runner"
+        or path.startswith("/api/runner/")
+        or path == "/api/hosts"
+        or path.startswith("/api/hosts/")
+    )
+
+
+def _public_wake_event(event: dict) -> dict:
+    return {key: value for key, value in event.items() if key != "dedupe_key"}
+
+
+@app.middleware("http")
+async def require_console_bearer(request: Request, call_next):
+    if not _protected_api_path(request.url.path):
+        return await call_next(request)
+    configured_token = _configured_console_api_token()
+    if not configured_token:
+        if settings.authority_role == "authoritative":
+            return JSONResponse(status_code=503, content={"detail": "Console API token is not configured"})
+        return await call_next(request)
+    authorization = request.headers.get("authorization", "")
+    scheme, separator, provided_token = authorization.partition(" ")
+    if not separator or scheme.lower() != "bearer" or not hmac.compare_digest(provided_token, configured_token):
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "invalid or missing bearer token"},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return await call_next(request)
 
 
 @app.get("/health")
@@ -61,9 +127,69 @@ def health():
         "state_dir": str(settings.state_dir),
         "contract": settings.contract_version,
         "contract_version": settings.contract_version,
+        "authority_role": settings.authority_role,
+        "instance_id": settings.instance_id,
+        "ledger_id": service.store.metadata("ledger_id"),
+        "monitor_worker": monitor_worker.status(),
+        "wandb_api_key_present": bool(service._wandb_api_key()),
+        "console_api_auth_configured": bool(_configured_console_api_token()),
         "real_execution_enabled": True,
         "started_at": getattr(app.state, "started_at", None),
     }
+
+
+@app.get("/api/bridge/events")
+def bridge_events(
+    consumer_id: str = Query(min_length=1, max_length=128),
+    limit: int = Query(default=20, ge=1, le=100),
+    lease_seconds: int = Query(default=60, ge=5, le=3600),
+):
+    ledger_id, events = service.store.claim_wake_events_with_ledger(
+        consumer_id=consumer_id,
+        limit=limit,
+        lease_seconds=lease_seconds,
+    )
+    return {
+        "authority_role": settings.authority_role,
+        "instance_id": settings.instance_id,
+        "ledger_id": ledger_id,
+        "events": [_public_wake_event(event) for event in events],
+    }
+
+
+@app.post("/api/bridge/events/{event_id}/ack")
+def ack_bridge_event(event_id: str, payload: AckWakeEventPayload):
+    try:
+        event, idempotent = service.store.ack_wake_event(
+            event_id,
+            consumer_id=payload.consumer_id,
+            expected_ledger_id=payload.expected_ledger_id,
+            lease_token=payload.lease_token,
+        )
+        return {
+            "status": "ok",
+            "event_id": event_id,
+            "acked": True,
+            "idempotent": idempotent,
+            "event": _public_wake_event(event),
+        }
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except WakeEventLeaseConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except WakeEventLedgerMismatch as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.get("/api/artifacts/{snapshot_id}/download")
+def download_artifact_bundle(snapshot_id: str):
+    try:
+        path = service.artifact_download_path(snapshot_id)
+        return FileResponse(path, media_type="application/zip", filename=f"{snapshot_id}.zip")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.get("/api/overview")

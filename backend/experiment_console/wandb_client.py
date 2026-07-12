@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -40,7 +39,7 @@ class WandBClient:
         self.runner = runner or CommandRunner()
 
     def _api_key(self) -> str:
-        return os.environ.get(self.settings.wandb_api_key_env, "")
+        return self.settings.wandb_api_key() or ""
 
     def _headers(self) -> dict[str, str]:
         api_key = self._api_key()
@@ -71,7 +70,7 @@ class WandBClient:
 
     def get_sweep_state(self, entity: str, project: str, sweep_id: str) -> dict[str, Any]:
         query = """
-        query SweepState($entity: String!, $project: String!, $sweep: String!) {
+        query SweepState($entity: String!, $project: String!, $sweep: String!, $cursor: String) {
           project(name: $project, entityName: $entity) {
             sweep(sweepName: $sweep) {
               name
@@ -79,26 +78,38 @@ class WandBClient:
               createdAt
               runCount
               config
-              runs(first: 200) {
+              runs(first: 200, after: $cursor) {
+                pageInfo { hasNextPage endCursor }
                 edges { node { name state createdAt heartbeatAt summaryMetrics config } }
               }
             }
           }
         }
         """
-        data = self.graphql(query, {"entity": entity, "project": project, "sweep": sweep_id})
-        sweep = ((data.get("project") or {}).get("sweep") or {})
         runs = []
-        for edge in ((sweep.get("runs") or {}).get("edges") or []):
-            node = edge.get("node") or {}
-            runs.append({
-                "name": node.get("name"),
-                "state": node.get("state"),
-                "created_at": node.get("createdAt"),
-                "heartbeat_at": node.get("heartbeatAt"),
-                "summary_metrics": node.get("summaryMetrics"),
-                "config": node.get("config"),
-            })
+        cursor = None
+        sweep = {}
+        while True:
+            data = self.graphql(query, {"entity": entity, "project": project, "sweep": sweep_id, "cursor": cursor})
+            sweep = ((data.get("project") or {}).get("sweep") or {})
+            run_connection = sweep.get("runs") or {}
+            for edge in (run_connection.get("edges") or []):
+                node = edge.get("node") or {}
+                runs.append({
+                    "name": node.get("name"),
+                    "state": node.get("state"),
+                    "created_at": node.get("createdAt"),
+                    "heartbeat_at": node.get("heartbeatAt"),
+                    "summary_metrics": node.get("summaryMetrics"),
+                    "config": node.get("config"),
+                })
+            page_info = run_connection.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                break
+            next_cursor = page_info.get("endCursor")
+            if not next_cursor or next_cursor == cursor:
+                break
+            cursor = next_cursor
         return {
             "id": sweep_id,
             "entity": entity,
@@ -173,7 +184,7 @@ def format_sweep(entity: str, project: str, node: dict[str, Any], *, include_run
     run_count = int(node.get("runCount") or 0)
     expected = expected_run_count_from_wandb_config(node.get("config")) or run_count
     state = node.get("state") or "UNKNOWN"
-    progress = 1.0 if state == "FINISHED" and expected else min(run_count / expected, 0.999) if expected else 0.0
+    progress = min(run_count / expected, 1.0) if expected else 0.0
     sweep = {
         "id": node.get("name"),
         "entity": entity,

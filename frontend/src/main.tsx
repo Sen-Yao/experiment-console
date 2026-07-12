@@ -58,6 +58,13 @@ type Sweep = {
   speed_per_hour?: number
   eta_seconds?: number | null
   last_sync_at?: string
+  progress_evidence?: {
+    classification?: string
+    message?: string
+    active_run_count?: number
+    oldest_active_run_age_seconds?: number
+    newest_active_run_heartbeat_lag_seconds?: number
+  } | null
 }
 
 type Overview = {
@@ -252,6 +259,7 @@ function TelemetryStrip({ sweep }: { sweep: Sweep }) {
       <Telemetry icon={<Timer size={16} />} label="ETA" value={formatEta(sweep.eta_seconds)} />
       <Telemetry icon={<Clock3 size={16} />} label="预计完成" value={formatExpectedCompletion(sweep.last_sync_at, sweep.eta_seconds)} />
       <Telemetry icon={<Gauge size={16} />} label="速度" value={formatSpeed(sweep.speed_per_hour)} />
+      <Telemetry icon={<Activity size={16} />} label="进展证据" value={formatProgressEvidence(sweep.progress_evidence)} />
     </div>
   )
 }
@@ -475,6 +483,10 @@ function formatEta(seconds?: number | null) {
 function formatSpeed(speed?: number) {
   if (!speed || speed <= 0) return '-'
   return `${speed.toFixed(speed >= 10 ? 0 : 1)} runs/h`
+}
+
+function formatProgressEvidence(evidence?: Sweep['progress_evidence']) {
+  return evidence?.message || '-'
 }
 
 ReactDOM.createRoot(document.getElementById('root')!).render(

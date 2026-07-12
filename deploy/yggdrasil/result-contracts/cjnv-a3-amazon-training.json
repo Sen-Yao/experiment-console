@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "expected_runs": 25,
+  "max_runs": 25,
+  "output_globs": [
+    "outputs/cjnv_a3_amazon_fixedtail_training_permutation_audit/amazon_{run_id}.json"
+  ],
+  "discovery_mode": "run_id_output_globs_v1",
+  "allow_partial": false,
+  "export_artifacts": true,
+  "metric_keys": [],
+  "group_keys": [],
+  "metric_paths": [],
+  "group_paths": [],
+  "comparison_paths": [],
+  "matrix_by": []
+}

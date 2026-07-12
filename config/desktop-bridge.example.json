@@ -1,0 +1,21 @@
+{
+  "ssh_target": "Yggdrasil",
+  "console_url": "http://127.0.0.1:5174",
+  "expected_authority_role": "authoritative",
+  "expected_instance_id": "yggdrasil-production",
+  "local_host": "127.0.0.1",
+  "local_port": 5174,
+  "remote_host": "127.0.0.1",
+  "remote_port": 5174,
+  "identity_file": "/Users/YOU/.ssh/experiment-console-tunnel",
+  "known_hosts_file": "/Users/YOU/.ssh/known_hosts",
+  "console_token_file": "/Users/YOU/.config/experiment-console/console_api_token",
+  "codex_command": [
+    "/ABSOLUTE/PATH/TO/codex",
+    "app-server",
+    "proxy"
+  ],
+  "poll_interval_seconds": 30,
+  "lease_seconds": 120,
+  "inflight_retry_grace_seconds": 15
+}

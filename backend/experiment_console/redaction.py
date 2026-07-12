@@ -16,7 +16,7 @@ SECRET_PATTERNS = [
 
 def redact_text(text: str) -> str:
     out = text
-    for key in ("WANDB_API_KEY", "WANDB_BASE_URL"):
+    for key in ("WANDB_API_KEY", "WANDB_BASE_URL", "EXPERIMENT_CONSOLE_API_TOKEN"):
         value = os.environ.get(key)
         if value:
             out = out.replace(value, "<redacted>")
