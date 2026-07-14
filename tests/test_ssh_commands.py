@@ -141,7 +141,17 @@ def test_agent_reconciler_uses_durable_receipts_and_conda_run(tmp_path):
     )
 
     remote = runner.calls[0]["argv"][-1]
-    assert runner.calls[0]["argv"][:3] == ["ssh", "--", "HCCS-25"]
+    assert runner.calls[0]["argv"][:9] == [
+        "ssh",
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        "ControlPersist=60",
+        "-o",
+        "ControlPath=/tmp/experiment-console-ssh-%C",
+        "--",
+        "HCCS-25",
+    ]
     assert result["pid"] == 12345
     assert runner.calls[0]["input_text"] == "secret\n"
     assert "CUDA_VISIBLE_DEVICES" in remote

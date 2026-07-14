@@ -48,6 +48,11 @@ not hold a second ledger and does not monitor experiments with a model turn.
    non-root entrypoint copies it into a private tmpfs as mode `0600`. It is not
    the Mac tunnel key.
 
+   Console reuses each OpenSSH transport for at most 60 seconds through a
+   control socket in the container's private `/tmp` tmpfs. This avoids repeated
+   HCCS key exchanges during one operation; the socket is not durable, does not
+   contain credentials, and is not part of agent launch receipts.
+
 3. W&B token: pre-provisioned as a one-line file named by
    `EXPERIMENT_CONSOLE_WANDB_SECRET_FILE`. Compose exposes it as a read-only
    Docker secret and sets only `WANDB_API_KEY_FILE`. The token is never placed

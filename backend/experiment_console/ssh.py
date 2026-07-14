@@ -14,6 +14,14 @@ from .redaction import redact_text
 
 MAX_RESULT_ARTIFACT_FILE_BYTES = 8 * 1024 * 1024
 MAX_RESULT_ARTIFACT_TOTAL_BYTES = 64 * 1024 * 1024
+SSH_CONNECTION_OPTIONS = (
+    "-o",
+    "ControlMaster=auto",
+    "-o",
+    "ControlPersist=60",
+    "-o",
+    "ControlPath=/tmp/experiment-console-ssh-%C",
+)
 
 
 def quote_remote(command: str) -> str:
@@ -82,7 +90,7 @@ class SSHExecutor:
         read_only: bool = False,
     ):
         host = validate_ssh_host(host)
-        argv = ["ssh", "--", host, quote_remote(remote_command)]
+        argv = ["ssh", *SSH_CONNECTION_OPTIONS, "--", host, quote_remote(remote_command)]
         last_exc: Exception | None = None
         attempts = 2 if read_only else 1
         for attempt in range(attempts):
