@@ -11,6 +11,10 @@ not hold a second ledger and does not monitor experiments with a model turn.
   `EXPERIMENT_CONSOLE_INSTANCE_ID=yggdrasil-production`.
 - Durable state: `console.sqlite3`, schedules, outbox, leases, and audit files
   live under `EXPERIMENT_CONSOLE_STATE_PATH`.
+- SQLite uses
+  `/mnt/user/appdata/experiment-console/state/console.sqlite3`, and temporary
+  files use the sibling `state/sqlite-tmp` directory instead of the container's
+  bounded `/tmp` tmpfs.
 - Durable results: artifact bundles use the separate
   `EXPERIMENT_CONSOLE_RESULTS_PATH` bind mount. A Mac `/Users/...` artifact
   path must never be sent to the remote Console. The bridge downloads only

@@ -54,6 +54,11 @@ safety/idempotency semantics. Ask before acting only when the current request
 does not already authorize the operation, or when the action is destructive,
 credential-sensitive, concurrent/costly, or blocked by platform approval.
 
+Managed sweeps use the Console agent-capacity reconciler. `recover-agents`
+only triggers one immediate reconciliation pass for a managed job; it does not
+accept GPU, max-agent, or conda launch overrides and cannot adopt historical
+jobs. Do not use or recreate a separate `launch-agents` path.
+
 ## Multi-Dataset Experiment Ordering
 
 When a batch needs experiments on multiple datasets, keep GPU time moving: after

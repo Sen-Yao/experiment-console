@@ -199,10 +199,9 @@ class CancelSweepPayload(BaseModel):
 
 
 class RecoverAgentsPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     job_id: str
-    gpu_mode: Literal["auto", "strict"] = "auto"
-    max_agents: int | None = None
-    conda_sh: str = "/opt/anaconda3/etc/profile.d/conda.sh"
     idempotency_key: str | None = None
 
 

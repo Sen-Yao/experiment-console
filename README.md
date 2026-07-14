@@ -16,9 +16,9 @@ Running sweeps often means juggling a YAML config, W&B sweep creation, GPU selec
 - validate sweep configs locally;
 - create a W&B sweep;
 - probe remote GPUs with `nvidia-smi`;
-- launch one W&B agent per eligible GPU;
+- continuously reconcile each managed sweep to `min(max_agents, remaining_runs)` agents on eligible GPUs;
 - queue formal sweeps per remote GPU workspace so the active sweep uses all available GPUs before the next sweep starts;
-- recover agents for an existing sweep;
+- trigger immediate capacity reconciliation for a managed sweep;
 - stop only the agents that match a tracked sweep;
 - reconcile W&B, remote process, and per-run artifact evidence before declaring
   a result complete;
@@ -45,6 +45,9 @@ Running sweeps often means juggling a YAML config, W&B sweep creation, GPU selec
 - Audit logs redact common secret patterns before writing to disk.
 - Actions with real side effects require the generated confirmation phrase.
 - Stop actions only target remote commands matching the tracked `wandb agent <entity>/<project>/<sweep_id>` string.
+- Managed agent starts use per-GPU locks and credential-free generation receipts under
+  `~/.local/state/experiment-console`; `recover-agents` only requests an immediate
+  controller pass and cannot change the launch-time capacity contract.
 - The API binds only to Yggdrasil loopback and requires a bearer token.
 - Result readiness requires both terminal execution evidence and a complete,
   valid, run-id-associated artifact set under the job's explicit
@@ -190,6 +193,12 @@ The development runtime and production FastAPI runtime expose the same runner-fa
 For runner-facing launch and preflight calls, `config_path` means the YAML path on the remote host, not a local workstation path. The intended flow is to commit/push the config, pull it in the remote checkout, verify the remote file exists, then launch with a path such as `/home/linziyao/DualRefGAD/configs/demo.yaml`. The standalone `validate-config` endpoint remains a local validation helper and is separate from launch/preflight config handling.
 
 Runner-facing `launch-sweep` defaults to `queue_policy=sequential`. If another sweep is already active in the same queue group, defaulting to `<remote_host>:<remote_cwd>`, Console records a queued job but does not create a W&B sweep or launch agents until `/api/runner/advance-queue` starts it. Use `queue_policy=immediate` only for explicitly approved concurrent launches.
+
+After a managed sweep is created, the monitor worker also owns agent-capacity
+reconciliation. It preserves existing agents, never preempts or migrates them,
+and only fills missing capacity on currently eligible GPUs. `recover-agents`
+triggers the same reconciler immediately; it does not use a separate launch
+path and cannot adopt historical jobs.
 
 For multi-dataset experiment batches, prepare the sweep YAML for every dataset before launching the first dataset, validate them together, and include them in the same GitHub sync/pull handoff. Do not wait for one dataset to finish before creating and syncing the next dataset's sweep YAML. When one dataset reaches a terminal state and another dataset still needs to run, prioritize starting or advancing the next dataset first. After the next dataset is confirmed running, return to the previous dataset's `pull-results` and result review.
 

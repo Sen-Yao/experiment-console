@@ -25,6 +25,7 @@ def test_compose_is_nonroot_loopback_only_and_uses_readonly_secrets():
     assert service["restart"] == "unless-stopped"
     assert service["ports"] == ["127.0.0.1:${EXPERIMENT_CONSOLE_PORT:-5174}:5174"]
     assert service["environment"]["EXPERIMENT_CONSOLE_AUTHORITY_ROLE"].startswith("${EXPERIMENT_CONSOLE_AUTHORITY_ROLE:?")
+    assert service["environment"]["SQLITE_TMPDIR"] == "/var/lib/experiment-console/state/sqlite-tmp"
     assert service["environment"]["WANDB_API_KEY_FILE"] == "/run/secrets/wandb_api_key"
     assert service["environment"]["EXPERIMENT_CONSOLE_API_TOKEN_FILE"] == "/run/secrets/console_api_token"
     assert "EXPERIMENT_CONSOLE_API_TOKEN" not in service["environment"]
@@ -54,6 +55,8 @@ def test_dockerfile_builds_amd64_target_and_drops_root():
     assert "EXPERIMENT_CONSOLE_API_TOKEN_FILE" in entrypoint
     assert "console_api_token" in entrypoint
     assert "API_TOKEN_LENGTH" in entrypoint
+    assert 'mkdir -p "$SSH_DIR" "$SQLITE_TMPDIR"' in entrypoint
+    assert 'chmod 0700 "$SQLITE_TMPDIR"' in entrypoint
     production_env = (ROOT / "deploy" / "yggdrasil" / "production.env.example").read_text(encoding="utf-8")
     assert "EXPERIMENT_CONSOLE_API_TOKEN_SECRET_FILE=" in production_env
 
@@ -85,6 +88,8 @@ def test_production_activation_requires_seed_and_verifier_probes_real_dependenci
     activation = (ROOT / "deploy" / "yggdrasil" / "activate-release.sh").read_text(encoding="utf-8")
     assert "first authoritative deployment requires an explicit migration seed" in activation
     assert "migration seed refused because the authoritative ledger already exists" in activation
+    assert 'NEW_RELEASE="$RELEASE"' in activation
+    assert 'RELEASE="$NEW_RELEASE"' in activation
     verifier = (ROOT / "deploy" / "yggdrasil" / "verify-release.sh").read_text(encoding="utf-8")
     assert "WandBClient(settings).discover_sweeps" in verifier
     assert "/api/runner/auth-check" in verifier

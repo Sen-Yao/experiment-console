@@ -166,7 +166,12 @@ def test_monitor_exception_event_exposes_only_stable_redacted_metadata(tmp_path)
     def fail_tick(job_id):
         raise RuntimeError("token=abcdefghijklmnop secret remote/path")
 
-    worker = MonitorWorker(SimpleNamespace(store=store, settings=settings, monitor_tick=fail_tick))
+    worker = MonitorWorker(SimpleNamespace(
+        store=store,
+        settings=settings,
+        due_agent_reconcile_job_ids=lambda *, limit: [],
+        monitor_tick=fail_tick,
+    ))
     worker.run_once()
     events = store.claim_wake_events(consumer_id="bridge-a", lease_seconds=60)
 

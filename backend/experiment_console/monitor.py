@@ -56,14 +56,48 @@ class MonitorWorker:
         }
 
     def run_once(self) -> list[dict[str, Any]]:
+        due_agent_jobs = self.service.due_agent_reconcile_job_ids(limit=20)
         due_schedules = self.store.due_monitor_schedules(limit=20)
-        batch_budget = sum(int(schedule["timeout_seconds"]) + 30 for schedule in due_schedules)
+        agent_attempt_budget = self.settings.command_timeout_seconds + (self.settings.ssh_timeout_seconds * 2) + 30
+        batch_budget = (
+            len(due_agent_jobs) * agent_attempt_budget
+            + sum(int(schedule["timeout_seconds"]) + 30 for schedule in due_schedules)
+        )
         lease_seconds = max(self.settings.monitor_lease_seconds, self.settings.monitor_worker_poll_seconds * 3, batch_budget)
         self._lease_held = self.store.acquire_lease("monitor-worker", self.owner_id, lease_seconds)
         self._ready = True
         if not self._lease_held:
             return []
         results = []
+        for job_id in due_agent_jobs:
+            job_lease = f"agent-reconcile-job:{job_id}"
+            if not self.store.acquire_lease(job_lease, self.owner_id, agent_attempt_budget):
+                continue
+            try:
+                result = self.service.reconcile_agent_capacity(job_id, requested_by="console-agent-reconciler")
+                results.append({"agent_reconcile": result})
+                self._last_error = None
+            except Exception as exc:
+                error_type, error_fingerprint = monitor_error_identity(exc)
+                self._last_error = f"agent_reconcile_error:{error_type}:{error_fingerprint[:16]}"
+                job = self.store.get_job(job_id)
+                schedule_row = self.store.get_monitor_schedule(job_id) or {}
+                thread_id = str(schedule_row.get("thread_id") or "").strip()
+                if job and thread_id:
+                    self.store.enqueue_wake_event(
+                        dedupe_key=f"{job_id}:attention:agent_reconcile_invariant:{error_fingerprint}",
+                        job_id=job_id,
+                        thread_id=thread_id,
+                        kind="attention",
+                        summary=f"job {job_id} agent reconciler invariant failed",
+                        payload={
+                            "classification": "agent_reconcile_invariant_error",
+                            "error_type": error_type,
+                            "error_fingerprint": error_fingerprint,
+                        },
+                    )
+            finally:
+                self.store.release_lease(job_lease, self.owner_id)
         for index, schedule in enumerate(due_schedules):
             remaining_budget = sum(int(item["timeout_seconds"]) + 30 for item in due_schedules[index:])
             if not self.store.acquire_lease("monitor-worker", self.owner_id, max(self.settings.monitor_lease_seconds, remaining_budget)):

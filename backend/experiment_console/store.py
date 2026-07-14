@@ -85,6 +85,8 @@ class ConsoleStore:
                     conn.execute(ddl)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_launch_identity ON jobs(name, config_path, remote_host, remote_cwd)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_sweep ON jobs(entity, project, sweep_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status_created_at ON jobs(status, created_at DESC)")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS monitor_schedules (
                     job_id TEXT PRIMARY KEY,
@@ -269,6 +271,18 @@ class ConsoleStore:
     def list_jobs(self) -> list[JobRecord]:
         with self._connect() as conn:
             rows = conn.execute("SELECT * FROM jobs ORDER BY created_at DESC").fetchall()
+        return [self._job_from_row(row) for row in rows]
+
+    def list_jobs_with_statuses(self, statuses: set[JobStatus]) -> list[JobRecord]:
+        values = sorted({status.value for status in statuses})
+        if not values:
+            return []
+        placeholders = ",".join("?" for _ in values)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM jobs WHERE status IN ({placeholders}) ORDER BY created_at DESC",
+                values,
+            ).fetchall()
         return [self._job_from_row(row) for row in rows]
 
     def get_job(self, job_id: str) -> JobRecord | None:

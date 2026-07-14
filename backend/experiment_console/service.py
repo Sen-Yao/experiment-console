@@ -10,6 +10,19 @@ from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from typing import Any
 
+from .agent_reconcile import (
+    AGENT_FAILURE_ATTENTION_THRESHOLD,
+    AGENT_STEADY_RECONCILE_SECONDS,
+    AGENT_ZERO_CAPACITY_ATTENTION_SECONDS,
+    age_seconds,
+    agent_reconcile_due,
+    desired_agent_count,
+    initial_agent_reconciler,
+    is_managed_agent_job,
+    next_reconcile_at,
+    retry_delay_seconds,
+    sweep_capacity,
+)
 from .command import CommandFailed
 from .config import Settings
 from .models import (
@@ -49,7 +62,7 @@ from .models import (
 from .planner import build_plan, confirmation_phrase
 from .reconcile import build_artifact_manifest, derive_execution_state, derive_result_state, update_sync_consistency
 from .redaction import redact_value
-from .ssh import SSHExecutor
+from .ssh import SSHExecutor, is_transient_ssh_error
 from .store import ConsoleStore, infer_job_kind
 from .sweep_telemetry import (
     enrich_sweeps_with_telemetry,
@@ -86,7 +99,6 @@ REPLAY_SAFE_INTENTS = {
     IntentType.register_existing_sweep,
     IntentType.stop_job,
     IntentType.cancel_sweep,
-    IntentType.recover_agents,
     IntentType.repair_watchdog,
     IntentType.schedule_monitor,
     IntentType.unschedule_monitor,
@@ -776,7 +788,7 @@ class ConsoleService:
     def _launch_replay_is_stale(self, job: JobRecord, operation: dict[str, Any]) -> bool:
         launch = job.monitor.get("launch") if isinstance(job.monitor.get("launch"), dict) else {}
         phase = str(launch.get("phase") or job.monitor.get("launch_phase") or job.monitor.get("stage") or "")
-        if phase not in {"creating_sweep", "sweep_created", "launching_agents"}:
+        if phase not in {"creating_sweep", "sweep_created", "launching_agents", "reconciling_agents"}:
             return False
         owner_id = str(launch.get("owner_id") or "")
         if not owner_id or owner_id != self._launch_owner_id:
@@ -831,6 +843,39 @@ class ConsoleService:
             return job, operation or {}
 
         sweep_id = str(job.sweep_id or "") or None
+        if sweep_id and is_managed_agent_job(job):
+            state = job.monitor.get("agent_reconciler") or {}
+            attention = str(state.get("lifecycle") or "") in {"attention", "fatal"}
+            classification = str(state.get("classification") or "agent_reconciliation_pending")
+            result = {
+                "stage": "attention" if attention else "reconciling_agents",
+                "classification": classification,
+                "job_id": job.job_id,
+                "sweep_id": sweep_id,
+                "created_new_sweep": True,
+                "agent_launches": list(state.get("assignments") or []),
+                "agent_reconciler": self._agent_reconcile_result(job, state, classification=classification),
+                "next_actions": (
+                    ["Inspect agent reconciler attention reasons; do not create another sweep."]
+                    if attention
+                    else ["The durable agent reconciler will recover capacity without creating another sweep."]
+                ),
+            }
+            job.status = JobStatus.attention if attention else JobStatus.running
+            self._record_operation(
+                job,
+                operation_id=operation_id,
+                intent=IntentType.launch_sweep,
+                requested_by=requested_by,
+                idempotency_key=idempotency_key,
+                stage=result["stage"],
+                classification=classification,
+                status=OperationStatus.failed.value if attention else OperationStatus.executing.value,
+                result=result,
+                retry_after_seconds=None if attention else 30,
+            )
+            persisted = self.store.get_job(job.job_id) or job
+            return persisted, self._current_operation(persisted) or {}
         classification = "launch_recovery_required" if sweep_id else "launch_outcome_unknown"
         interrupted_phase = str(
             ((job.monitor.get("launch") or {}).get("phase") if isinstance(job.monitor.get("launch"), dict) else None)
@@ -1407,6 +1452,351 @@ class ConsoleService:
             return
         if result_contract is None or not str(thread_id or "").strip():
             raise ValueError(f"authoritative Console requires result_contract and thread_id before {operation}")
+
+    def due_agent_reconcile_job_ids(self, *, limit: int = 20, now: str | None = None) -> list[str]:
+        active_statuses = set(JobStatus) - TERMINAL_JOB_STATUSES
+        due = [
+            job.job_id
+            for job in self.store.list_jobs_with_statuses(active_statuses)
+            if agent_reconcile_due(job, now=now)
+        ]
+        return due[:max(0, limit)]
+
+    def reconcile_agent_capacity(
+        self,
+        job_id: str,
+        *,
+        force: bool = False,
+        requested_by: str = "console-agent-reconciler",
+    ) -> dict[str, Any]:
+        with self._serialized_job(job_id):
+            return self._reconcile_agent_capacity_locked(
+                self._require_job(job_id),
+                force=force,
+                requested_by=requested_by,
+            )
+
+    def _reconcile_agent_capacity_locked(
+        self,
+        job: JobRecord,
+        *,
+        force: bool,
+        requested_by: str,
+    ) -> dict[str, Any]:
+        if not is_managed_agent_job(job):
+            raise ValueError("job is not owned by the agent capacity reconciler")
+        if not all((job.sweep_id, job.entity, job.project, job.remote_host, job.remote_cwd)):
+            return self._fatal_agent_reconcile(
+                job,
+                classification="agent_identity_invalid",
+                reason="managed job lacks sweep or remote identity",
+                requested_by=requested_by,
+            )
+        state = dict(job.monitor["agent_reconciler"])
+        if not force and not agent_reconcile_due(job):
+            return self._agent_reconcile_result(job, state, classification="not_due")
+        now = utc_now()
+        state["last_attempt_at"] = now
+        state["updated_at"] = now
+        sweep_path = f"{job.entity}/{job.project}/{job.sweep_id}"
+        auth = job.monitor.get("auth") if isinstance(job.monitor.get("auth"), dict) else {}
+        if auth.get("classification") == "auth_check_pending":
+            try:
+                auth = self.ssh.auth_check(
+                    host=job.remote_host,
+                    remote_cwd=job.remote_cwd,
+                    sweep_path=sweep_path,
+                    wandb_api_key=self._wandb_api_key(),
+                    conda_env=job.conda_env or self.settings.default_conda_env,
+                    conda_sh=self.settings.default_conda_sh,
+                )
+                job.monitor["auth"] = auth
+            except Exception as exc:
+                return self._agent_reconcile_exception(job, state, exc, requested_by=requested_by)
+        if not auth.get("ok"):
+            return self._fatal_agent_reconcile(
+                job,
+                classification=str(auth.get("classification") or "wandb_auth_missing"),
+                reason="managed sweep does not have a validated W&B identity",
+                requested_by=requested_by,
+                state=state,
+            )
+        try:
+            sweep = self.wandb.get_sweep_state(job.entity, job.project, job.sweep_id)
+        except Exception as exc:
+            return self._agent_reconcile_exception(job, state, exc, requested_by=requested_by)
+        observed_sweep_id = str(sweep.get("id") or job.sweep_id)
+        if observed_sweep_id != job.sweep_id:
+            return self._fatal_agent_reconcile(
+                job,
+                classification="sweep_identity_mismatch",
+                reason=f"W&B returned sweep {observed_sweep_id} for {job.sweep_id}",
+                requested_by=requested_by,
+                state=state,
+            )
+        progress = sweep_capacity(sweep, fallback_expected=to_non_negative_int(state.get("expected_runs")) or 1)
+        remaining_runs = to_non_negative_int(progress["remaining"])
+        desired_agents = desired_agent_count(
+            max_agents=to_non_negative_int(state.get("max_agents")) or 1,
+            remaining_runs=remaining_runs,
+        )
+        state.update({
+            "expected_runs": to_non_negative_int(progress["expected"]),
+            "remaining_runs": remaining_runs,
+            "desired_agents": desired_agents,
+            "sweep_state": sweep.get("state"),
+        })
+        if progress["terminal"] or desired_agents == 0:
+            state.update({
+                "lifecycle": "terminal",
+                "classification": "terminal",
+                "desired_agents": 0,
+                "next_reconcile_at": None,
+                "updated_at": now,
+            })
+            job.monitor["agent_reconciler"] = state
+            self.store.upsert_job(job)
+            return self._agent_reconcile_result(job, state, classification="terminal")
+        try:
+            gpu_probe = self.ssh.probe_gpus(job.remote_host)
+            eligible = [
+                int(gpu["index"])
+                for gpu in (gpu_probe.get("gpus") or [])
+                if isinstance(gpu, dict) and gpu.get("eligible") and str(gpu.get("index", "")).isdigit()
+            ]
+            remote = self.ssh.reconcile_agent_capacity(
+                host=job.remote_host,
+                job_id=job.job_id,
+                remote_cwd=job.remote_cwd,
+                sweep_path=sweep_path,
+                desired_agents=desired_agents,
+                eligible_gpu_indices=eligible,
+                conda_env=job.conda_env or self.settings.default_conda_env,
+                conda_sh=self.settings.default_conda_sh,
+                wandb_api_key=self._wandb_api_key(),
+            )
+        except Exception as exc:
+            return self._agent_reconcile_exception(job, state, exc, requested_by=requested_by)
+        assignments = compact_agent_assignments(remote.get("assignments"))
+        live_agents = len({int(item["gpu_index"]) for item in assignments if item.get("gpu_index") is not None})
+        launch_failures = [item for item in (remote.get("failed") or []) if isinstance(item, dict)]
+        has_launch_failure = bool(launch_failures)
+        if has_launch_failure:
+            state["consecutive_failures"] = to_non_negative_int(state.get("consecutive_failures")) + 1
+            state["consecutive_launch_failures"] = to_non_negative_int(state.get("consecutive_launch_failures")) + 1
+        else:
+            state["consecutive_failures"] = 0
+            state["consecutive_launch_failures"] = 0
+            state["last_success_at"] = now
+        if live_agents > 0:
+            state["zero_capacity_failures"] = 0
+            state["first_zero_capacity_at"] = None
+            state["first_agent_at"] = state.get("first_agent_at") or now
+        else:
+            state["first_zero_capacity_at"] = state.get("first_zero_capacity_at") or state.get("created_at") or now
+            if has_launch_failure:
+                state["zero_capacity_failures"] = to_non_negative_int(state.get("zero_capacity_failures")) + 1
+        zero_age = age_seconds(state.get("first_zero_capacity_at"), now=now) if live_agents == 0 else 0
+        attention_reasons: list[str] = []
+        if eligible and to_non_negative_int(state.get("consecutive_launch_failures")) >= AGENT_FAILURE_ATTENTION_THRESHOLD:
+            attention_reasons.append("eligible_gpu_launch_failures")
+        if live_agents == 0 and to_non_negative_int(state.get("zero_capacity_failures")) >= AGENT_FAILURE_ATTENTION_THRESHOLD:
+            attention_reasons.append("zero_capacity_retries_exhausted")
+        if live_agents == 0 and zero_age >= AGENT_ZERO_CAPACITY_ATTENTION_SECONDS:
+            attention_reasons.append("zero_capacity_timeout")
+        if attention_reasons:
+            classification = "agent_capacity_attention"
+            lifecycle = "attention"
+        elif live_agents >= desired_agents:
+            classification = "capacity_satisfied"
+            lifecycle = "running"
+        elif not eligible:
+            classification = "resource_wait"
+            lifecycle = "running_degraded"
+        elif live_agents > 0:
+            classification = "running_degraded"
+            lifecycle = "running_degraded"
+        else:
+            classification = "capacity_pending"
+            lifecycle = "pending"
+        delay = retry_delay_seconds(to_non_negative_int(state.get("consecutive_failures"))) if has_launch_failure else AGENT_STEADY_RECONCILE_SECONDS
+        state.update({
+            "lifecycle": lifecycle,
+            "classification": classification,
+            "live_agents": live_agents,
+            "assignments": assignments,
+            "eligible_gpu_indices": eligible,
+            "last_gpu_probe": compact_gpu_probe(gpu_probe),
+            "last_remote_result": compact_agent_reconcile_remote(remote),
+            "last_failures": launch_failures[:10],
+            "attention_reasons": attention_reasons,
+            "zero_capacity_age_seconds": zero_age,
+            "next_reconcile_at": next_reconcile_at(now=now, delay_seconds=delay),
+            "updated_at": now,
+        })
+        job.agent_pids = sorted({str(item["pid"]) for item in assignments if str(item.get("pid") or "")})
+        job.monitor["agent_launches"] = assignments
+        job.monitor["agent_reconciler"] = state
+        job.monitor["gpu_probe"] = compact_gpu_probe(gpu_probe)
+        if attention_reasons:
+            job.status = JobStatus.attention
+            self._enqueue_agent_reconcile_attention(job, state, requested_by=requested_by)
+        else:
+            job.status = JobStatus.running
+            state["attention_episode"] = None
+        self.store.upsert_job(job)
+        return self._agent_reconcile_result(
+            job,
+            state,
+            classification=classification,
+            launched=compact_agent_assignments(remote.get("launched")),
+            failures=launch_failures,
+        )
+
+    def _agent_reconcile_exception(
+        self,
+        job: JobRecord,
+        state: dict[str, Any],
+        exc: Exception,
+        *,
+        requested_by: str,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        transient = bool(
+            is_transient_ssh_error(exc)
+            or isinstance(exc, (WandBUnavailable, TimeoutError, ConnectionError, OSError))
+        )
+        if not transient:
+            return self._fatal_agent_reconcile(
+                job,
+                classification="agent_reconcile_invariant_error",
+                reason=compact_error(exc),
+                requested_by=requested_by,
+                state=state,
+            )
+        failures = to_non_negative_int(state.get("consecutive_failures")) + 1
+        last_live = to_non_negative_int(state.get("live_agents"))
+        zero_failures = to_non_negative_int(state.get("zero_capacity_failures")) + (1 if last_live == 0 else 0)
+        first_zero = state.get("first_zero_capacity_at") or state.get("created_at") or now
+        zero_age = age_seconds(first_zero, now=now) if last_live == 0 else 0
+        reasons = []
+        if last_live == 0 and zero_failures >= AGENT_FAILURE_ATTENTION_THRESHOLD:
+            reasons.append("zero_capacity_retries_exhausted")
+        if last_live == 0 and zero_age >= AGENT_ZERO_CAPACITY_ATTENTION_SECONDS:
+            reasons.append("zero_capacity_timeout")
+        classification = "agent_capacity_attention" if reasons else "transient_control_plane_error"
+        state.update({
+            "lifecycle": "attention" if reasons else ("running_degraded" if last_live else "pending"),
+            "classification": classification,
+            "consecutive_failures": failures,
+            "zero_capacity_failures": zero_failures,
+            "first_zero_capacity_at": first_zero if last_live == 0 else None,
+            "zero_capacity_age_seconds": zero_age,
+            "attention_reasons": reasons,
+            "last_error": compact_error(exc),
+            "next_reconcile_at": next_reconcile_at(now=now, delay_seconds=retry_delay_seconds(failures)),
+            "updated_at": now,
+        })
+        job.monitor["agent_reconciler"] = state
+        if reasons:
+            job.status = JobStatus.attention
+            self._enqueue_agent_reconcile_attention(job, state, requested_by=requested_by)
+        self.store.upsert_job(job)
+        return self._agent_reconcile_result(job, state, classification=classification, failures=[{"error": compact_error(exc)}])
+
+    def _fatal_agent_reconcile(
+        self,
+        job: JobRecord,
+        *,
+        classification: str,
+        reason: str,
+        requested_by: str,
+        state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        state = dict(state or job.monitor.get("agent_reconciler") or {})
+        state.update({
+            "lifecycle": "fatal",
+            "classification": classification,
+            "attention_reasons": [classification],
+            "last_error": reason,
+            "next_reconcile_at": None,
+            "updated_at": now,
+        })
+        job.monitor["agent_reconciler"] = state
+        job.status = JobStatus.attention
+        self._enqueue_agent_reconcile_attention(job, state, requested_by=requested_by)
+        self.store.upsert_job(job)
+        return self._agent_reconcile_result(job, state, classification=classification, failures=[{"error": reason}])
+
+    def _enqueue_agent_reconcile_attention(
+        self,
+        job: JobRecord,
+        state: dict[str, Any],
+        *,
+        requested_by: str,
+    ) -> None:
+        reasons = sorted({str(item) for item in (state.get("attention_reasons") or []) if str(item)})
+        signature = hashlib.sha256(json.dumps(reasons, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+        episode = state.get("attention_episode")
+        if not isinstance(episode, dict) or episode.get("signature") != signature:
+            episode = {"id": new_id("agent_attention", job.job_id), "signature": signature, "created_at": utc_now()}
+            state["attention_episode"] = episode
+        schedule = self.store.get_monitor_schedule(job.job_id) or {}
+        thread_id = str(schedule.get("thread_id") or "").strip()
+        if not thread_id:
+            return
+        self.store.enqueue_wake_event(
+            dedupe_key=f"{job.job_id}:attention:agent_capacity:{episode['id']}",
+            job_id=job.job_id,
+            thread_id=thread_id,
+            kind="attention",
+            summary=f"job {job.job_id} agent capacity requires attention",
+            payload={
+                "classification": state.get("classification"),
+                "attention_reasons": reasons,
+                "desired_agents": state.get("desired_agents"),
+                "live_agents": state.get("live_agents"),
+                "requested_by": requested_by,
+            },
+        )
+
+    def _agent_reconcile_result(
+        self,
+        job: JobRecord,
+        state: dict[str, Any],
+        *,
+        classification: str,
+        launched: list[dict[str, Any]] | None = None,
+        failures: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "stage": "done",
+            "classification": classification,
+            "job_id": job.job_id,
+            "sweep_id": job.sweep_id,
+            "desired_agents": state.get("desired_agents"),
+            "live_agents": state.get("live_agents"),
+            "remaining_runs": state.get("remaining_runs"),
+            "assignments": list(state.get("assignments") or []),
+            "launched": list(launched or []),
+            "failures": list(failures or []),
+            "next_reconcile_at": state.get("next_reconcile_at"),
+            "attention_reasons": list(state.get("attention_reasons") or []),
+        }
+
+    def _stop_agent_reconciler(self, job: JobRecord, *, classification: str) -> JobRecord:
+        if not is_managed_agent_job(job):
+            return job
+        state = dict(job.monitor["agent_reconciler"])
+        state.update({
+            "lifecycle": "stopped",
+            "classification": classification,
+            "next_reconcile_at": None,
+            "updated_at": utc_now(),
+        })
+        job.monitor["agent_reconciler"] = state
+        return self.store.upsert_job(job)
 
     def _assess_queue_blocker(self, job: JobRecord | None) -> dict[str, Any]:
         if job is None:
@@ -2222,126 +2612,74 @@ class ConsoleService:
                 "existing_job_id": existing_sweep_job.job_id,
                 "next_actions": ["既有 job 已登记该 sweep；如需 agent 请 recover-agents。"],
             }, job
+        expected_runs = to_non_negative_int(validation.get("expected_run_count"))
+        if not expected_runs and isinstance(job.monitor.get("result_contract"), dict):
+            expected_runs = to_non_negative_int(job.monitor["result_contract"].get("expected_runs"))
+        job.monitor["agent_reconciler"] = initial_agent_reconciler(
+            max_agents=payload.max_agents,
+            expected_runs=expected_runs or 1,
+        )
+        job.monitor["sweep_path"] = sweep_path
         try:
-            gpu_probe = self.ssh.probe_gpus(remote_host)
-            eligible = [gpu for gpu in gpu_probe["gpus"] if gpu["eligible"]]
-            if payload.max_agents is not None:
-                eligible = eligible[:payload.max_agents]
-            launches: list[dict[str, Any]] = []
-            wandb_api_key = self._wandb_api_key()
             auth = self.ssh.auth_check(
                 host=remote_host,
                 remote_cwd=remote_cwd,
                 sweep_path=sweep_path,
-                wandb_api_key=wandb_api_key,
+                wandb_api_key=self._wandb_api_key(),
                 conda_env=conda_env,
                 conda_sh=conda_sh,
             )
-            self._set_launch_phase(
-                job,
-                "launching_agents",
-                operation_id=operation_id,
-                classification="launching_agents",
-                sweep_receipt=sweep,
-                agent_launches=launches,
-            )
-            job.monitor.update({"gpu_probe": gpu_probe, "auth": auth})
-            self._record_operation(
-                job,
-                operation_id=operation_id,
-                intent=IntentType.launch_sweep,
-                requested_by=requested_by,
-                idempotency_key=idempotency_key,
-                stage="launching_agents",
-                classification="launching_agents",
-                status=OperationStatus.executing.value,
-                result={
-                    "stage": "launching_agents",
-                    "classification": "launching_agents",
-                    "created_new_sweep": True,
-                    "sweep": sweep,
-                    "agent_launches": [],
-                    "next_actions": ["Console is launching the planned agent capacity."],
-                },
-                retry_after_seconds=2,
-            )
-            for gpu in eligible:
-                launch = self.ssh.launch_agent(
-                    host=remote_host,
-                    remote_cwd=remote_cwd,
-                    sweep_path=sweep_path,
-                    gpu_index=gpu["index"],
-                    conda_env=conda_env,
-                    conda_sh=conda_sh,
-                    wandb_api_key=wandb_api_key,
-                )
-                launches.append(launch)
-                if launch.get("pid"):
-                    job.agent_pids = sorted(set([*job.agent_pids, str(launch["pid"])]))
-                self._set_launch_phase(
-                    job,
-                    "launching_agents",
-                    operation_id=operation_id,
-                    classification="launching_agents",
-                    sweep_receipt=sweep,
-                    agent_launches=launches,
-                )
-                job.monitor["agent_launches"] = [compact_agent_launch(item) for item in launches]
-                self._record_operation(
-                    job,
-                    operation_id=operation_id,
-                    intent=IntentType.launch_sweep,
-                    requested_by=requested_by,
-                    idempotency_key=idempotency_key,
-                    stage="launching_agents",
-                    classification="launching_agents",
-                    status=OperationStatus.executing.value,
-                    result={
-                        "stage": "launching_agents",
-                        "classification": "launching_agents",
-                        "created_new_sweep": True,
-                        "sweep": sweep,
-                        "agent_launches": launches,
-                        "next_actions": ["Console is launching the remaining planned agent capacity."],
-                    },
-                    retry_after_seconds=2,
-                )
         except Exception as exc:
-            self._set_launch_phase(
-                job,
-                "attention",
-                operation_id=operation_id,
-                classification="agent_launch_failed",
-                sweep_receipt=sweep,
-                agent_launches=launches if "launches" in locals() else [],
-            )
-            return self._fail_launch_job(
-                job,
-                intent=IntentType.launch_sweep,
-                operation_id=operation_id,
-                requested_by=requested_by,
-                idempotency_key=idempotency_key,
-                stage="agent_launch_failed",
-                classification="control_plane_error",
-                exc=exc,
-                next_actions=["检查 GPU 探测、W&B auth 或 agent 启动错误；只对这个既有 sweep 使用 recover-agents 补足缺失容量。"],
-                status=JobStatus.attention,
-                extra_result={
-                    "validation": validation,
-                    "preflight": preflight,
-                    "sweep": sweep,
-                    "agent_launches": launches if "launches" in locals() else [],
-                },
-            )
-        job.agent_pids = sorted(set([*job.agent_pids, *[str(item["pid"]) for item in launches if item.get("pid")]]))
-        job.status = JobStatus.running if launches else JobStatus.attention
-        classification = classify_launch(auth, launches)
-        job.monitor.update({
-            "gpu_probe": gpu_probe,
-            "auth": auth,
-            "agent_launches": [compact_agent_launch(item) for item in launches],
-            "sweep_path": sweep_path,
-        })
+            auth = {
+                "ok": None,
+                "classification": "auth_check_pending",
+                "error": compact_error(exc),
+            }
+        job.monitor["auth"] = auth
+        job.status = JobStatus.running
+        self._set_launch_phase(
+            job,
+            "reconciling_agents",
+            operation_id=operation_id,
+            classification="agent_reconciliation_pending",
+            sweep_receipt=sweep,
+            agent_launches=[],
+        )
+        self._record_operation(
+            job,
+            operation_id=operation_id,
+            intent=IntentType.launch_sweep,
+            requested_by=requested_by,
+            idempotency_key=idempotency_key,
+            stage="reconciling_agents",
+            classification="agent_reconciliation_pending",
+            status=OperationStatus.executing.value,
+            result={
+                "stage": "reconciling_agents",
+                "classification": "agent_reconciliation_pending",
+                "created_new_sweep": True,
+                "sweep": sweep,
+                "next_actions": ["Console agent reconciler owns capacity recovery for this sweep."],
+            },
+            retry_after_seconds=2,
+        )
+        capacity = self._reconcile_agent_capacity_locked(
+            job,
+            force=True,
+            requested_by="launch-sweep",
+        )
+        job = self._require_job(job.job_id)
+        live_agents = to_non_negative_int(capacity.get("live_agents"))
+        capacity_classification = str(capacity.get("classification") or "capacity_pending")
+        if capacity_classification == "capacity_satisfied":
+            classification = "agents_running"
+        elif live_agents > 0 and capacity_classification != "agent_capacity_attention":
+            classification = "agents_running_degraded"
+        elif job.status == JobStatus.attention:
+            classification = capacity_classification
+        else:
+            classification = "agent_capacity_pending"
+        launches = list(capacity.get("assignments") or [])
         self._set_launch_phase(
             job,
             "done",
@@ -2358,7 +2696,13 @@ class ConsoleService:
             idempotency_key=idempotency_key,
             stage="done",
             classification=classification,
-            status=OperationStatus.succeeded.value if classification == "agents_running" else OperationStatus.failed.value if classification in {"wandb_auth_missing", "agents_failed_wandb_auth"} else OperationStatus.executing.value,
+            status=(
+                OperationStatus.failed.value
+                if job.status == JobStatus.attention
+                else OperationStatus.succeeded.value
+                if live_agents > 0
+                else OperationStatus.executing.value
+            ),
             result={
                 "stage": "done",
                 "classification": classification,
@@ -2367,12 +2711,16 @@ class ConsoleService:
                 "preflight": preflight,
                 "auth": auth,
                 "sweep": sweep,
-                "gpu_probe": gpu_probe,
                 "agent_launches": launches,
+                "agent_reconciler": capacity,
                 "launch_identity_conflicts": job.monitor.get("launch_identity_conflicts") or [],
-                "next_actions": next_actions_for_classification(classification),
+                "next_actions": (
+                    ["Inspect the agent reconciler attention reasons; do not create another sweep."]
+                    if job.status == JobStatus.attention
+                    else []
+                ),
             },
-            retry_after_seconds=2,
+            retry_after_seconds=30 if not live_agents and job.status != JobStatus.attention else None,
         )
         return {
             "stage": "done",
@@ -2382,11 +2730,15 @@ class ConsoleService:
             "preflight": preflight,
             "auth": auth,
             "sweep": sweep,
-            "gpu_probe": gpu_probe,
             "agent_launches": launches,
+            "agent_reconciler": capacity,
             "config_path": remote_config_path,
             "launch_identity_conflicts": job.monitor.get("launch_identity_conflicts") or [],
-            "next_actions": next_actions_for_classification(classification),
+            "next_actions": (
+                ["Inspect the agent reconciler attention reasons; do not create another sweep."]
+                if job.status == JobStatus.attention
+                else []
+            ),
         }, job
 
     def _advance_queue(
@@ -2954,6 +3306,11 @@ class ConsoleService:
                 job.monitor["last_agent_probe"] = compact_agent_probe(agent_probe)
             except Exception as exc:
                 agent_probe = {"classification": "agent_probe_unavailable", "error": compact_error(exc)}
+        agent_reconciler = (
+            job.monitor.get("agent_reconciler")
+            if job and isinstance(job.monitor.get("agent_reconciler"), dict)
+            else {}
+        )
         agent_health = "unknown"
         if job and job.monitor.get("kind") == "single_run" and isinstance(run_status, dict):
             alive = run_status.get("alive_pids") or []
@@ -2988,6 +3345,15 @@ class ConsoleService:
             agent_health = "terminal"
         elif job and job.status == JobStatus.queued:
             agent_health = "queued"
+        if agent_reconciler:
+            controller_lifecycle = str(agent_reconciler.get("lifecycle") or "")
+            controller_live = to_non_negative_int(agent_reconciler.get("live_agents"))
+            if controller_lifecycle in {"pending", "running_degraded"} and controller_live == 0:
+                agent_health = "waiting_for_capacity"
+            elif controller_live > 0 and agent_health in {"unknown", "missing"}:
+                agent_health = "running"
+            elif controller_lifecycle in {"terminal", "stopped"} and execution_state.get("queue_releasable"):
+                agent_health = "terminal"
         sweep_attention = False
         sweep_attention_reasons: list[str] = []
         if job and job.monitor.get("kind") != "single_run" and sweep:
@@ -3068,6 +3434,9 @@ class ConsoleService:
             if execution_state.get("queue_releasable") and agent_health != "terminal":
                 queue_releasable = False
                 blocked_reasons.append("remote_process_not_terminal")
+            if str(agent_reconciler.get("lifecycle") or "") in {"attention", "fatal"}:
+                queue_releasable = False
+                blocked_reasons.append("agent_capacity_attention")
             if sweep_attention or result_artifact_attention:
                 queue_releasable = False
                 blocked_reasons.append("attention")
@@ -3085,7 +3454,12 @@ class ConsoleService:
                 "blocked_reasons": blocked_reasons,
             }
             desired_status = execution_state["job_status"]
-            if sweep_attention or result_artifact_attention or sync_state["classification"] == "sync_error":
+            if (
+                sweep_attention
+                or result_artifact_attention
+                or sync_state["classification"] == "sync_error"
+                or str(agent_reconciler.get("lifecycle") or "") in {"attention", "fatal"}
+            ):
                 desired_status = JobStatus.attention
             cached_status = compact_sweep_status(sweep, include_runs=True)
             artifact_observed_at = str(
@@ -3189,6 +3563,8 @@ class ConsoleService:
             classification = "attention"
             if job.monitor.get("kind") == "single_run":
                 next_actions = ["检查 single-run 的 last_run_status、failure_diagnostics 和远端日志；修复配置 argv 或训练脚本后重新 launch-run。"]
+            elif agent_reconciler.get("attention_reasons"):
+                next_actions = ["检查 agent_reconciler.attention_reasons；不要创建重复 sweep，修复后用 recover-agents 触发立即调和。"]
             else:
                 next_actions = ["检查 agent 诊断；修复远端代码/路径后重新 launch 或 recover-agents。"]
         elif sweep_attention:
@@ -3215,6 +3591,7 @@ class ConsoleService:
                 "launches": agent_launches,
                 "pids": list(job.agent_pids) if job else [],
                 "probe": compact_agent_probe(agent_probe) if isinstance(agent_probe, dict) else None,
+                "reconciler": compact_agent_reconciler(agent_reconciler),
             },
             "results": {
                 "readiness": result_readiness,
@@ -3340,6 +3717,8 @@ class ConsoleService:
             )
             return result, job
         result = {"cancel_wandb_requested": payload.cancel_wandb, "cancel_wandb_implemented": False}
+        if not is_queued:
+            job = self._stop_agent_reconciler(job, classification="stop_requested")
         if is_queued:
             result["queued_cancelled"] = True
             result["note"] = "Queued job had no W&B sweep or agents."
@@ -3419,6 +3798,9 @@ class ConsoleService:
                 monitor={"stage": "cancel_requested", "created_new_sweep": False},
             )
             self.store.upsert_job(job)
+        elif is_managed_agent_job(job):
+            with self._serialized_job(job.job_id):
+                job = self._stop_agent_reconciler(self._require_job(job.job_id), classification="sweep_cancel_requested")
         self._record_operation(
             job,
             operation_id=operation_id,
@@ -3481,6 +3863,10 @@ class ConsoleService:
         job = self._require_job(payload.job_id)
         if not job.sweep_id or not job.entity or not job.project or not job.remote_host or not job.remote_cwd:
             raise ValueError("job lacks sweep/remote metadata required for recover")
+        if not is_managed_agent_job(job):
+            raise ValueError("recover-agents cannot adopt a historical job; only newly launched managed sweeps are eligible")
+        if job.status in TERMINAL_JOB_STATUSES or str(job.monitor["agent_reconciler"].get("lifecycle") or "") == "stopped":
+            raise ValueError("recover-agents cannot restart a stopped or terminal managed job")
         operation_id = operation_id or self._operation_identity(IntentType.recover_agents, payload.model_dump(mode="json"))[0]
         idempotency_key = idempotency_key or self._operation_identity(IntentType.recover_agents, payload.model_dump(mode="json"))[1]
         self._record_operation(
@@ -3495,40 +3881,17 @@ class ConsoleService:
             result={"stage": "accepted", "classification": "accepted", "job_id": job.job_id},
             retry_after_seconds=2,
         )
-        gpu_probe = self.ssh.probe_gpus(job.remote_host)
-        eligible = [gpu for gpu in gpu_probe["gpus"] if gpu["eligible"]]
-        if payload.max_agents is not None:
-            eligible = eligible[:payload.max_agents]
-        sweep_path = f"{job.entity}/{job.project}/{job.sweep_id}"
-        wandb_api_key = self._wandb_api_key()
-        conda_env = job.conda_env or self.settings.default_conda_env
-        if conda_env and not job.conda_env:
-            job.conda_env = conda_env
-        auth = self.ssh.auth_check(
-            host=job.remote_host,
-            remote_cwd=job.remote_cwd,
-            sweep_path=sweep_path,
-            wandb_api_key=wandb_api_key,
-            conda_env=conda_env,
-            conda_sh=payload.conda_sh,
+        reconcile = self._reconcile_agent_capacity_locked(
+            job,
+            force=True,
+            requested_by=requested_by,
         )
-        launches = [
-            self.ssh.launch_agent(
-                host=job.remote_host,
-                remote_cwd=job.remote_cwd,
-                sweep_path=sweep_path,
-                gpu_index=gpu["index"],
-                conda_env=conda_env,
-                conda_sh=payload.conda_sh,
-                wandb_api_key=wandb_api_key,
-            )
-            for gpu in eligible
-        ]
-        job.agent_pids = sorted(set(job.agent_pids + [item["pid"] for item in launches if item.get("pid")]))
-        job.status = JobStatus.running if launches else JobStatus.attention
-        classification = classify_launch(auth, launches)
-        job.monitor.update({"recover_gpu_probe": gpu_probe, "recover_auth": auth, "recover_agent_launches": launches, "classification": classification})
-        self.store.upsert_job(job)
+        job = self._require_job(job.job_id)
+        classification = (
+            str(reconcile.get("classification") or "agent_reconcile_triggered")
+            if job.status == JobStatus.attention
+            else "agent_reconcile_triggered"
+        )
         self._record_operation(
             job,
             operation_id=operation_id,
@@ -3537,25 +3900,21 @@ class ConsoleService:
             idempotency_key=idempotency_key,
             stage="done",
             classification=classification,
-            status=OperationStatus.succeeded.value if classification == "agents_running" else OperationStatus.failed.value if classification in {"wandb_auth_missing", "agents_failed_wandb_auth"} else OperationStatus.executing.value,
+            status=OperationStatus.failed.value if job.status == JobStatus.attention else OperationStatus.succeeded.value,
             result={
                 "stage": "done",
                 "classification": classification,
-                "auth": auth,
-                "gpu_probe": gpu_probe,
-                "agent_launches": launches,
                 "created_new_sweep": False,
-                "next_actions": next_actions_for_classification(classification),
+                "agent_reconciler": reconcile,
+                "next_actions": ["Inspect agent reconciler attention reasons."] if job.status == JobStatus.attention else [],
             },
         )
         return {
             "stage": "done",
             "classification": classification,
-            "auth": auth,
-            "gpu_probe": gpu_probe,
-            "agent_launches": launches,
             "created_new_sweep": False,
-            "next_actions": next_actions_for_classification(classification),
+            "agent_reconciler": reconcile,
+            "next_actions": ["Inspect agent reconciler attention reasons."] if job.status == JobStatus.attention else [],
         }, job
 
     def _repair_watchdog(self, payload: RepairWatchdogPayload, *, requested_by: str = "experiment-runner", operation_id: str | None = None, idempotency_key: str | None = None) -> tuple[dict[str, Any], JobRecord]:
@@ -4630,29 +4989,6 @@ def count_jobs(jobs: list[JobRecord]) -> dict[str, int]:
     return counts
 
 
-def classify_launch(auth: dict[str, Any], launches: list[dict[str, Any]]) -> str:
-    if not auth.get("ok"):
-        return str(auth.get("classification") or "wandb_auth_missing")
-    if not launches:
-        return "no_eligible_gpus"
-    classifications = {str(item.get("classification") or "") for item in launches}
-    if "wandb_auth_missing" in classifications:
-        return "agents_failed_wandb_auth"
-    if any(item.get("pid") for item in launches):
-        return "agents_running"
-    return "agents_started_unverified"
-
-
-def next_actions_for_classification(classification: str) -> list[str]:
-    if classification in {"wandb_auth_missing", "agents_failed_wandb_auth"}:
-        return ["刷新 WANDB_API_KEY 或 Bitwarden session 后，对同一个 job 执行 recover-agents；不要重新创建 sweep。"]
-    if classification == "no_eligible_gpus":
-        return ["等待 GPU 空闲后执行 recover-agents，或显式设置更保守的 max_agents。"]
-    if classification == "agents_started_unverified":
-        return ["检查远端 agent log；如 agent 不存在，对既有 job 执行 recover-agents。"]
-    return []
-
-
 def summarize_result_pull(result: dict[str, Any]) -> dict[str, Any]:
     return {
         "source": result.get("source"),
@@ -4833,6 +5169,107 @@ def compact_agent_probe(probe: dict[str, Any] | None) -> dict[str, Any] | None:
     }
 
 
+def compact_gpu_probe(probe: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(probe, dict):
+        return None
+    return {
+        "host": probe.get("host"),
+        "eligible_count": probe.get("eligible_count"),
+        "gpus": [
+            {
+                key: gpu.get(key)
+                for key in ["index", "eligible", "memory_free_mb", "memory_used_mb", "utilization_gpu"]
+                if key in gpu
+            }
+            for gpu in (probe.get("gpus") or [])
+            if isinstance(gpu, dict)
+        ],
+    }
+
+
+def compact_agent_assignments(assignments: Any) -> list[dict[str, Any]]:
+    return [
+        {
+            key: item.get(key)
+            for key in [
+                "job_id",
+                "sweep_path",
+                "gpu_index",
+                "generation",
+                "pid",
+                "session_id",
+                "pid_start_ticks",
+                "log",
+                "conda_env",
+                "classification",
+                "receipt_path",
+                "started_at",
+                "updated_at",
+            ]
+            if item.get(key) is not None
+        }
+        for item in (assignments or [])
+        if isinstance(item, dict)
+    ]
+
+
+def compact_agent_reconcile_remote(result: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(result, dict):
+        return None
+    return {
+        "classification": result.get("classification"),
+        "desired_agents": result.get("desired_agents"),
+        "live_agents": result.get("live_agents"),
+        "assignments": compact_agent_assignments(result.get("assignments")),
+        "launched": compact_agent_assignments(result.get("launched")),
+        "failed": list(result.get("failed") or [])[:10],
+        "skipped": list(result.get("skipped") or [])[:10],
+        "occupied_gpus": list(result.get("occupied_gpus") or []),
+        "receipt_root": result.get("receipt_root"),
+        "observed_at": result.get("observed_at"),
+    }
+
+
+def compact_agent_reconciler(state: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(state, dict) or not state:
+        return None
+    compact = {
+        key: state.get(key)
+        for key in [
+            "version",
+            "lifecycle",
+            "classification",
+            "max_agents",
+            "expected_runs",
+            "remaining_runs",
+            "desired_agents",
+            "live_agents",
+            "eligible_gpu_indices",
+            "consecutive_failures",
+            "consecutive_launch_failures",
+            "zero_capacity_failures",
+            "zero_capacity_age_seconds",
+            "first_zero_capacity_at",
+            "first_agent_at",
+            "last_attempt_at",
+            "last_success_at",
+            "next_reconcile_at",
+            "attention_reasons",
+            "attention_episode",
+            "last_error",
+            "created_at",
+            "updated_at",
+        ]
+        if key in state
+    }
+    compact["assignments"] = compact_agent_assignments(state.get("assignments"))
+    if state.get("last_gpu_probe"):
+        compact["last_gpu_probe"] = compact_gpu_probe(state.get("last_gpu_probe"))
+    if state.get("last_remote_result"):
+        compact["last_remote_result"] = compact_agent_reconcile_remote(state.get("last_remote_result"))
+    return compact
+
+
 def compact_failure_diagnostics(diagnostics: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(diagnostics, dict):
         return None
@@ -4887,6 +5324,7 @@ def compact_job_record(job: JobRecord) -> dict[str, Any]:
         "run",
         "last_run_status",
         "last_agent_probe",
+        "agent_reconciler",
         "last_failure_diagnostics",
         "error",
         "validation_error",
@@ -4898,6 +5336,8 @@ def compact_job_record(job: JobRecord) -> dict[str, Any]:
                 compact_monitor[key] = compact_failure_diagnostics(monitor[key])
             elif key == "last_agent_probe":
                 compact_monitor[key] = compact_agent_probe(monitor[key])
+            elif key == "agent_reconciler":
+                compact_monitor[key] = compact_agent_reconciler(monitor[key])
             elif key == "preflight" and isinstance(monitor[key], dict):
                 compact_monitor[key] = {
                     preflight_key: monitor[key].get(preflight_key)

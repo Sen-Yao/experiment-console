@@ -161,27 +161,21 @@ def build_plan(intent: IntentType, payload: dict, settings: Settings) -> Executi
         )
     if isinstance(parsed, RecoverAgentsPayload):
         return ExecutionPlan(
-            summary=f"Recover agents for existing job {parsed.job_id}.",
+            summary=f"Trigger immediate agent-capacity reconciliation for managed job {parsed.job_id}.",
             risk_level="remote_side_effect",
             commands=[
                 CommandPreview(
-                    label="load_existing_job",
-                    argv=["console-ledger", "get-job", parsed.job_id],
-                    reason="Recover must reuse the existing sweep id and must not create a duplicate sweep.",
-                ),
-                CommandPreview(
-                    label="probe_gpus",
-                    argv=["ssh", "<job.remote_host>", "nvidia-smi --query-gpu=..."],
-                    reason="Find eligible GPUs for replacement agents.",
-                ),
-                CommandPreview(
-                    label="start_agents",
-                    argv=["ssh", "<job.remote_host>", "cd <remote_cwd> && nohup wandb agent <existing_sweep> ..."],
-                    reason="Start replacement agents for the existing sweep only.",
+                    label="reconcile_agent_capacity",
+                    argv=["console-agent-reconciler", "reconcile-now", parsed.job_id],
+                    reason="Reuse the managed job's fixed capacity contract and durable remote receipts.",
                     side_effect=True,
                 ),
             ],
-            expected_side_effects=["Start remote wandb agent processes for an existing sweep", "Update local job/audit state"],
+            expected_side_effects=[
+                "Probe W&B progress and eligible GPUs",
+                "Start only missing receipt-managed agents when capacity is below the fixed target",
+                "Update Console job and audit state",
+            ],
         )
     if isinstance(parsed, RepairWatchdogPayload):
         return ExecutionPlan(

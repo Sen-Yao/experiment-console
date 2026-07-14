@@ -7,6 +7,8 @@ HCCS_SSH_KEY_FILE="${HCCS_SSH_KEY_FILE:-/run/secrets/hccs_ssh_key}"
 HCCS_SSH_CONFIG_FILE="${HCCS_SSH_CONFIG_FILE:-/run/config/hccs_ssh_config}"
 HCCS_KNOWN_HOSTS_FILE="${HCCS_KNOWN_HOSTS_FILE:-/run/config/hccs_known_hosts}"
 SSH_DIR="${HOME:-/home/console}/.ssh"
+SQLITE_TMPDIR="${SQLITE_TMPDIR:-/var/lib/experiment-console/state/sqlite-tmp}"
+export SQLITE_TMPDIR
 
 require_readable_nonempty() {
     if [ ! -r "$1" ] || [ ! -s "$1" ]; then
@@ -27,7 +29,8 @@ if [ "$API_TOKEN_LENGTH" -lt 32 ]; then
 fi
 
 umask 077
-mkdir -p "$SSH_DIR"
+mkdir -p "$SSH_DIR" "$SQLITE_TMPDIR"
+chmod 0700 "$SQLITE_TMPDIR"
 cp "$HCCS_SSH_KEY_FILE" "$SSH_DIR/id_hccs"
 cp "$HCCS_SSH_CONFIG_FILE" "$SSH_DIR/config"
 cp "$HCCS_KNOWN_HOSTS_FILE" "$SSH_DIR/known_hosts"

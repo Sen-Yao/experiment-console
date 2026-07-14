@@ -47,6 +47,7 @@ done
 
 docker exec "$cid" python - "$INSTANCE_ID" <<'PY'
 import json
+import os
 import sqlite3
 import sys
 import urllib.error
@@ -57,6 +58,9 @@ from experiment_console.config import Settings
 from experiment_console.wandb_client import WandBClient
 
 expected_instance = sys.argv[1]
+sqlite_tmpdir = Path(os.environ["SQLITE_TMPDIR"])
+assert sqlite_tmpdir == Path("/var/lib/experiment-console/state/sqlite-tmp"), sqlite_tmpdir
+assert sqlite_tmpdir.is_dir() and os.access(sqlite_tmpdir, os.W_OK), sqlite_tmpdir
 with urllib.request.urlopen("http://127.0.0.1:5174/health", timeout=4) as response:
     health = json.load(response)
 assert health.get("status") == "ok", health
@@ -150,6 +154,7 @@ print(json.dumps({
     "unscheduled_active_contract_jobs": unscheduled_active,
     "wandb_graphql_probe": "ok",
     "hccs_wandb_auth_probe": "ok",
+    "sqlite_tmpdir": str(sqlite_tmpdir),
 }, sort_keys=True))
 PY
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -45,6 +46,13 @@ class FakeWandB:
 class FakeSSH:
     def __init__(self):
         self.launches = []
+        self.agent_reconcile_calls = []
+        self.agent_assignments = {}
+        self.auth_ok = True
+        self.gpu_rows = [
+            {"index": 0, "eligible": True, "memory_free_mb": 12000, "utilization_gpu": 0},
+            {"index": 1, "eligible": True, "memory_free_mb": 11000, "utilization_gpu": 3},
+        ]
         self.run_launches = []
         self.created_sweeps = 0
         self.agent_probe = None
@@ -72,24 +80,60 @@ class FakeSSH:
     def probe_gpus(self, host):
         return {
             "host": host,
-            "eligible_count": 2,
-            "gpus": [
-                {"index": 0, "eligible": True, "memory_free_mb": 12000, "utilization_gpu": 0},
-                {"index": 1, "eligible": True, "memory_free_mb": 11000, "utilization_gpu": 3},
-            ],
+            "eligible_count": sum(1 for item in self.gpu_rows if item["eligible"]),
+            "gpus": list(self.gpu_rows),
         }
 
-    def launch_agent(self, *, host, remote_cwd, sweep_path, gpu_index, conda_env, conda_sh, wandb_api_key=None):
-        self.launches.append({
+    def reconcile_agent_capacity(self, *, host, job_id, remote_cwd, sweep_path, desired_agents, eligible_gpu_indices, conda_env, conda_sh, wandb_api_key=None):
+        call = {
             "host": host,
+            "job_id": job_id,
             "remote_cwd": remote_cwd,
             "sweep_path": sweep_path,
-            "gpu_index": gpu_index,
+            "desired_agents": desired_agents,
+            "eligible_gpu_indices": list(eligible_gpu_indices),
             "conda_env": conda_env,
             "conda_sh": conda_sh,
             "wandb_api_key": wandb_api_key,
-        })
-        return {"host": host, "gpu_index": gpu_index, "pid": str(1000 + gpu_index), "sweep_path": sweep_path}
+        }
+        self.agent_reconcile_calls.append(call)
+        assignments = self.agent_assignments.setdefault(sweep_path, {})
+        launched = []
+        for gpu_index in eligible_gpu_indices:
+            if len(assignments) >= desired_agents:
+                break
+            if gpu_index in assignments:
+                continue
+            generation = 1
+            launch = {
+                "job_id": job_id,
+                "host": host,
+                "gpu_index": gpu_index,
+                "generation": generation,
+                "pid": str(1000 + gpu_index),
+                "sweep_path": sweep_path,
+                "conda_env": conda_env,
+                "classification": "agent_started",
+                "receipt_path": f"/home/test/.local/state/experiment-console/agent-receipts/{job_id}/gpu_{gpu_index}_generation_{generation}.json",
+                "log": f"/home/test/.local/state/experiment-console/agent-logs/{job_id}/gpu_{gpu_index}.log",
+            }
+            assignments[gpu_index] = launch
+            launched.append(launch)
+            self.launches.append({**call, **launch})
+        values = list(assignments.values())
+        return {
+            "classification": "capacity_satisfied" if len(values) >= desired_agents else "capacity_degraded",
+            "job_id": job_id,
+            "sweep_path": sweep_path,
+            "desired_agents": desired_agents,
+            "live_agents": len(values),
+            "assignments": values,
+            "launched": launched,
+            "failed": [],
+            "skipped": [],
+            "occupied_gpus": sorted(assignments),
+            "receipt_root": "/home/test/.local/state/experiment-console/agent-receipts",
+        }
 
     def create_sweep(self, *, host, remote_cwd, remote_config, entity, project, wandb_api_key):
         self.created_sweeps += 1
@@ -193,7 +237,7 @@ class FakeSSH:
         return {"host": host, "stopped_pids": list(pids or ["1000"]), "sweep_path": sweep_path}
 
     def auth_check(self, *, host, remote_cwd, sweep_path, wandb_api_key, conda_env=None, conda_sh=None):
-        return {"ok": bool(wandb_api_key), "classification": "auth_ok" if wandb_api_key else "wandb_auth_missing"}
+        return {"ok": self.auth_ok, "classification": "auth_ok" if self.auth_ok else "wandb_auth_missing"}
 
     def preflight(self, *, host, remote_cwd, conda_env=None, conda_sh="/opt/anaconda3/etc/profile.d/conda.sh", config_path=None):
         return {
@@ -1180,12 +1224,18 @@ def test_stale_creating_sweep_without_receipt_fails_closed_once(tmp_path):
     ]
 
 
-def test_partial_agent_launch_receipt_survives_crash_and_replay_never_refills(tmp_path):
-    class CrashOnSecondAgentSSH(FakeSSH):
-        def launch_agent(self, **kwargs):
-            if kwargs["gpu_index"] == 1:
-                raise SystemExit("simulated process loss before second agent receipt")
-            return super().launch_agent(**kwargs)
+def test_remote_agent_receipts_survive_lost_ack_and_reconcile_without_duplicates(tmp_path):
+    class CrashAfterRemoteReceiptSSH(FakeSSH):
+        def __init__(self):
+            super().__init__()
+            self.crash_after_receipt = True
+
+        def reconcile_agent_capacity(self, **kwargs):
+            result = super().reconcile_agent_capacity(**kwargs)
+            if self.crash_after_receipt:
+                self.crash_after_receipt = False
+                raise SystemExit("simulated process loss after durable remote receipts")
+            return result
 
     settings = Settings(
         state_dir=tmp_path,
@@ -1193,12 +1243,13 @@ def test_partial_agent_launch_receipt_survives_crash_and_replay_never_refills(tm
         default_project="my-project",
         authority_role="authoritative",
     )
-    ssh = CrashOnSecondAgentSSH()
+    ssh = CrashAfterRemoteReceiptSSH()
     payload = {
         "job_name": "crash-during-agents",
         "config_path": write_sweep_config(tmp_path / "crash-agents.yaml"),
         "remote_host": "gpu-host-1",
         "remote_cwd": "/tmp/demo",
+        "max_agents": 2,
         "idempotency_key": "crash-during-agents",
         "thread_id": "thread-crash-agents",
         "result_contract": {
@@ -1214,18 +1265,17 @@ def test_partial_agent_launch_receipt_survives_crash_and_replay_never_refills(tm
         ssh=ssh,
     )
 
-    with pytest.raises(SystemExit, match="simulated process loss"):
+    with pytest.raises(SystemExit, match="durable remote receipts"):
         first_service.runner_command(IntentType.launch_sweep, payload)
 
     interrupted = first_service.store.find_job_by_idempotency_key("crash-during-agents")
     assert interrupted is not None
     assert interrupted.sweep_id == "abc123"
-    assert interrupted.monitor["launch"]["phase"] == "launching_agents"
+    assert interrupted.monitor["launch"]["phase"] == "reconciling_agents"
     assert interrupted.monitor["launch"]["sweep_receipt"]["sweep_id"] == "abc123"
-    assert interrupted.monitor["launch"]["agent_launches"] == [
-        {"host": "gpu-host-1", "gpu_index": 0, "pid": "1000", "sweep_path": "my-team/my-project/abc123"}
-    ]
-    assert interrupted.agent_pids == ["1000"]
+    assert interrupted.monitor["agent_reconciler"]["lifecycle"] == "pending"
+    assert interrupted.agent_pids == []
+    assert [item["gpu_index"] for item in ssh.launches] == [0, 1]
 
     restarted = ConsoleService(
         settings=settings,
@@ -1233,19 +1283,16 @@ def test_partial_agent_launch_receipt_survives_crash_and_replay_never_refills(tm
         wandb=FakeWandB(),
         ssh=ssh,
     )
-    first_replay = restarted.runner_command(IntentType.launch_sweep, payload)
-    second_replay = restarted.runner_command(IntentType.launch_sweep, payload)
+    recovered = restarted.reconcile_agent_capacity(interrupted.job_id, force=True)
+    replay = restarted.runner_command(IntentType.launch_sweep, payload)
     events = restarted.store.claim_wake_events(consumer_id="bridge", limit=10, lease_seconds=60)
 
-    assert first_replay.classification == "launch_recovery_required"
-    assert second_replay.classification == "launch_recovery_required"
-    assert first_replay.result["sweep_id"] == "abc123"
-    assert first_replay.result["agent_launches"][0]["pid"] == "1000"
+    assert recovered["classification"] == "capacity_satisfied"
+    assert recovered["live_agents"] == 2
+    assert replay.result["created_new_sweep"] is True
     assert ssh.created_sweeps == 1
-    assert [item["gpu_index"] for item in ssh.launches] == [0]
-    assert [(event["kind"], event["payload"]["classification"]) for event in events] == [
-        ("attention", "launch_recovery_required")
-    ]
+    assert [item["gpu_index"] for item in ssh.launches] == [0, 1]
+    assert events == []
 
 
 def test_row_level_launch_idempotency_without_operation_receipt_fails_closed(tmp_path):
@@ -1558,7 +1605,7 @@ def test_running_sweep_with_failed_runs_and_no_results_needs_attention(tmp_path)
     assert "run 级失败" in watchdog.result["message"] or "失败" in watchdog.result["message"]
 
 
-def test_recover_agents_does_not_create_new_sweep(tmp_path):
+def test_recover_agents_refuses_historical_unmanaged_job(tmp_path):
     service = make_service(tmp_path)
     job = JobRecord(
         job_id="job_existing",
@@ -1573,14 +1620,325 @@ def test_recover_agents_does_not_create_new_sweep(tmp_path):
     service.store.upsert_job(job)
     intent, _ = service.preview(IntentPreviewRequest(
         intent=IntentType.recover_agents,
-        payload={"job_id": "job_existing", "max_agents": 1},
+        payload={"job_id": "job_existing"},
     ))
+    assert [command.label for command in intent.plan.commands] == ["reconcile_agent_capacity"]
+    assert all(command.argv[0] != "ssh" for command in intent.plan.commands)
     service.confirm(intent.intent_id, ConfirmRequest(confirmation_phrase=intent.confirmation_phrase))
-    response = service.execute(intent.intent_id)
-    assert response.intent.result
-    assert response.intent.result["created_new_sweep"] is False
-    assert response.job is not None
-    assert response.job.status == JobStatus.running
+    with pytest.raises(ValueError, match="cannot adopt a historical job"):
+        service.execute(intent.intent_id)
+
+
+def test_recover_agents_only_triggers_managed_reconciliation(tmp_path):
+    service = make_service(tmp_path)
+    ssh = service.ssh
+    launched = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "managed-recover",
+        "config_path": write_sweep_config(tmp_path / "managed-recover.yaml"),
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "max_agents": 1,
+        "idempotency_key": "managed-recover-launch",
+    })
+    before_calls = len(ssh.agent_reconcile_calls)
+    before_sweeps = ssh.created_sweeps
+
+    recovered = service.runner_command(IntentType.recover_agents, {
+        "job_id": launched.job_id,
+        "idempotency_key": "managed-recover-now",
+    })
+
+    assert recovered.classification == "agent_reconcile_triggered"
+    assert recovered.result["created_new_sweep"] is False
+    assert len(ssh.agent_reconcile_calls) == before_calls + 1
+    assert ssh.created_sweeps == before_sweeps
+
+    service.runner_command(IntentType.recover_agents, {"job_id": launched.job_id})
+    service.runner_command(IntentType.recover_agents, {"job_id": launched.job_id})
+    assert len(ssh.agent_reconcile_calls) == before_calls + 3
+
+
+def test_recover_agents_rejects_removed_launch_controls(tmp_path):
+    service = make_service(tmp_path)
+
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        service.runner_command(IntentType.recover_agents, {
+            "job_id": "job-managed",
+            "max_agents": 2,
+        })
+
+
+def test_recover_agents_cannot_restart_stopped_controller(tmp_path):
+    service = make_service(tmp_path)
+    launched = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "managed-recover-stopped",
+        "config_path": write_sweep_config(tmp_path / "managed-recover-stopped.yaml"),
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "max_agents": 1,
+        "idempotency_key": "managed-recover-stopped-launch",
+    })
+    service.runner_command(IntentType.stop_job, {
+        "job_id": launched.job_id,
+        "idempotency_key": "managed-recover-stopped-stop",
+    })
+    before_calls = len(service.ssh.agent_reconcile_calls)
+
+    with pytest.raises(ValueError, match="cannot restart"):
+        service.runner_command(IntentType.recover_agents, {"job_id": launched.job_id})
+
+    assert len(service.ssh.agent_reconcile_calls) == before_calls
+
+
+def test_agent_reconciler_expands_to_ceiling_and_never_scales_down_live_agents(tmp_path):
+    class MutableWandB(FakeWandB):
+        def __init__(self):
+            super().__init__()
+            self.finished = 0
+
+        def get_sweep_state(self, entity, project, sweep_id):
+            return {
+                "id": sweep_id,
+                "entity": entity,
+                "project": project,
+                "state": "RUNNING",
+                "expectedRunCount": 5,
+                "runCount": 5,
+                "raw_run_state_counts": {"finished": self.finished, "running": 0, "failed": 0},
+                "runs": [],
+            }
+
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = FakeSSH()
+    wandb = MutableWandB()
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=wandb, ssh=ssh)
+    launched = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "elastic-capacity",
+        "config_path": write_sweep_config(tmp_path / "elastic-capacity.yaml"),
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "max_agents": 5,
+        "idempotency_key": "elastic-capacity",
+    })
+
+    assert launched.classification == "agents_running_degraded"
+    assert launched.result["agent_reconciler"]["live_agents"] == 2
+    ssh.gpu_rows = [
+        {"index": index, "eligible": True, "memory_free_mb": 12000, "utilization_gpu": 0}
+        for index in range(5)
+    ]
+    expanded = service.reconcile_agent_capacity(launched.job_id, force=True)
+
+    assert expanded["classification"] == "capacity_satisfied"
+    assert expanded["desired_agents"] == 5
+    assert expanded["live_agents"] == 5
+    assert [item["gpu_index"] for item in ssh.launches] == [0, 1, 2, 3, 4]
+
+    wandb.finished = 4
+    before_launches = len(ssh.launches)
+    contracted_target = service.reconcile_agent_capacity(launched.job_id, force=True)
+
+    assert contracted_target["desired_agents"] == 1
+    assert contracted_target["live_agents"] == 5
+    assert len(ssh.launches) == before_launches
+
+
+def test_agent_reconciler_treats_no_eligible_gpu_as_normal_wait(tmp_path):
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = FakeSSH()
+    ssh.gpu_rows = []
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
+
+    launched = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "resource-wait",
+        "config_path": write_sweep_config(tmp_path / "resource-wait.yaml"),
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "max_agents": 2,
+        "idempotency_key": "resource-wait",
+    })
+    status = service.runner_command(IntentType.status_query, {"job_id": launched.job_id})
+
+    assert launched.classification == "agent_capacity_pending"
+    assert launched.job.status == JobStatus.running
+    assert launched.job.monitor["agent_reconciler"]["classification"] == "resource_wait"
+    assert launched.job.monitor["agent_reconciler"]["zero_capacity_failures"] == 0
+    assert status.classification == "ok"
+    assert status.result["agent"]["health"] == "waiting_for_capacity"
+
+
+def test_agent_reconciler_wakes_once_after_three_eligible_launch_failures(tmp_path):
+    class FailingLaunchSSH(FakeSSH):
+        def reconcile_agent_capacity(self, **kwargs):
+            self.agent_reconcile_calls.append(dict(kwargs))
+            return {
+                "classification": "capacity_launch_failed",
+                "desired_agents": kwargs["desired_agents"],
+                "live_agents": 0,
+                "assignments": [],
+                "launched": [],
+                "failed": [{"gpu_index": kwargs["eligible_gpu_indices"][0], "classification": "agent_launch_failed"}],
+                "skipped": [],
+                "occupied_gpus": [],
+                "receipt_root": "/home/test/.local/state/experiment-console/agent-receipts",
+            }
+
+    settings = Settings(
+        state_dir=tmp_path,
+        default_entity="my-team",
+        default_project="my-project",
+        authority_role="authoritative",
+    )
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=FailingLaunchSSH())
+    launched = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "persistent-launch-failure",
+        "config_path": write_sweep_config(tmp_path / "persistent-launch-failure.yaml"),
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "max_agents": 1,
+        "idempotency_key": "persistent-launch-failure",
+        "thread_id": "thread-agent-reconcile",
+        "result_contract": {
+            "expected_runs": 5,
+            "output_globs": ["outputs/cora_{run_id}.json"],
+            "discovery_mode": "run_id_output_globs_v1",
+        },
+    })
+
+    assert launched.job.monitor["agent_reconciler"]["consecutive_launch_failures"] == 1
+    service.reconcile_agent_capacity(launched.job_id, force=True)
+    third = service.reconcile_agent_capacity(launched.job_id, force=True)
+    fourth = service.reconcile_agent_capacity(launched.job_id, force=True)
+    events = service.store.claim_wake_events(consumer_id="bridge", limit=10, lease_seconds=60)
+
+    assert third["classification"] == "agent_capacity_attention"
+    assert "eligible_gpu_launch_failures" in third["attention_reasons"]
+    assert fourth["classification"] == "agent_capacity_attention"
+    assert service.store.get_job(launched.job_id).status == JobStatus.attention
+    assert [(event["kind"], event["payload"]["classification"]) for event in events] == [
+        ("attention", "agent_capacity_attention")
+    ]
+
+
+def test_agent_reconciler_wakes_after_fifteen_minutes_without_first_agent(tmp_path):
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = FakeSSH()
+    ssh.gpu_rows = []
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
+    launched = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "zero-capacity-timeout",
+        "config_path": write_sweep_config(tmp_path / "zero-capacity-timeout.yaml"),
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "max_agents": 1,
+        "idempotency_key": "zero-capacity-timeout",
+    })
+    job = service.store.get_job(launched.job_id)
+    state = job.monitor["agent_reconciler"]
+    state["first_zero_capacity_at"] = (datetime.now(timezone.utc) - timedelta(minutes=16)).isoformat(timespec="seconds")
+    state["next_reconcile_at"] = "2000-01-01T00:00:00+00:00"
+    service.store.upsert_job(job)
+
+    result = service.reconcile_agent_capacity(job.job_id, force=True)
+
+    assert result["classification"] == "agent_capacity_attention"
+    assert result["attention_reasons"] == ["zero_capacity_timeout"]
+
+
+def test_monitor_worker_runs_due_agent_reconciliation_without_monitor_schedule(tmp_path):
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = FakeSSH()
+    ssh.gpu_rows = []
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
+    launched = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "worker-capacity",
+        "config_path": write_sweep_config(tmp_path / "worker-capacity.yaml"),
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "max_agents": 2,
+        "idempotency_key": "worker-capacity",
+    })
+    job = service.store.get_job(launched.job_id)
+    job.monitor["agent_reconciler"]["next_reconcile_at"] = "2000-01-01T00:00:00+00:00"
+    service.store.upsert_job(job)
+    ssh.gpu_rows = [
+        {"index": 0, "eligible": True, "memory_free_mb": 12000, "utilization_gpu": 0},
+        {"index": 1, "eligible": True, "memory_free_mb": 12000, "utilization_gpu": 0},
+    ]
+
+    results = MonitorWorker(service).run_once()
+    refreshed = service.store.get_job(launched.job_id)
+
+    assert results[0]["agent_reconcile"]["classification"] == "capacity_satisfied"
+    assert refreshed.monitor["agent_reconciler"]["live_agents"] == 2
+
+
+def test_agent_reconcile_due_scan_uses_indexed_nonterminal_jobs(tmp_path, monkeypatch):
+    service = make_service(tmp_path)
+    launched = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "indexed-controller-scan",
+        "config_path": write_sweep_config(tmp_path / "indexed-controller-scan.yaml"),
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "max_agents": 1,
+        "idempotency_key": "indexed-controller-scan",
+    })
+    job = service.store.get_job(launched.job_id)
+    job.monitor["agent_reconciler"]["next_reconcile_at"] = "2000-01-01T00:00:00+00:00"
+    service.store.upsert_job(job)
+    monkeypatch.setattr(service.store, "list_jobs", lambda: (_ for _ in ()).throw(AssertionError("full history scan")))
+
+    assert service.due_agent_reconcile_job_ids() == [launched.job_id]
+    with service.store._connect() as connection:
+        indexes = {row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'jobs'"
+        )}
+    assert {"idx_jobs_created_at", "idx_jobs_status_created_at"} <= indexes
+
+
+def test_stop_disables_agent_reconciliation_before_killing_agents(tmp_path):
+    service = make_service(tmp_path)
+    launched = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "stop-managed-capacity",
+        "config_path": write_sweep_config(tmp_path / "stop-managed-capacity.yaml"),
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "max_agents": 1,
+        "idempotency_key": "stop-managed-capacity",
+    })
+
+    stopped = service.runner_command(IntentType.stop_job, {
+        "job_id": launched.job_id,
+        "idempotency_key": "stop-managed-capacity-now",
+    })
+    job = service.store.get_job(launched.job_id)
+
+    assert stopped.classification == "job_cancelled"
+    assert job.monitor["agent_reconciler"]["lifecycle"] == "stopped"
+    assert job.monitor["agent_reconciler"]["next_reconcile_at"] is None
+    assert launched.job_id not in service.due_agent_reconcile_job_ids()
+
+
+def test_agent_reconciler_marks_auth_failure_fatal_immediately(tmp_path):
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = FakeSSH()
+    ssh.auth_ok = False
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
+
+    launched = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "auth-fatal",
+        "config_path": write_sweep_config(tmp_path / "auth-fatal.yaml"),
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "max_agents": 1,
+        "idempotency_key": "auth-fatal",
+    })
+
+    assert launched.job.status == JobStatus.attention
+    assert launched.job.monitor["agent_reconciler"]["lifecycle"] == "fatal"
+    assert launched.job.monitor["agent_reconciler"]["classification"] == "wandb_auth_missing"
+    assert launched.job.monitor["agent_reconciler"]["next_reconcile_at"] is None
+    assert ssh.agent_reconcile_calls == []
 
 
 def test_terminal_job_cannot_transition_to_running():

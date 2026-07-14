@@ -413,65 +413,443 @@ except Exception as exc:
         payload.update({"host": host, "sweep_path": sweep_path, "command": result.summary()})
         return payload
 
-    def launch_agent(
+    def reconcile_agent_capacity(
         self,
         *,
         host: str,
+        job_id: str,
         remote_cwd: str,
         sweep_path: str,
-        gpu_index: int,
+        desired_agents: int,
+        eligible_gpu_indices: list[int],
         conda_env: str | None,
         conda_sh: str,
         wandb_api_key: str | None = None,
+        receipt_root: str | None = None,
+        proc_root: str = "/proc",
     ) -> dict[str, Any]:
-        if conda_env:
-            launch_prefix = f"source {shlex.quote(conda_sh)} && conda run -n {shlex.quote(conda_env)} "
-        else:
-            launch_prefix = ""
-        inner = (
-            f"cd {shlex.quote(remote_cwd)} && "
-            f"export CUDA_VISIBLE_DEVICES={shlex.quote(str(gpu_index))} && "
-            f"{launch_prefix}"
-            f"wandb agent {shlex.quote(sweep_path)}"
+        script = r'''
+import fcntl, hashlib, json, os, re, shlex, shutil, subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+
+job_id = __JOB_ID__
+remote_cwd = __REMOTE_CWD__
+sweep_path = __SWEEP_PATH__
+desired_agents = __DESIRED_AGENTS__
+eligible_gpu_indices = __ELIGIBLE_GPU_INDICES__
+conda_env = __CONDA_ENV__
+conda_sh = __CONDA_SH__
+receipt_root_value = __RECEIPT_ROOT__
+proc_root = __PROC_ROOT__
+
+def stamp():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+def safe_component(value):
+    value = str(value or "")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}", value):
+        raise ValueError("unsafe receipt identity")
+    return value
+
+def atomic_json(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    temporary = path.with_name(path.name + ".tmp." + str(os.getpid()))
+    descriptor = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+def read_cmdline(pid):
+    try:
+        raw = open(os.path.join(proc_root, str(pid), "cmdline"), "rb").read()
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+        return []
+    return [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
+
+def read_environ(pid):
+    try:
+        raw = open(os.path.join(proc_root, str(pid), "environ"), "rb").read()
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+        return {}
+    values = {}
+    for part in raw.split(b"\0"):
+        if b"=" not in part:
+            continue
+        key, value = part.split(b"=", 1)
+        values[key.decode("utf-8", "replace")] = value.decode("utf-8", "replace")
+    return values
+
+def read_process_identity(pid):
+    try:
+        text = open(os.path.join(proc_root, str(pid), "stat"), encoding="utf-8").read()
+        tail = text[text.rfind(")") + 2:].split()
+        return {"session_id": int(tail[3]), "start_ticks": int(tail[19])}
+    except Exception:
+        return {"session_id": None, "start_ticks": None}
+
+def wandb_agent_sweep(argv):
+    for index in range(max(0, len(argv) - 2)):
+        if os.path.basename(argv[index]) == "wandb" and argv[index + 1] == "agent":
+            return argv[index + 2]
+    return None
+
+def visible_gpu(pid):
+    raw = str(read_environ(pid).get("CUDA_VISIBLE_DEVICES") or "").strip()
+    if re.fullmatch(r"[0-9]+", raw):
+        return int(raw)
+    return None
+
+def discover_agents():
+    agents = []
+    try:
+        names = os.listdir(proc_root)
+    except OSError:
+        names = []
+    for name in names:
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        argv = read_cmdline(pid)
+        target = wandb_agent_sweep(argv)
+        if not target:
+            continue
+        identity = read_process_identity(pid)
+        agents.append({
+            "pid": str(pid),
+            "sweep_path": target,
+            "gpu_index": visible_gpu(pid),
+            "session_id": identity["session_id"],
+            "start_ticks": identity["start_ticks"],
+        })
+    return agents
+
+def pid_exists(pid):
+    value = str(pid or "")
+    if not value.isdigit():
+        return False
+    if os.path.isdir(os.path.join(proc_root, value)):
+        return True
+    # The production host exposes /proc.  The fallback keeps the same remote
+    # script testable on macOS, where process inspection is not available.
+    try:
+        os.kill(int(value), 0)
+        return True
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+
+def receipt_is_live(receipt, observed_agents=None):
+    if not receipt:
+        return False
+    leader_exists = pid_exists(receipt.get("pid"))
+    expected_sweep = receipt.get("sweep_path")
+    expected_gpu = receipt.get("gpu_index")
+    expected_session = receipt.get("session_id")
+    expected_start = receipt.get("pid_start_ticks")
+    identity = read_process_identity(receipt.get("pid")) if leader_exists else {"session_id": None, "start_ticks": None}
+    leader_identity_matches = leader_exists
+    if leader_exists and expected_start is not None and identity.get("start_ticks") is not None:
+        leader_identity_matches = int(expected_start) == int(identity["start_ticks"])
+    if leader_identity_matches and expected_session is not None and identity.get("session_id") is not None:
+        if int(expected_session) == int(identity["session_id"]):
+            return True
+    for agent in observed_agents if observed_agents is not None else discover_agents():
+        if agent.get("sweep_path") != expected_sweep:
+            continue
+        if expected_gpu is not None and agent.get("gpu_index") != int(expected_gpu):
+            continue
+        if expected_session is not None and agent.get("session_id") is not None:
+            if int(expected_session) != int(agent["session_id"]):
+                continue
+        return True
+    # On hosts without /proc, the leader PID is the only identity available.
+    # Linux takes the stricter session/cmdline path above.
+    return leader_identity_matches and (expected_session is None or identity.get("session_id") is None)
+
+def receipt_matches_agent(receipt, agent):
+    if receipt.get("sweep_path") != agent.get("sweep_path"):
+        return False
+    if receipt.get("gpu_index") is not None and agent.get("gpu_index") != int(receipt["gpu_index"]):
+        return False
+    if str(receipt.get("pid") or "") == str(agent.get("pid") or ""):
+        return True
+    receipt_session = receipt.get("session_id")
+    agent_session = agent.get("session_id")
+    return receipt_session is not None and agent_session is not None and int(receipt_session) == int(agent_session)
+
+safe_job = safe_component(job_id)
+sweep_slug = safe_component(sweep_path.replace("/", "_"))
+root = Path(receipt_root_value).expanduser() if receipt_root_value else Path.home() / ".local" / "state" / "experiment-console" / "agent-receipts"
+root.mkdir(parents=True, exist_ok=True)
+os.chmod(root, 0o700)
+job_dir = root / safe_job / sweep_slug
+job_dir.mkdir(parents=True, exist_ok=True)
+os.chmod(job_dir, 0o700)
+log_dir = root.parent / "agent-logs" / safe_job / sweep_slug
+log_dir.mkdir(parents=True, exist_ok=True)
+os.chmod(log_dir, 0o700)
+
+def receipt_paths(gpu_index):
+    def generation(path):
+        match = re.search(r"_generation_([0-9]+)\.json$", path.name)
+        return int(match.group(1)) if match else 0
+    return sorted(job_dir.glob("gpu_%d_generation_*.json" % gpu_index), key=generation)
+
+def next_generation(gpu_index):
+    generations = []
+    for path in receipt_paths(gpu_index):
+        match = re.search(r"_generation_([0-9]+)\.json$", path.name)
+        if match:
+            generations.append(int(match.group(1)))
+    return max(generations, default=0) + 1
+
+def write_receipt(gpu_index, generation, payload):
+    path = job_dir / ("gpu_%d_generation_%d.json" % (gpu_index, generation))
+    atomic_json(path, payload)
+    return str(path)
+
+def current_assignments(agents):
+    matching = [item for item in agents if item.get("sweep_path") == sweep_path and item.get("gpu_index") is not None]
+    assignments = []
+    seen_process_groups = set()
+    for agent in sorted(matching, key=lambda item: (int(item["gpu_index"]), int(item["pid"]))):
+        gpu_index = int(agent["gpu_index"])
+        process_group = (gpu_index, agent.get("session_id") or agent.get("pid"))
+        if process_group in seen_process_groups:
+            continue
+        seen_process_groups.add(process_group)
+        paths = receipt_paths(gpu_index)
+        matching_path = next(
+            (path for path in reversed(paths) if receipt_matches_agent(read_json(path), agent)),
+            None,
         )
-        log_name = f"console_wandb_agent_{sweep_path.replace('/', '_')}_gpu{gpu_index}.log"
-        log_path = f"{remote_cwd.rstrip('/')}/{log_name}"
-        script = """
-import json, os, subprocess
-cwd = __CWD__
-inner = __INNER__
-log_path = __LOG_PATH__
-os.makedirs(os.path.dirname(log_path), exist_ok=True)
-with open(log_path, "ab", buffering=0) as log:
-    proc = subprocess.Popen(
-        ["bash", "-lc", inner],
-        cwd=cwd,
-        stdin=subprocess.DEVNULL,
-        stdout=log,
-        stderr=subprocess.STDOUT,
-        env=os.environ.copy(),
-        start_new_session=True,
-    )
-print(json.dumps({"ok": True, "pid": proc.pid, "log": log_path}))
-"""
+        receipt = read_json(matching_path) if matching_path else {}
+        if not receipt_matches_agent(receipt, agent):
+            generation = next_generation(gpu_index)
+            receipt = {
+                "version": 1,
+                "job_id": job_id,
+                "sweep_path": sweep_path,
+                "gpu_index": gpu_index,
+                "generation": generation,
+                "pid": str(agent["pid"]),
+                "session_id": agent.get("session_id"),
+                "pid_start_ticks": agent.get("start_ticks"),
+                "log": None,
+                "conda_env": conda_env,
+                "command": ["wandb", "agent", sweep_path],
+                "classification": "discovered_existing_agent",
+                "started_at": stamp(),
+                "updated_at": stamp(),
+            }
+            receipt["receipt_path"] = write_receipt(gpu_index, generation, receipt)
+        else:
+            receipt = dict(receipt)
+            receipt["receipt_path"] = str(matching_path)
+            receipt["agent_pid"] = str(agent["pid"])
+            receipt["classification"] = "live_receipt"
+        assignments.append(receipt)
+    receipt_gpu_indices = set()
+    for path in job_dir.glob("gpu_*_generation_*.json"):
+        match = re.match(r"gpu_([0-9]+)_generation_", path.name)
+        if match:
+            receipt_gpu_indices.add(int(match.group(1)))
+    for gpu_index in sorted(receipt_gpu_indices):
+        if any(int(item.get("gpu_index", -1)) == int(gpu_index) for item in assignments):
+            continue
+        paths = receipt_paths(int(gpu_index))
+        live_path = next(
+            (path for path in reversed(paths) if receipt_is_live(read_json(path), agents)),
+            None,
+        )
+        receipt = read_json(live_path) if live_path else {}
+        if receipt and receipt_is_live(receipt, agents):
+            receipt = dict(receipt)
+            receipt["receipt_path"] = str(live_path)
+            receipt["classification"] = "agent_starting"
+            assignments.append(receipt)
+    return assignments
+
+def live_receipts_for_gpu(gpu_index, agents=None):
+    live = []
+    pattern = "*/*/gpu_%d_generation_*.json" % gpu_index
+    for path in root.glob(pattern):
+        receipt = read_json(path)
+        if receipt and receipt_is_live(receipt, agents):
+            live.append({
+                "job_id": receipt.get("job_id"),
+                "sweep_path": receipt.get("sweep_path"),
+                "gpu_index": receipt.get("gpu_index"),
+                "pid": receipt.get("pid"),
+                "receipt_path": str(path),
+            })
+    return live
+
+launched = []
+failed = []
+skipped = []
+agents = discover_agents()
+assignments = current_assignments(agents)
+
+for gpu_index in sorted({int(item) for item in eligible_gpu_indices if int(item) >= 0}):
+    if len(assignments) >= desired_agents:
+        break
+    if any(int(item.get("gpu_index", -1)) == gpu_index for item in assignments):
+        continue
+    lock_path = root / ("gpu_%d.lock" % gpu_index)
+    lock_descriptor = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(lock_descriptor, "r+") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        agents = discover_agents()
+        occupied = [item for item in agents if item.get("gpu_index") == gpu_index]
+        occupied_receipts = live_receipts_for_gpu(gpu_index, agents)
+        same_sweep = [item for item in occupied if item.get("sweep_path") == sweep_path]
+        if same_sweep:
+            assignments = current_assignments(agents)
+            continue
+        same_sweep_receipts = [item for item in occupied_receipts if item.get("sweep_path") == sweep_path]
+        if same_sweep_receipts:
+            assignments = current_assignments(agents)
+            for receipt in same_sweep_receipts:
+                if not any(int(item.get("gpu_index", -1)) == gpu_index for item in assignments):
+                    assignments.append(read_json(Path(str(receipt["receipt_path"]))))
+            continue
+        if occupied or occupied_receipts:
+            skipped.append({
+                "gpu_index": gpu_index,
+                "classification": "gpu_owned_by_other_agent",
+                "sweep_paths": sorted({str(item.get("sweep_path")) for item in [*occupied, *occupied_receipts]}),
+            })
+            continue
+        generation = next_generation(gpu_index)
+        log_path = log_dir / ("gpu_%d_generation_%d.log" % (gpu_index, generation))
+        wandb_executable = shutil.which("wandb") or "wandb"
+        if conda_env:
+            inner = "cd %s && source %s && conda run -n %s wandb agent %s" % (
+                shlex.quote(remote_cwd), shlex.quote(conda_sh), shlex.quote(conda_env), shlex.quote(sweep_path),
+            )
+        else:
+            inner = "cd %s && %s agent %s" % (shlex.quote(remote_cwd), shlex.quote(wandb_executable), shlex.quote(sweep_path))
+        environment = os.environ.copy()
+        environment["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+        try:
+            with open(log_path, "ab", buffering=0) as log:
+                process = subprocess.Popen(
+                    ["bash", "-lc", inner],
+                    cwd=remote_cwd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    env=environment,
+                    start_new_session=True,
+                )
+            identity = read_process_identity(process.pid)
+            receipt = {
+                "version": 1,
+                "job_id": job_id,
+                "sweep_path": sweep_path,
+                "gpu_index": gpu_index,
+                "generation": generation,
+                "pid": str(process.pid),
+                "session_id": process.pid,
+                "pid_start_ticks": identity.get("start_ticks"),
+                "log": str(log_path),
+                "conda_env": conda_env,
+                "command": ["wandb", "agent", sweep_path],
+                "command_sha256": hashlib.sha256(("wandb agent " + sweep_path).encode("utf-8")).hexdigest(),
+                "classification": "agent_started",
+                "started_at": stamp(),
+                "updated_at": stamp(),
+            }
+            try:
+                receipt["receipt_path"] = write_receipt(gpu_index, generation, receipt)
+            except Exception:
+                try:
+                    os.killpg(process.pid, 15)
+                except Exception:
+                    pass
+                raise
+            launched.append(receipt)
+            assignments.append(receipt)
+        except Exception as exc:
+            failed.append({"gpu_index": gpu_index, "classification": "agent_launch_failed", "error": type(exc).__name__ + ": " + str(exc)})
+
+agents = discover_agents()
+assignments = current_assignments(agents)
+for receipt in launched:
+    if not any(int(item.get("gpu_index", -1)) == int(receipt["gpu_index"]) for item in assignments) and receipt_is_live(receipt, agents):
+        assignments.append(receipt)
+assignments = sorted(assignments, key=lambda item: (int(item.get("gpu_index", -1)), int(item.get("generation", 0))))
+occupied_gpus = sorted({
+    int(gpu_index)
+    for gpu_index in eligible_gpu_indices
+    if any(item.get("gpu_index") is not None and int(item["gpu_index"]) == int(gpu_index) for item in agents)
+    or live_receipts_for_gpu(int(gpu_index), agents)
+})
+if failed:
+    classification = "capacity_launch_failed"
+elif len(assignments) >= desired_agents:
+    classification = "capacity_satisfied"
+elif desired_agents <= 0:
+    classification = "terminal_observed"
+elif not eligible_gpu_indices:
+    classification = "resource_wait"
+else:
+    classification = "capacity_degraded"
+print(json.dumps({
+    "classification": classification,
+    "job_id": job_id,
+    "sweep_path": sweep_path,
+    "desired_agents": desired_agents,
+    "live_agents": len(assignments),
+    "assignments": assignments,
+    "launched": launched,
+    "failed": failed,
+    "skipped": skipped,
+    "occupied_gpus": occupied_gpus,
+    "receipt_root": str(root),
+    "observed_at": stamp(),
+}))
+'''
         script = (
-            script.replace("__CWD__", repr(remote_cwd))
-            .replace("__INNER__", repr(inner))
-            .replace("__LOG_PATH__", repr(log_path))
+            script.replace("__JOB_ID__", repr(job_id))
+            .replace("__REMOTE_CWD__", repr(remote_cwd))
+            .replace("__SWEEP_PATH__", repr(sweep_path))
+            .replace("__DESIRED_AGENTS__", repr(max(0, int(desired_agents))))
+            .replace("__ELIGIBLE_GPU_INDICES__", repr([int(item) for item in eligible_gpu_indices]))
+            .replace("__CONDA_ENV__", repr(conda_env))
+            .replace("__CONDA_SH__", repr(conda_sh))
+            .replace("__RECEIPT_ROOT__", repr(receipt_root))
+            .replace("__PROC_ROOT__", repr(proc_root))
         )
         remote = f"cd {shlex.quote(remote_cwd)} && python3 -c {shlex.quote(script)}"
-        result = self.run_with_wandb_key(host, remote, wandb_api_key=wandb_api_key, timeout=self.settings.command_timeout_seconds)
+        result = self.run_with_wandb_key(
+            host,
+            remote,
+            wandb_api_key=wandb_api_key,
+            timeout=self.settings.command_timeout_seconds,
+        )
         payload = json.loads(result.stdout.strip().splitlines()[-1])
-        pid = str(payload.get("pid") or "").strip()
-        return {
-            "host": host,
-            "gpu_index": gpu_index,
-            "pid": pid,
-            "log": log_path,
-            "conda_env": conda_env,
-            "command": result.summary(),
-            "launcher": payload,
-        }
+        payload.update({"host": host, "command": result.summary()})
+        return payload
 
     def launch_run(
         self,

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
 import time
 
@@ -39,6 +41,23 @@ class TransientThenSuccessRunner:
         return CommandResult(argv=argv, returncode=0, stdout=self.success_stdout, stderr="")
 
 
+class LostAckOnceLocalRunner:
+    def __init__(self):
+        self.calls = []
+        self.lost_ack = True
+
+    def run(self, argv, *, timeout, input_text=None):
+        self.calls.append({"argv": argv, "timeout": timeout, "input_text": input_text})
+        completed = subprocess.run(argv[-1], shell=True, text=True, capture_output=True, timeout=timeout, input=input_text)
+        result = CommandResult(argv=argv, returncode=completed.returncode, stdout=completed.stdout, stderr=completed.stderr)
+        if completed.returncode != 0:
+            raise CommandFailed(result)
+        if self.lost_ack:
+            self.lost_ack = False
+            raise CommandFailed(CommandResult(argv=argv, returncode=255, stdout=completed.stdout, stderr="Connection reset by peer"))
+        return result
+
+
 def write_fake_cmdline(proc_root, pid: int, argv: list[str]) -> None:
     process_dir = proc_root / str(pid)
     process_dir.mkdir(parents=True)
@@ -74,7 +93,7 @@ def test_read_only_probe_retries_one_transient_disconnect(tmp_path):
     assert result["eligible_count"] == 1
 
 
-@pytest.mark.parametrize("operation", ["create_sweep", "launch_agent"])
+@pytest.mark.parametrize("operation", ["create_sweep", "reconcile_agent_capacity"])
 def test_mutating_ssh_operations_do_not_retry_after_transient_disconnect(tmp_path, operation):
     runner = TransientThenSuccessRunner('{"ok":true,"pid":12345}\n')
     ssh = SSHExecutor(Settings(state_dir=tmp_path), runner=runner)
@@ -90,11 +109,13 @@ def test_mutating_ssh_operations_do_not_retry_after_transient_disconnect(tmp_pat
                 wandb_api_key="secret",
             )
         else:
-            ssh.launch_agent(
+            ssh.reconcile_agent_capacity(
                 host="HCCS-25",
+                job_id="job-managed",
                 remote_cwd="/home/linziyao/DualRefGAD",
                 sweep_path="HCCS/DualRefGAD/abc123",
-                gpu_index=0,
+                desired_agents=1,
+                eligible_gpu_indices=[0],
                 conda_env="DualRefGAD",
                 conda_sh="/opt/anaconda3/etc/profile.d/conda.sh",
                 wandb_api_key="secret",
@@ -103,15 +124,17 @@ def test_mutating_ssh_operations_do_not_retry_after_transient_disconnect(tmp_pat
     assert len(runner.calls) == 1
 
 
-def test_launch_agent_uses_conda_run_for_agent_process(tmp_path):
+def test_agent_reconciler_uses_durable_receipts_and_conda_run(tmp_path):
     runner = RecordingRunner()
     ssh = SSHExecutor(Settings(state_dir=tmp_path), runner=runner)
 
-    result = ssh.launch_agent(
+    result = ssh.reconcile_agent_capacity(
         host="HCCS-25",
+        job_id="job-managed",
         remote_cwd="/home/linziyao/DualRefGAD",
         sweep_path="HCCS/DualRefGAD/abc123",
-        gpu_index=3,
+        desired_agents=1,
+        eligible_gpu_indices=[3],
         conda_env="DualRefGAD",
         conda_sh="/opt/anaconda3/etc/profile.d/conda.sh",
         wandb_api_key="secret",
@@ -119,13 +142,70 @@ def test_launch_agent_uses_conda_run_for_agent_process(tmp_path):
 
     remote = runner.calls[0]["argv"][-1]
     assert runner.calls[0]["argv"][:3] == ["ssh", "--", "HCCS-25"]
-    assert result["pid"] == "12345"
+    assert result["pid"] == 12345
     assert runner.calls[0]["input_text"] == "secret\n"
-    assert "CUDA_VISIBLE_DEVICES=3" in remote
-    assert "source /opt/anaconda3/etc/profile.d/conda.sh" in remote
-    assert "conda run -n DualRefGAD" in remote
+    assert "CUDA_VISIBLE_DEVICES" in remote
+    assert "agent-receipts" in remote
+    assert "generation" in remote
+    assert "fcntl.flock" in remote
+    assert "os.replace" in remote
+    assert "/opt/anaconda3/etc/profile.d/conda.sh" in remote
+    assert "DualRefGAD" in remote
     assert "HCCS/DualRefGAD/abc123" in remote
     assert "python3 -c" in remote
+
+
+def test_agent_reconciler_recovers_lost_ssh_ack_from_remote_receipt_without_duplicate(tmp_path, monkeypatch):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    wandb = bin_dir / "wandb"
+    wandb.write_text("#!/usr/bin/env python3\nimport time\ntime.sleep(30)\n", encoding="utf-8")
+    wandb.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+    receipt_root = tmp_path / "remote-state" / "agent-receipts"
+    runner = LostAckOnceLocalRunner()
+    ssh = SSHExecutor(Settings(state_dir=tmp_path, command_timeout_seconds=10), runner=runner)
+
+    with pytest.raises(CommandFailed, match="command failed"):
+        ssh.reconcile_agent_capacity(
+            host="local",
+            job_id="job-managed",
+            remote_cwd=str(tmp_path),
+            sweep_path="HCCS/DualRefGAD/receipt-test",
+            desired_agents=1,
+            eligible_gpu_indices=[3],
+            conda_env=None,
+            conda_sh="/unused/conda.sh",
+            wandb_api_key="secret-not-for-receipt",
+            receipt_root=str(receipt_root),
+        )
+
+    recovered = ssh.reconcile_agent_capacity(
+        host="local",
+        job_id="job-managed",
+        remote_cwd=str(tmp_path),
+        sweep_path="HCCS/DualRefGAD/receipt-test",
+        desired_agents=1,
+        eligible_gpu_indices=[3],
+        conda_env=None,
+        conda_sh="/unused/conda.sh",
+        wandb_api_key="secret-not-for-receipt",
+        receipt_root=str(receipt_root),
+    )
+    receipts = list(receipt_root.rglob("*.json"))
+    receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+    try:
+        assert recovered["live_agents"] == 1
+        assert recovered["launched"] == []
+        assert len(receipts) == 1
+        assert "secret-not-for-receipt" not in receipts[0].read_text(encoding="utf-8")
+        assert receipt["gpu_index"] == 3
+        assert receipt["generation"] == 1
+    finally:
+        try:
+            os.killpg(int(receipt["session_id"]), signal.SIGTERM)
+        except ProcessLookupError:
+            pass
 
 
 def test_stop_agents_uses_exact_proc_cmdline_matching(tmp_path):
