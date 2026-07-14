@@ -3511,22 +3511,39 @@ class ConsoleService:
                     "payload": {"status_before": ledger_status_before, "derived_status": desired_status.value},
                 },
             ]
+            monitor_patch = {
+                "last_wandb_status": cached_status,
+                "sweep_attention_reasons": sweep_attention_reasons,
+                "sync_consistency": sync_state,
+                "execution_gates": gates,
+                "reconcile": {
+                    "reconcile_id": reconcile_id,
+                    "observed_at": observed_at,
+                    "lifecycle": execution_state.get("lifecycle"),
+                    "ledger_status_before": ledger_status_before,
+                    "ledger_status_after": desired_status.value,
+                },
+            }
+            if execution_state.get("queue_releasable") and agent_reconciler:
+                terminal_controller = dict(agent_reconciler)
+                terminal_controller.update({
+                    "lifecycle": "terminal",
+                    "classification": "terminal",
+                    "remaining_runs": 0,
+                    "desired_agents": 0,
+                    "next_reconcile_at": None,
+                    "sweep_state": sweep.get("state"),
+                    "terminal_observed_at": observed_at,
+                    "updated_at": observed_at,
+                })
+                if agent_health == "terminal":
+                    terminal_controller.update({"live_agents": 0, "assignments": []})
+                monitor_patch["agent_reconciler"] = terminal_controller
+                agent_reconciler = terminal_controller
             job = self.store.reconcile_job(
                 job,
                 desired_status,
-                {
-                    "last_wandb_status": cached_status,
-                    "sweep_attention_reasons": sweep_attention_reasons,
-                    "sync_consistency": sync_state,
-                    "execution_gates": gates,
-                    "reconcile": {
-                        "reconcile_id": reconcile_id,
-                        "observed_at": observed_at,
-                        "lifecycle": execution_state.get("lifecycle"),
-                        "ledger_status_before": ledger_status_before,
-                        "ledger_status_after": desired_status.value,
-                    },
-                },
+                monitor_patch,
                 source_observations,
             )
         classification = "ok"

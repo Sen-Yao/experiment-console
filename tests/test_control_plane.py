@@ -1896,6 +1896,61 @@ def test_agent_reconcile_due_scan_uses_indexed_nonterminal_jobs(tmp_path, monkey
     assert {"idx_jobs_created_at", "idx_jobs_status_created_at"} <= indexes
 
 
+def test_status_terminalizes_controller_before_job_leaves_due_scan(tmp_path):
+    class TerminalWandB(FakeWandB):
+        def __init__(self):
+            super().__init__()
+            self.finished = False
+
+        def get_sweep_state(self, entity, project, sweep_id):
+            if not self.finished:
+                return super().get_sweep_state(entity, project, sweep_id)
+            return {
+                "id": sweep_id,
+                "entity": entity,
+                "project": project,
+                "state": "FINISHED",
+                "runCount": 1,
+                "expectedRunCount": 1,
+                "raw_run_state_counts": {"finished": 1, "running": 0, "failed": 0},
+                "runs": [{"name": "run-1", "state": "finished"}],
+            }
+
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = FakeSSH()
+    wandb = TerminalWandB()
+    service = ConsoleService(
+        settings=settings,
+        store=ConsoleStore(settings.sqlite_path, settings.audit_path),
+        wandb=wandb,
+        ssh=ssh,
+    )
+    launched = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "terminal-controller",
+        "config_path": write_sweep_config(tmp_path / "terminal-controller.yaml"),
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "max_agents": 1,
+        "idempotency_key": "terminal-controller",
+    })
+    ssh.agent_probe = {"tracked_pids": [], "alive_pids": [], "pgrep": []}
+    wandb.finished = True
+
+    service.runner_command(IntentType.status_query, {"job_id": launched.job_id})
+    job = service.store.get_job(launched.job_id)
+    controller = job.monitor["agent_reconciler"]
+
+    assert job.status == JobStatus.finished
+    assert controller["lifecycle"] == "terminal"
+    assert controller["classification"] == "terminal"
+    assert controller["remaining_runs"] == 0
+    assert controller["desired_agents"] == 0
+    assert controller["live_agents"] == 0
+    assert controller["assignments"] == []
+    assert controller["next_reconcile_at"] is None
+    assert launched.job_id not in service.due_agent_reconcile_job_ids()
+
+
 def test_stop_disables_agent_reconciliation_before_killing_agents(tmp_path):
     service = make_service(tmp_path)
     launched = service.runner_command(IntentType.launch_sweep, {
