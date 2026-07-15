@@ -65,7 +65,7 @@ for destination in /run/secrets/wandb_api_key /run/secrets/console_api_token /ru
   [[ "$rw" == "false" ]] || fail "credential/config mount is not read-only: $destination"
 done
 
-docker exec "$cid" python - "$INSTANCE_ID" "$REQUIRE_EMPTY_LEDGER" "$EXPECTED_PREVIOUS_LEDGER" "$EXPECTED_NEW_LEDGER" <<'PY'
+docker exec -i "$cid" python - "$INSTANCE_ID" "$REQUIRE_EMPTY_LEDGER" "$EXPECTED_PREVIOUS_LEDGER" "$EXPECTED_NEW_LEDGER" <<'PY'
 import json
 import os
 import sqlite3

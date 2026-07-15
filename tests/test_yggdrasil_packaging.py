@@ -93,17 +93,21 @@ def test_production_activation_supports_fresh_v2_cutover_and_verifier_probes_rea
     assert "first authoritative deployment requires an explicit migration seed or --fresh-v2-ledger" in activation
     assert "migration seed refused because the authoritative ledger already exists" in activation
     assert "fresh v2 cutover refused while" in activation
+    assert activation.count("docker exec -i") == 2
     assert "dependency_episodes" in activation
     assert "dependency_impacts" in activation
     assert "verified_empty=1" in activation
     assert 'NEW_RELEASE="$RELEASE"' in activation
     assert 'RELEASE="$NEW_RELEASE"' in activation
     verifier = (ROOT / "deploy" / "yggdrasil" / "verify-release.sh").read_text(encoding="utf-8")
+    rollback = (ROOT / "deploy" / "yggdrasil" / "rollback-release.sh").read_text(encoding="utf-8")
     assert "WandBClient(settings).discover_sweeps" in verifier
     assert "SSHExecutor(settings).auth_check" in verifier
     assert 'health.get("contract") == "runner_console_agent_v2"' in verifier
     assert 'str(health.get("ledger_schema_version")) == "2"' in verifier
     assert "require_empty_ledger" in verifier
+    assert "docker exec -i" in verifier
+    assert "docker exec -i" in rollback
     assert '"hccs_wandb_auth_probe": "ok"' in verifier
 
 

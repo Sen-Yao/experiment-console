@@ -146,7 +146,7 @@ if [[ -n "$OLD_RELEASE" && -r "$OLD_RELEASE/compose.yggdrasil.yaml" ]]; then
     old_cid="$(container_id)"
     [[ -n "$old_cid" ]] || fail "fresh v2 cutover requires the current Console container"
     [[ "$(docker inspect -f '{{.State.Running}}' "$old_cid")" == "true" ]] || fail "fresh v2 cutover requires the current Console to be running"
-    source_metadata="$(docker exec "$old_cid" python - <<'PY'
+    source_metadata="$(docker exec -i "$old_cid" python - <<'PY'
 import sqlite3
 
 database = "/var/lib/experiment-console/state/console.sqlite3"
@@ -225,7 +225,7 @@ if [[ -z "$cid" ]] || [[ "$(docker inspect -f '{{if .State.Health}}{{.State.Heal
   false
 fi
 if [[ "$FRESH_V2_LEDGER" == "1" ]]; then
-  NEW_LEDGER_ID="$(docker exec "$cid" python - "$OLD_LEDGER_ID" <<'PY'
+  NEW_LEDGER_ID="$(docker exec -i "$cid" python - "$OLD_LEDGER_ID" <<'PY'
 import json
 import sqlite3
 import sys

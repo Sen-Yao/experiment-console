@@ -108,7 +108,7 @@ if [[ -n "$CURRENT_RELEASE" && -r "$CURRENT_RELEASE/compose.yggdrasil.yaml" ]]; 
   cutover_commit=""
   current_cid="$(container_id)"
   if [[ -n "$current_cid" ]] && [[ "$(docker inspect -f '{{.State.Running}}' "$current_cid")" == "true" ]]; then
-    cutover_commit="$(docker exec "$current_cid" python - <<'PY'
+    cutover_commit="$(docker exec -i "$current_cid" python - <<'PY'
 import sqlite3
 
 with sqlite3.connect("/var/lib/experiment-console/state/console.sqlite3") as connection:
