@@ -13,18 +13,22 @@ from typing import Any
 from .agent_reconcile import (
     AGENT_FAILURE_ATTENTION_THRESHOLD,
     AGENT_STEADY_RECONCILE_SECONDS,
-    AGENT_ZERO_CAPACITY_ATTENTION_SECONDS,
     age_seconds,
     agent_reconcile_due,
     desired_agent_count,
     initial_agent_reconciler,
     is_managed_agent_job,
     next_reconcile_at,
-    retry_delay_seconds,
     sweep_capacity,
 )
 from .command import CommandFailed
 from .config import Settings
+from .dependency_health import (
+    advance_dependency_episode,
+    dependency_key,
+    dependency_retry_due,
+    resolved_failure_summary,
+)
 from .models import (
     AuditEvent,
     AdvanceQueuePayload,
@@ -71,7 +75,7 @@ from .sweep_telemetry import (
     strip_runs,
 )
 from .validation import build_single_run_command, load_yaml_text, validate_experiment_config_text, validate_experiment_config
-from .wandb_client import WandBClient, WandBUnavailable
+from .wandb_client import WandBAuthRequired, WandBClient, WandBUnavailable
 
 
 def utc_now() -> str:
@@ -1499,32 +1503,127 @@ class ConsoleService:
         state["last_attempt_at"] = now
         state["updated_at"] = now
         sweep_path = f"{job.entity}/{job.project}/{job.sweep_id}"
-        auth = job.monitor.get("auth") if isinstance(job.monitor.get("auth"), dict) else {}
-        if auth.get("classification") == "auth_check_pending":
-            try:
-                auth = self.ssh.auth_check(
-                    host=job.remote_host,
-                    remote_cwd=job.remote_cwd,
-                    sweep_path=sweep_path,
-                    wandb_api_key=self._wandb_api_key(),
-                    conda_env=job.conda_env or self.settings.default_conda_env,
-                    conda_sh=self.settings.default_conda_sh,
-                )
-                job.monitor["auth"] = auth
-            except Exception as exc:
-                return self._agent_reconcile_exception(job, state, exc, requested_by=requested_by)
-        if not auth.get("ok"):
-            return self._fatal_agent_reconcile(
-                job,
-                classification=str(auth.get("classification") or "wandb_auth_missing"),
-                reason="managed sweep does not have a validated W&B identity",
-                requested_by=requested_by,
-                state=state,
-            )
+
+        dependency_failures: list[dict[str, Any]] = []
+        remote_probe = None
         try:
-            sweep = self.wandb.get_sweep_state(job.entity, job.project, job.sweep_id)
+            remote_probe = self.ssh.check_agent_processes(
+                host=job.remote_host,
+                sweep_path=sweep_path,
+                pids=job.agent_pids,
+            )
+            state["last_agent_observation"] = compact_agent_probe(remote_probe)
+            observed_live = observed_agent_count(remote_probe)
+            state["live_agents"] = observed_live
+            if observed_live > 0:
+                state["first_agent_at"] = state.get("first_agent_at") or now
+            resolved = self._resolve_dependency_success(
+                source="ssh",
+                scope=job.remote_host,
+                operation_stage="observe_agent_processes",
+                current_job_id=job.job_id,
+            )
+            apply_dependency_resolution(state, resolved)
         except Exception as exc:
-            return self._agent_reconcile_exception(job, state, exc, requested_by=requested_by)
+            dependency_failures.append(self._dependency_failure_spec(
+                exc,
+                source="ssh",
+                scope=job.remote_host,
+                operation_stage="observe_agent_processes",
+            ))
+
+        wandb_scope = self._wandb_dependency_scope()
+        auth = job.monitor.get("auth") if isinstance(job.monitor.get("auth"), dict) else {}
+        auth_classification = str(auth.get("classification") or "auth_check_pending")
+        if not auth.get("ok"):
+            if auth_classification in {"wandb_auth_missing", "auth_required"} and not force:
+                auth_error = WandBAuthRequired(str(auth.get("error") or "remote W&B credentials are unavailable"))
+                dependency_failures.append(self._dependency_failure_spec(
+                    auth_error,
+                    source="wandb",
+                    scope=f"{wandb_scope}|remote:{job.remote_host}",
+                    operation_stage="remote_auth_check",
+                ))
+            else:
+                try:
+                    auth = self.ssh.auth_check(
+                        host=job.remote_host,
+                        remote_cwd=job.remote_cwd,
+                        sweep_path=sweep_path,
+                        wandb_api_key=self._wandb_api_key(),
+                        conda_env=job.conda_env or self.settings.default_conda_env,
+                        conda_sh=self.settings.default_conda_sh,
+                    )
+                    job.monitor["auth"] = auth
+                    if not auth.get("ok"):
+                        if auth.get("classification") in {"wandb_auth_missing", "auth_required"}:
+                            raise WandBAuthRequired(str(auth.get("error") or "remote W&B authentication failed"))
+                        raise WandBUnavailable(str(auth.get("error") or "remote W&B API is unavailable"))
+                    resolved = self._resolve_dependency_success(
+                        source="wandb",
+                        scope=f"{wandb_scope}|remote:{job.remote_host}",
+                        operation_stage="remote_auth_check",
+                        current_job_id=job.job_id,
+                    )
+                    apply_dependency_resolution(state, resolved)
+                except Exception as exc:
+                    dependency_failures.append(self._dependency_failure_spec(
+                        exc,
+                        source="wandb" if isinstance(exc, WandBUnavailable) else "ssh",
+                        scope=f"{wandb_scope}|remote:{job.remote_host}" if isinstance(exc, WandBUnavailable) else job.remote_host,
+                        operation_stage="remote_auth_check",
+                    ))
+        wandb_key = dependency_key(source="wandb", scope=wandb_scope, operation_stage="get_sweep_state")
+        active_wandb_episode = self.store.get_dependency_episode(wandb_key)
+        sweep = None
+        if active_wandb_episode and not force and not dependency_retry_due(active_wandb_episode, now=now):
+            schedule = self.store.get_monitor_schedule(job.job_id) or {}
+            active_wandb_episode = self.store.upsert_dependency_episode(
+                active_wandb_episode,
+                job_id=job.job_id,
+                thread_id=str(schedule.get("thread_id") or "").strip() or None,
+            )
+            dependency_failures.append({"episode": active_wandb_episode})
+        else:
+            try:
+                sweep = self.wandb.get_sweep_state(job.entity, job.project, job.sweep_id)
+                resolved = self._resolve_dependency_success(
+                    source="wandb",
+                    scope=wandb_scope,
+                    operation_stage="get_sweep_state",
+                    current_job_id=job.job_id,
+                )
+                apply_dependency_resolution(state, resolved)
+            except Exception as exc:
+                dependency_failures.append(self._dependency_failure_spec(
+                    exc,
+                    source="wandb",
+                    scope=wandb_scope,
+                    operation_stage="get_sweep_state",
+                ))
+
+        if dependency_failures:
+            episodes = []
+            for failure in dependency_failures:
+                episode = failure.get("episode")
+                if not isinstance(episode, dict):
+                    episode = self._record_dependency_failure(
+                        job,
+                        state,
+                        exc=failure["exc"],
+                        source=failure["source"],
+                        scope=failure["scope"],
+                        operation_stage=failure["operation_stage"],
+                        classification=failure["classification"],
+                        retry_active=failure["retry_active"],
+                        action_required_immediately=failure["action_required_immediately"],
+                        requested_by=requested_by,
+                        now=now,
+                    )
+                episodes.append(episode)
+            return self._persist_dependency_wait(job, state, episodes, requested_by=requested_by, now=now)
+
+        assert sweep is not None
         observed_sweep_id = str(sweep.get("id") or job.sweep_id)
         if observed_sweep_id != job.sweep_id:
             return self._fatal_agent_reconcile(
@@ -1559,79 +1658,128 @@ class ConsoleService:
             return self._agent_reconcile_result(job, state, classification="terminal")
         try:
             gpu_probe = self.ssh.probe_gpus(job.remote_host)
-            eligible = [
+            hardware_eligible = [
                 int(gpu["index"])
                 for gpu in (gpu_probe.get("gpus") or [])
                 if isinstance(gpu, dict) and gpu.get("eligible") and str(gpu.get("index", "")).isdigit()
             ]
+            resolved = self._resolve_dependency_success(
+                source="ssh",
+                scope=job.remote_host,
+                operation_stage="probe_gpus",
+                current_job_id=job.job_id,
+            )
+            apply_dependency_resolution(state, resolved)
+        except Exception as exc:
+            failure = self._dependency_failure_spec(
+                exc,
+                source="ssh",
+                scope=job.remote_host,
+                operation_stage="probe_gpus",
+            )
+            episode = self._record_dependency_failure(
+                job,
+                state,
+                requested_by=requested_by,
+                now=now,
+                **failure,
+            )
+            return self._persist_dependency_wait(job, state, [episode], requested_by=requested_by, now=now)
+        try:
             remote = self.ssh.reconcile_agent_capacity(
                 host=job.remote_host,
                 job_id=job.job_id,
                 remote_cwd=job.remote_cwd,
                 sweep_path=sweep_path,
                 desired_agents=desired_agents,
-                eligible_gpu_indices=eligible,
+                eligible_gpu_indices=hardware_eligible,
                 conda_env=job.conda_env or self.settings.default_conda_env,
                 conda_sh=self.settings.default_conda_sh,
                 wandb_api_key=self._wandb_api_key(),
             )
+            resolved = self._resolve_dependency_success(
+                source="ssh",
+                scope=job.remote_host,
+                operation_stage="remote_agent_reconcile",
+                current_job_id=job.job_id,
+            )
+            apply_dependency_resolution(state, resolved)
         except Exception as exc:
-            return self._agent_reconcile_exception(job, state, exc, requested_by=requested_by)
+            failure = self._dependency_failure_spec(
+                exc,
+                source="ssh",
+                scope=job.remote_host,
+                operation_stage="remote_agent_reconcile",
+            )
+            episode = self._record_dependency_failure(
+                job,
+                state,
+                requested_by=requested_by,
+                now=now,
+                **failure,
+            )
+            return self._persist_dependency_wait(job, state, [episode], requested_by=requested_by, now=now)
         assignments = compact_agent_assignments(remote.get("assignments"))
         live_agents = len({int(item["gpu_index"]) for item in assignments if item.get("gpu_index") is not None})
         launch_failures = [item for item in (remote.get("failed") or []) if isinstance(item, dict)]
-        has_launch_failure = bool(launch_failures)
-        if has_launch_failure:
-            state["consecutive_failures"] = to_non_negative_int(state.get("consecutive_failures")) + 1
-            state["consecutive_launch_failures"] = to_non_negative_int(state.get("consecutive_launch_failures")) + 1
-        else:
-            state["consecutive_failures"] = 0
-            state["consecutive_launch_failures"] = 0
-            state["last_success_at"] = now
+        owned_by_other = {
+            int(item["gpu_index"])
+            for item in (remote.get("skipped") or [])
+            if isinstance(item, dict)
+            and item.get("classification") == "gpu_owned_by_other_agent"
+            and str(item.get("gpu_index", "")).isdigit()
+        }
+        allocatable = sorted(set(hardware_eligible) - owned_by_other)
+        state["hardware_eligible_gpus"] = sorted(set(hardware_eligible))
+        state["allocatable_gpus"] = allocatable
         if live_agents > 0:
-            state["zero_capacity_failures"] = 0
-            state["first_zero_capacity_at"] = None
             state["first_agent_at"] = state.get("first_agent_at") or now
+        attention_reasons = []
+        launch_episode = None
+        previous_launch_episode = state.get("launch_failure_episode") if isinstance(state.get("launch_failure_episode"), dict) else None
+        if launch_failures and live_agents == 0:
+            launch_episode = advance_launch_failure_episode(previous_launch_episode, launch_failures, now=now)
+            state["launch_failure_episode"] = launch_episode
+            state["consecutive_launch_failures"] = launch_episode["attempts"]
+            state["current_failure"] = launch_episode
+            if launch_episode["action_required"]:
+                attention_reasons.append("agent_launch_failed")
         else:
-            state["first_zero_capacity_at"] = state.get("first_zero_capacity_at") or state.get("created_at") or now
-            if has_launch_failure:
-                state["zero_capacity_failures"] = to_non_negative_int(state.get("zero_capacity_failures")) + 1
-        zero_age = age_seconds(state.get("first_zero_capacity_at"), now=now) if live_agents == 0 else 0
-        attention_reasons: list[str] = []
-        if eligible and to_non_negative_int(state.get("consecutive_launch_failures")) >= AGENT_FAILURE_ATTENTION_THRESHOLD:
-            attention_reasons.append("eligible_gpu_launch_failures")
-        if live_agents == 0 and to_non_negative_int(state.get("zero_capacity_failures")) >= AGENT_FAILURE_ATTENTION_THRESHOLD:
-            attention_reasons.append("zero_capacity_retries_exhausted")
-        if live_agents == 0 and zero_age >= AGENT_ZERO_CAPACITY_ATTENTION_SECONDS:
-            attention_reasons.append("zero_capacity_timeout")
+            if previous_launch_episode:
+                state["last_resolved_failure"] = resolved_launch_failure_summary(previous_launch_episode, resolved_at=now)
+                self._enqueue_agent_reconcile_resolved(job, previous_launch_episode, state, requested_by=requested_by)
+            state["launch_failure_episode"] = None
+            state["consecutive_launch_failures"] = 0
+            state["current_failure"] = None
+        state["last_success_at"] = now
         if attention_reasons:
             classification = "agent_capacity_attention"
             lifecycle = "attention"
         elif live_agents >= desired_agents:
             classification = "capacity_satisfied"
             lifecycle = "running"
-        elif not eligible:
+        elif not allocatable and live_agents == 0:
             classification = "resource_wait"
             lifecycle = "running_degraded"
         elif live_agents > 0:
             classification = "running_degraded"
             lifecycle = "running_degraded"
+        elif launch_failures:
+            classification = "agent_launch_failed_reconciling"
+            lifecycle = "pending"
         else:
             classification = "capacity_pending"
             lifecycle = "pending"
-        delay = retry_delay_seconds(to_non_negative_int(state.get("consecutive_failures"))) if has_launch_failure else AGENT_STEADY_RECONCILE_SECONDS
         state.update({
             "lifecycle": lifecycle,
             "classification": classification,
             "live_agents": live_agents,
             "assignments": assignments,
-            "eligible_gpu_indices": eligible,
             "last_gpu_probe": compact_gpu_probe(gpu_probe),
             "last_remote_result": compact_agent_reconcile_remote(remote),
             "last_failures": launch_failures[:10],
             "attention_reasons": attention_reasons,
-            "zero_capacity_age_seconds": zero_age,
-            "next_reconcile_at": next_reconcile_at(now=now, delay_seconds=delay),
+            "next_reconcile_at": next_reconcile_at(now=now, delay_seconds=AGENT_STEADY_RECONCILE_SECONDS),
             "updated_at": now,
         })
         job.agent_pids = sorted({str(item["pid"]) for item in assignments if str(item.get("pid") or "")})
@@ -1643,7 +1791,6 @@ class ConsoleService:
             self._enqueue_agent_reconcile_attention(job, state, requested_by=requested_by)
         else:
             job.status = JobStatus.running
-            state["attention_episode"] = None
         self.store.upsert_job(job)
         return self._agent_reconcile_result(
             job,
@@ -1653,56 +1800,276 @@ class ConsoleService:
             failures=launch_failures,
         )
 
-    def _agent_reconcile_exception(
+    def _wandb_dependency_scope(self) -> str:
+        api_key = self._wandb_api_key() or ""
+        credential_scope = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12] if api_key else "missing"
+        return f"{getattr(self.wandb, 'endpoint', 'wandb')}|credential:{credential_scope}"
+
+    def _dependency_failure_spec(
+        self,
+        exc: Exception,
+        *,
+        source: str,
+        scope: str,
+        operation_stage: str,
+    ) -> dict[str, Any]:
+        if source == "wandb":
+            retry_active = bool(getattr(exc, "transient", not isinstance(exc, WandBAuthRequired)))
+            classification = str(getattr(
+                exc,
+                "classification",
+                "wandb_unavailable_reconciling" if retry_active else "auth_required",
+            ))
+            return {
+                "exc": exc,
+                "source": source,
+                "scope": scope,
+                "operation_stage": operation_stage,
+                "classification": classification,
+                "retry_active": retry_active,
+                "action_required_immediately": not retry_active,
+            }
+        error_text = compact_error(exc)
+        result = getattr(exc, "result", None)
+        if result is not None:
+            error_text = "\n".join([
+                str(getattr(result, "stderr", "") or ""),
+                str(getattr(result, "stdout", "") or ""),
+            ])
+        deterministic = any(marker in error_text for marker in (
+            "Permission denied",
+            "REMOTE HOST IDENTIFICATION HAS CHANGED",
+            "Host key verification failed",
+        ))
+        classification = (
+            "ssh_configuration_required"
+            if deterministic
+            else "remote_agent_reconcile_unavailable"
+            if operation_stage == "remote_agent_reconcile"
+            else "ssh_unavailable_reconciling"
+        )
+        return {
+            "exc": exc,
+            "source": source,
+            "scope": scope,
+            "operation_stage": operation_stage,
+            "classification": classification,
+            "retry_active": not deterministic,
+            "action_required_immediately": deterministic,
+        }
+
+    def _record_dependency_failure(
         self,
         job: JobRecord,
         state: dict[str, Any],
+        *,
         exc: Exception,
+        source: str,
+        scope: str,
+        operation_stage: str,
+        classification: str,
+        retry_active: bool,
+        action_required_immediately: bool,
+        requested_by: str,
+        now: str,
+    ) -> dict[str, Any]:
+        key = dependency_key(source=source, scope=scope, operation_stage=operation_stage)
+        with self.store.named_lock(f"dependency:{key}"):
+            previous = self.store.get_dependency_episode(key)
+            episode = advance_dependency_episode(
+                previous,
+                source=source,
+                scope=scope,
+                operation_stage=operation_stage,
+                classification=classification,
+                exc=exc,
+                retry_active=retry_active,
+                action_required_immediately=action_required_immediately,
+                now=now,
+            )
+            schedule = self.store.get_monitor_schedule(job.job_id) or {}
+            episode = self.store.upsert_dependency_episode(
+                episode,
+                job_id=job.job_id,
+                thread_id=str(schedule.get("thread_id") or "").strip() or None,
+            )
+        if not previous:
+            self.store.write_audit(AuditEvent(
+                event_type="dependency_failure_started",
+                job_id=job.job_id,
+                message=f"{source} dependency became unavailable.",
+                detail=compact_dependency_failure(episode),
+            ))
+        if episode["action_required"]:
+            if not bool((previous or {}).get("action_required")):
+                self.store.write_audit(AuditEvent(
+                    event_type="dependency_attention_started",
+                    job_id=job.job_id,
+                    message=f"{source} dependency requires attention.",
+                    detail=compact_dependency_failure(episode),
+                ))
+            self._enqueue_dependency_attention(episode, requested_by=requested_by)
+        return episode
+
+    def _persist_dependency_wait(
+        self,
+        job: JobRecord,
+        state: dict[str, Any],
+        episodes: list[dict[str, Any]],
         *,
         requested_by: str,
+        now: str,
     ) -> dict[str, Any]:
-        now = utc_now()
-        transient = bool(
-            is_transient_ssh_error(exc)
-            or isinstance(exc, (WandBUnavailable, TimeoutError, ConnectionError, OSError))
-        )
-        if not transient:
-            return self._fatal_agent_reconcile(
-                job,
-                classification="agent_reconcile_invariant_error",
-                reason=compact_error(exc),
-                requested_by=requested_by,
-                state=state,
-            )
-        failures = to_non_negative_int(state.get("consecutive_failures")) + 1
-        last_live = to_non_negative_int(state.get("live_agents"))
-        zero_failures = to_non_negative_int(state.get("zero_capacity_failures")) + (1 if last_live == 0 else 0)
-        first_zero = state.get("first_zero_capacity_at") or state.get("created_at") or now
-        zero_age = age_seconds(first_zero, now=now) if last_live == 0 else 0
-        reasons = []
-        if last_live == 0 and zero_failures >= AGENT_FAILURE_ATTENTION_THRESHOLD:
-            reasons.append("zero_capacity_retries_exhausted")
-        if last_live == 0 and zero_age >= AGENT_ZERO_CAPACITY_ATTENTION_SECONDS:
-            reasons.append("zero_capacity_timeout")
-        classification = "agent_capacity_attention" if reasons else "transient_control_plane_error"
+        unique = {
+            str(episode.get("dependency_key")): episode
+            for episode in [*(state.get("dependency_failures") or []), *episodes]
+            if isinstance(episode, dict) and episode.get("dependency_key")
+        }
+        failures = list(unique.values())
+        primary = sorted(
+            failures,
+            key=lambda item: (not bool(item.get("action_required")), bool(item.get("auto_retry_active"))),
+        )[0]
+        action_required = any(bool(item.get("action_required")) for item in failures)
+        retry_times = sorted(str(item["next_retry_at"]) for item in failures if item.get("next_retry_at"))
         state.update({
-            "lifecycle": "attention" if reasons else ("running_degraded" if last_live else "pending"),
-            "classification": classification,
-            "consecutive_failures": failures,
-            "zero_capacity_failures": zero_failures,
-            "first_zero_capacity_at": first_zero if last_live == 0 else None,
-            "zero_capacity_age_seconds": zero_age,
-            "attention_reasons": reasons,
-            "last_error": compact_error(exc),
-            "next_reconcile_at": next_reconcile_at(now=now, delay_seconds=retry_delay_seconds(failures)),
+            "lifecycle": "attention" if action_required else "running_degraded" if to_non_negative_int(state.get("live_agents")) else "pending",
+            "classification": primary.get("classification"),
+            "current_failure": compact_dependency_failure(primary),
+            "dependency_failures": [compact_dependency_failure(item) for item in failures],
+            "attention_reasons": sorted({str(item.get("classification")) for item in failures if item.get("action_required")}),
+            "next_reconcile_at": retry_times[0] if retry_times else None,
             "updated_at": now,
         })
         job.monitor["agent_reconciler"] = state
-        if reasons:
-            job.status = JobStatus.attention
-            self._enqueue_agent_reconcile_attention(job, state, requested_by=requested_by)
+        job.status = JobStatus.attention if action_required else JobStatus.running
         self.store.upsert_job(job)
-        return self._agent_reconcile_result(job, state, classification=classification, failures=[{"error": compact_error(exc)}])
+        return self._agent_reconcile_result(
+            job,
+            state,
+            classification=str(primary.get("classification") or "external_unavailable_reconciling"),
+            failures=[{
+                "source": item.get("source"),
+                "operation_stage": item.get("operation_stage"),
+                "error": item.get("error_summary"),
+            } for item in failures],
+        )
+
+    def _enqueue_dependency_attention(self, episode: dict[str, Any], *, requested_by: str) -> None:
+        impacts = self.store.dependency_impacts(str(episode["episode_id"]))
+        by_thread: dict[str, list[str]] = {}
+        for impact in impacts:
+            thread_id = str(impact.get("thread_id") or "").strip()
+            if thread_id:
+                by_thread.setdefault(thread_id, []).append(str(impact["job_id"]))
+        for thread_id, job_ids in by_thread.items():
+            primary_job_id = sorted(set(job_ids))[0]
+            thread_digest = hashlib.sha256(thread_id.encode("utf-8")).hexdigest()[:16]
+            capacity = {}
+            for job_id in sorted(set(job_ids)):
+                impacted_job = self.store.get_job(job_id)
+                if not impacted_job or not is_managed_agent_job(impacted_job):
+                    continue
+                impacted_state = impacted_job.monitor["agent_reconciler"]
+                capacity[job_id] = {
+                    "desired_agents": impacted_state.get("desired_agents"),
+                    "live_agents": impacted_state.get("live_agents"),
+                    "hardware_eligible_gpus": list(impacted_state.get("hardware_eligible_gpus") or []),
+                    "allocatable_gpus": list(impacted_state.get("allocatable_gpus") or []),
+                }
+            self.store.enqueue_wake_event(
+                dedupe_key=f"dependency:{episode['episode_id']}:thread:{thread_digest}:attention",
+                job_id=primary_job_id,
+                thread_id=thread_id,
+                kind="attention",
+                summary=f"{episode['source']} dependency requires attention for {len(set(job_ids))} job(s)",
+                payload={
+                    "action_required": True,
+                    "classification": episode.get("classification"),
+                    "failure_source": episode.get("source"),
+                    "operation_stage": episode.get("operation_stage"),
+                    "episode_id": episode.get("episode_id"),
+                    "affected_job_ids": sorted(set(job_ids)),
+                    "first_seen_at": episode.get("first_seen_at"),
+                    "duration_seconds": episode.get("age_seconds"),
+                    "attempts": episode.get("attempts"),
+                    "auto_retry_active": episode.get("auto_retry_active"),
+                    "next_retry_at": episode.get("next_retry_at"),
+                    "capacity": capacity,
+                    "error_summary": episode.get("error_summary"),
+                    "error_fingerprint": episode.get("error_fingerprint"),
+                    "recommended_actions": ["Inspect the dependency and repair the confirmed cause before forcing reconciliation."],
+                    "forbidden_actions": ["create_duplicate_sweep", "blind_recover_agents"],
+                    "requested_by": requested_by,
+                },
+            )
+
+    def _resolve_dependency_success(
+        self,
+        *,
+        source: str,
+        scope: str,
+        operation_stage: str,
+        current_job_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        key = dependency_key(source=source, scope=scope, operation_stage=operation_stage)
+        with self.store.named_lock(f"dependency:{key}"):
+            episode, impacts = self.store.delete_dependency_episode(key)
+        if not episode:
+            return None
+        now = utc_now()
+        summary = resolved_failure_summary(episode, resolved_at=now)
+        self.store.write_audit(AuditEvent(
+            event_type="dependency_failure_resolved",
+            job_id=current_job_id,
+            message=f"{source} dependency recovered.",
+            detail=summary,
+        ))
+        for impact in impacts:
+            job_id = str(impact["job_id"])
+            if job_id == current_job_id:
+                continue
+            impacted_job = self.store.get_job(job_id)
+            if not impacted_job or not is_managed_agent_job(impacted_job):
+                continue
+            impacted_state = dict(impacted_job.monitor["agent_reconciler"])
+            apply_dependency_resolution(impacted_state, summary)
+            impacted_state["next_reconcile_at"] = now
+            impacted_state["updated_at"] = now
+            if impacted_job.status == JobStatus.attention and not impacted_state.get("attention_reasons"):
+                impacted_job.status = JobStatus.running
+            impacted_job.monitor["agent_reconciler"] = impacted_state
+            self.store.upsert_job(impacted_job)
+        if episode.get("action_required"):
+            by_thread: dict[str, list[str]] = {}
+            for impact in impacts:
+                thread_id = str(impact.get("thread_id") or "").strip()
+                if thread_id:
+                    by_thread.setdefault(thread_id, []).append(str(impact["job_id"]))
+            for thread_id, job_ids in by_thread.items():
+                primary_job_id = sorted(set(job_ids))[0]
+                thread_digest = hashlib.sha256(thread_id.encode("utf-8")).hexdigest()[:16]
+                self.store.enqueue_wake_event(
+                    dedupe_key=f"dependency:{episode['episode_id']}:thread:{thread_digest}:resolved",
+                    job_id=primary_job_id,
+                    thread_id=thread_id,
+                    kind="resolved",
+                    summary=f"{source} dependency recovered; no manual action is required",
+                    payload={
+                        "action_required": False,
+                        "classification": "dependency_recovered",
+                        "failure_source": source,
+                        "operation_stage": operation_stage,
+                        "episode_id": episode.get("episode_id"),
+                        "affected_job_ids": sorted(set(job_ids)),
+                        "resolved_at": now,
+                        "attempts": episode.get("attempts"),
+                        "auto_retry_active": False,
+                        "recommended_actions": [],
+                        "forbidden_actions": ["create_duplicate_sweep", "blind_recover_agents"],
+                    },
+                )
+        return summary
 
     def _fatal_agent_reconcile(
         self,
@@ -1715,11 +2082,25 @@ class ConsoleService:
     ) -> dict[str, Any]:
         now = utc_now()
         state = dict(state or job.monitor.get("agent_reconciler") or {})
+        failure = {
+            "episode_id": new_id("agent_fatal", job.job_id),
+            "source": "agent_reconciler",
+            "operation_stage": "invariant",
+            "classification": classification,
+            "action_required": True,
+            "auto_retry_active": False,
+            "attempts": 1,
+            "first_seen_at": now,
+            "last_seen_at": now,
+            "next_retry_at": None,
+            "error_summary": reason,
+            "error_fingerprint": hashlib.sha256(reason.encode("utf-8")).hexdigest(),
+        }
         state.update({
             "lifecycle": "fatal",
             "classification": classification,
             "attention_reasons": [classification],
-            "last_error": reason,
+            "current_failure": failure,
             "next_reconcile_at": None,
             "updated_at": now,
         })
@@ -1737,26 +2118,80 @@ class ConsoleService:
         requested_by: str,
     ) -> None:
         reasons = sorted({str(item) for item in (state.get("attention_reasons") or []) if str(item)})
-        signature = hashlib.sha256(json.dumps(reasons, sort_keys=True).encode("utf-8")).hexdigest()[:16]
-        episode = state.get("attention_episode")
-        if not isinstance(episode, dict) or episode.get("signature") != signature:
-            episode = {"id": new_id("agent_attention", job.job_id), "signature": signature, "created_at": utc_now()}
-            state["attention_episode"] = episode
+        episode = state.get("launch_failure_episode") if isinstance(state.get("launch_failure_episode"), dict) else state.get("current_failure")
+        if not isinstance(episode, dict):
+            return
+        episode_id = str(episode.get("episode_id") or new_id("agent_attention", job.job_id))
         schedule = self.store.get_monitor_schedule(job.job_id) or {}
         thread_id = str(schedule.get("thread_id") or "").strip()
         if not thread_id:
             return
         self.store.enqueue_wake_event(
-            dedupe_key=f"{job.job_id}:attention:agent_capacity:{episode['id']}",
+            dedupe_key=f"{job.job_id}:attention:agent_capacity:{episode_id}",
             job_id=job.job_id,
             thread_id=thread_id,
             kind="attention",
             summary=f"job {job.job_id} agent capacity requires attention",
             payload={
-                "classification": state.get("classification"),
+                "action_required": True,
+                "classification": episode.get("classification") or state.get("classification"),
+                "failure_source": episode.get("source") or "agent_launch",
+                "operation_stage": episode.get("operation_stage") or "launch_agent",
+                "episode_id": episode_id,
                 "attention_reasons": reasons,
                 "desired_agents": state.get("desired_agents"),
                 "live_agents": state.get("live_agents"),
+                "attempts": episode.get("attempts"),
+                "first_seen_at": episode.get("first_seen_at"),
+                "duration_seconds": episode.get("age_seconds"),
+                "auto_retry_active": True,
+                "next_retry_at": state.get("next_reconcile_at"),
+                "capacity": {
+                    "desired_agents": state.get("desired_agents"),
+                    "live_agents": state.get("live_agents"),
+                    "hardware_eligible_gpus": list(state.get("hardware_eligible_gpus") or []),
+                    "allocatable_gpus": list(state.get("allocatable_gpus") or []),
+                },
+                "error_summary": episode.get("error_summary"),
+                "error_fingerprint": episode.get("error_fingerprint"),
+                "recommended_actions": ["Inspect and repair the verified agent launch failure before forcing reconciliation."],
+                "forbidden_actions": ["create_duplicate_sweep", "blind_recover_agents"],
+                "requested_by": requested_by,
+            },
+        )
+
+    def _enqueue_agent_reconcile_resolved(
+        self,
+        job: JobRecord,
+        episode: dict[str, Any],
+        state: dict[str, Any],
+        *,
+        requested_by: str,
+    ) -> None:
+        if not episode.get("action_required"):
+            return
+        schedule = self.store.get_monitor_schedule(job.job_id) or {}
+        thread_id = str(schedule.get("thread_id") or "").strip()
+        if not thread_id:
+            return
+        episode_id = str(episode.get("episode_id") or "")
+        self.store.enqueue_wake_event(
+            dedupe_key=f"{job.job_id}:resolved:agent_capacity:{episode_id}",
+            job_id=job.job_id,
+            thread_id=thread_id,
+            kind="resolved",
+            summary=f"job {job.job_id} agent launch failure recovered",
+            payload={
+                "action_required": False,
+                "classification": "agent_launch_recovered",
+                "failure_source": "agent_launch",
+                "operation_stage": "launch_agent",
+                "episode_id": episode_id,
+                "live_agents": state.get("live_agents"),
+                "desired_agents": state.get("desired_agents"),
+                "resolved_at": utc_now(),
+                "recommended_actions": [],
+                "forbidden_actions": ["create_duplicate_sweep", "blind_recover_agents"],
                 "requested_by": requested_by,
             },
         )
@@ -3278,8 +3713,41 @@ class ConsoleService:
         if sweep_id:
             try:
                 sweep = self.wandb.get_sweep_state(entity, project, sweep_id)
+                if job and is_managed_agent_job(job):
+                    state = dict(job.monitor["agent_reconciler"])
+                    resolved = self._resolve_dependency_success(
+                        source="wandb",
+                        scope=self._wandb_dependency_scope(),
+                        operation_stage="get_sweep_state",
+                        current_job_id=job.job_id,
+                    )
+                    if resolved:
+                        apply_dependency_resolution(state, resolved)
+                        state["next_reconcile_at"] = observed_at
+                        state["updated_at"] = observed_at
+                        job.monitor["agent_reconciler"] = state
+                        if job.status == JobStatus.attention and not state.get("attention_reasons"):
+                            job.status = JobStatus.running
+                        self.store.upsert_job(job)
             except Exception as exc:
                 degraded = str(exc)
+                if job and is_managed_agent_job(job):
+                    state = dict(job.monitor["agent_reconciler"])
+                    failure = self._dependency_failure_spec(
+                        exc,
+                        source="wandb",
+                        scope=self._wandb_dependency_scope(),
+                        operation_stage="get_sweep_state",
+                    )
+                    episode = self._record_dependency_failure(
+                        job,
+                        state,
+                        requested_by="status-query",
+                        now=observed_at,
+                        **failure,
+                    )
+                    self._persist_dependency_wait(job, state, [episode], requested_by="status-query", now=observed_at)
+                    job = self.store.get_job(job.job_id) or job
         if job and sweep:
             sweep = self._enrich_single_sweep_with_telemetry(sweep)
         execution_state = derive_execution_state(sweep)
@@ -3304,8 +3772,39 @@ class ConsoleService:
                     pids=job.agent_pids,
                 )
                 job.monitor["last_agent_probe"] = compact_agent_probe(agent_probe)
+                if is_managed_agent_job(job):
+                    state = dict(job.monitor["agent_reconciler"])
+                    state["last_agent_observation"] = compact_agent_probe(agent_probe)
+                    state["live_agents"] = observed_agent_count(agent_probe)
+                    resolved = self._resolve_dependency_success(
+                        source="ssh",
+                        scope=str(job.remote_host),
+                        operation_stage="observe_agent_processes",
+                        current_job_id=job.job_id,
+                    )
+                    if resolved:
+                        apply_dependency_resolution(state, resolved)
+                        state["next_reconcile_at"] = observed_at
+                    job.monitor["agent_reconciler"] = state
             except Exception as exc:
                 agent_probe = {"classification": "agent_probe_unavailable", "error": compact_error(exc)}
+                if is_managed_agent_job(job):
+                    state = dict(job.monitor["agent_reconciler"])
+                    failure = self._dependency_failure_spec(
+                        exc,
+                        source="ssh",
+                        scope=str(job.remote_host),
+                        operation_stage="observe_agent_processes",
+                    )
+                    episode = self._record_dependency_failure(
+                        job,
+                        state,
+                        requested_by="status-query",
+                        now=observed_at,
+                        **failure,
+                    )
+                    self._persist_dependency_wait(job, state, [episode], requested_by="status-query", now=observed_at)
+                    job = self.store.get_job(job.job_id) or job
         agent_reconciler = (
             job.monitor.get("agent_reconciler")
             if job and isinstance(job.monitor.get("agent_reconciler"), dict)
@@ -3570,9 +4069,24 @@ class ConsoleService:
                 ]
             else:
                 next_actions = ["Queued only: W&B sweep has not been created. Wait for the blocker to finish, then run advance-queue."]
+        elif (
+            job
+            and isinstance(agent_reconciler.get("current_failure"), dict)
+            and agent_reconciler["current_failure"].get("action_required")
+        ):
+            classification = "attention"
+            current_failure = agent_reconciler["current_failure"]
+            next_actions = (
+                ["Console 仍在自动重试；修复依赖后先用 status 验证恢复，不要盲目执行 recover-agents。"]
+                if current_failure.get("auto_retry_active")
+                else ["修复 current_failure 指示的确定性问题；凭证问题先运行 auth-check，确认恢复后再调和。"]
+            )
         elif degraded:
-            classification = "degraded"
-            next_actions = ["稍后重试 status；如持续 degraded，检查 W&B/API 网络与本地 WANDB_API_KEY。"]
+            current_failure = agent_reconciler.get("current_failure") if isinstance(agent_reconciler.get("current_failure"), dict) else {}
+            classification = str(current_failure.get("classification") or "external_unavailable_reconciling")
+            next_actions = [
+                "Console 正在自动重试外部依赖；查看 current_failure.next_retry_at，勿创建重复 sweep 或盲目 recover-agents。"
+            ]
         elif sync_state.get("classification") == "sync_error":
             classification = "sync_error"
             next_actions = ["多源状态持续不一致；队列已阻塞。检查 W&B run edges、远端进程和 artifact manifest 的 reconcile 证据。"]
@@ -3580,10 +4094,14 @@ class ConsoleService:
             classification = "attention"
             if job.monitor.get("kind") == "single_run":
                 next_actions = ["检查 single-run 的 last_run_status、failure_diagnostics 和远端日志；修复配置 argv 或训练脚本后重新 launch-run。"]
-            elif agent_reconciler.get("attention_reasons"):
-                next_actions = ["检查 agent_reconciler.attention_reasons；不要创建重复 sweep，修复后用 recover-agents 触发立即调和。"]
+            elif isinstance(agent_reconciler.get("current_failure"), dict):
+                current_failure = agent_reconciler["current_failure"]
+                if current_failure.get("auto_retry_active"):
+                    next_actions = ["Console 仍在自动重试；修复依赖后先用 status 验证恢复，不要盲目执行 recover-agents。"]
+                else:
+                    next_actions = ["修复 current_failure 指示的确定性问题；凭证问题先运行 auth-check，确认恢复后再调和。"]
             else:
-                next_actions = ["检查 agent 诊断；修复远端代码/路径后重新 launch 或 recover-agents。"]
+                next_actions = ["检查 agent 诊断并修复明确原因；不要创建重复 sweep 或盲目调和。"]
         elif sweep_attention:
             classification = "attention"
             next_actions = sweep_attention_reasons or ["检查 run 级失败诊断；如需要，修复远端代码/路径后重新 launch 或 recover-agents。"]
@@ -3884,6 +4402,12 @@ class ConsoleService:
             raise ValueError("recover-agents cannot adopt a historical job; only newly launched managed sweeps are eligible")
         if job.status in TERMINAL_JOB_STATUSES or str(job.monitor["agent_reconciler"].get("lifecycle") or "") == "stopped":
             raise ValueError("recover-agents cannot restart a stopped or terminal managed job")
+        current_failure = job.monitor["agent_reconciler"].get("current_failure")
+        if isinstance(current_failure, dict) and not payload.confirmed_failure_resolved:
+            raise ValueError(
+                "recover-agents refused while current_failure is unresolved; confirm recovery with status/auth-check "
+                "or explicitly confirm that the verified cause was repaired"
+            )
         operation_id = operation_id or self._operation_identity(IntentType.recover_agents, payload.model_dump(mode="json"))[0]
         idempotency_key = idempotency_key or self._operation_identity(IntentType.recover_agents, payload.model_dump(mode="json"))[1]
         self._record_operation(
@@ -3923,7 +4447,7 @@ class ConsoleService:
                 "classification": classification,
                 "created_new_sweep": False,
                 "agent_reconciler": reconcile,
-                "next_actions": ["Inspect agent reconciler attention reasons."] if job.status == JobStatus.attention else [],
+                "next_actions": ["Inspect and repair current_failure before another forced reconciliation."] if job.status == JobStatus.attention else [],
             },
         )
         return {
@@ -3931,7 +4455,7 @@ class ConsoleService:
             "classification": classification,
             "created_new_sweep": False,
             "agent_reconciler": reconcile,
-            "next_actions": ["Inspect agent reconciler attention reasons."] if job.status == JobStatus.attention else [],
+            "next_actions": ["Inspect and repair current_failure before another forced reconciliation."] if job.status == JobStatus.attention else [],
         }, job
 
     def _repair_watchdog(self, payload: RepairWatchdogPayload, *, requested_by: str = "experiment-runner", operation_id: str | None = None, idempotency_key: str | None = None) -> tuple[dict[str, Any], JobRecord]:
@@ -4280,7 +4804,10 @@ class ConsoleService:
         actionable_classification = None
         summary = ""
         artifact_episode_id = ((job.monitor.get("artifact_consistency") or {}).get("episode_id") if isinstance(job.monitor.get("artifact_consistency"), dict) else None)
-        external_mismatches = ["wandb_status_unavailable"] if status_result.get("classification") == "degraded" else []
+        external_mismatches = ["wandb_status_unavailable"] if (
+            status_result.get("degraded")
+            or str(status_result.get("classification") or "").endswith("_unavailable_reconciling")
+        ) else []
         previous_external_consistency = job.monitor.get("external_consistency") if isinstance(job.monitor.get("external_consistency"), dict) else None
         external_consistency = update_sync_consistency(
             previous_external_consistency,
@@ -4521,7 +5048,7 @@ class ConsoleService:
         if not remote_host:
             remote_host = self.settings.default_remote_host
         sweep_path = f"{entity}/{project}/{sweep_id}" if sweep_id else None
-        return self.ssh.auth_check(
+        result = self.ssh.auth_check(
             host=remote_host,
             remote_cwd=remote_cwd,
             sweep_path=sweep_path,
@@ -4529,6 +5056,48 @@ class ConsoleService:
             conda_env=(job.conda_env if job else None) or self.settings.default_conda_env,
             conda_sh=self.settings.default_conda_sh,
         )
+        if job and is_managed_agent_job(job):
+            with self._serialized_job(job.job_id):
+                job = self._require_job(job.job_id)
+                state = dict(job.monitor["agent_reconciler"])
+                job.monitor["auth"] = result
+                scope = f"{self._wandb_dependency_scope()}|remote:{remote_host}"
+                now = utc_now()
+                if result.get("ok"):
+                    resolved = self._resolve_dependency_success(
+                        source="wandb",
+                        scope=scope,
+                        operation_stage="remote_auth_check",
+                        current_job_id=job.job_id,
+                    )
+                    apply_dependency_resolution(state, resolved)
+                    state["next_reconcile_at"] = now
+                    state["updated_at"] = now
+                    if job.status == JobStatus.attention and not state.get("attention_reasons"):
+                        job.status = JobStatus.running
+                    job.monitor["agent_reconciler"] = state
+                    self.store.upsert_job(job)
+                else:
+                    exc = (
+                        WandBAuthRequired(str(result.get("error") or "remote W&B authentication failed"))
+                        if result.get("classification") in {"wandb_auth_missing", "auth_required"}
+                        else WandBUnavailable(str(result.get("error") or "remote W&B API is unavailable"))
+                    )
+                    failure = self._dependency_failure_spec(
+                        exc,
+                        source="wandb",
+                        scope=scope,
+                        operation_stage="remote_auth_check",
+                    )
+                    episode = self._record_dependency_failure(
+                        job,
+                        state,
+                        requested_by="auth-check",
+                        now=now,
+                        **failure,
+                    )
+                    self._persist_dependency_wait(job, state, [episode], requested_by="auth-check", now=now)
+        return result
 
     def _pull_results(self, payload: PullResultsPayload, *, requested_by: str = "experiment-runner", operation_id: str | None = None, idempotency_key: str | None = None) -> dict[str, Any]:
         if payload.job_id:
@@ -5176,6 +5745,122 @@ def to_optional_positive_int(value: Any) -> int | None:
     return parsed or None
 
 
+def observed_agent_count(probe: dict[str, Any] | None) -> int:
+    if not isinstance(probe, dict):
+        return 0
+    identities = set()
+    for item in probe.get("pgrep") or []:
+        if not isinstance(item, dict):
+            continue
+        gpu_index = item.get("gpu_index")
+        session_id = item.get("session_id")
+        pid = item.get("pid")
+        identities.add(("gpu", int(gpu_index)) if str(gpu_index).isdigit() else ("session", str(session_id or pid)))
+    if identities:
+        return len(identities)
+    return len({str(pid) for pid in (probe.get("alive_pids") or []) if str(pid)})
+
+
+def advance_launch_failure_episode(
+    current: dict[str, Any] | None,
+    failures: list[dict[str, Any]],
+    *,
+    now: str,
+) -> dict[str, Any]:
+    normalized = [
+        {
+            "classification": str(item.get("classification") or "agent_launch_failed"),
+            "error": str(item.get("error") or ""),
+        }
+        for item in failures
+    ]
+    signature = hashlib.sha256(json.dumps(normalized, sort_keys=True).encode("utf-8")).hexdigest()
+    same = isinstance(current, dict) and current.get("error_fingerprint") == signature
+    attempts = to_non_negative_int((current or {}).get("attempts")) + 1 if same else 1
+    first_seen_at = str((current or {}).get("first_seen_at") or now) if same else now
+    return {
+        "episode_id": str((current or {}).get("episode_id") or new_id("agent_launch_failure")) if same else new_id("agent_launch_failure"),
+        "source": "agent_launch",
+        "operation_stage": "launch_agent",
+        "classification": "agent_launch_failed",
+        "action_required": attempts >= AGENT_FAILURE_ATTENTION_THRESHOLD,
+        "auto_retry_active": True,
+        "attempts": attempts,
+        "first_seen_at": first_seen_at,
+        "last_seen_at": now,
+        "age_seconds": age_seconds(first_seen_at, now=now),
+        "error_summary": "; ".join(item["error"] or item["classification"] for item in normalized)[:2000],
+        "error_fingerprint": signature,
+    }
+
+
+def resolved_launch_failure_summary(episode: dict[str, Any], *, resolved_at: str) -> dict[str, Any]:
+    return {
+        key: episode.get(key)
+        for key in (
+            "episode_id",
+            "source",
+            "operation_stage",
+            "classification",
+            "attempts",
+            "first_seen_at",
+            "last_seen_at",
+            "error_fingerprint",
+        )
+    } | {"resolved_at": resolved_at}
+
+
+def compact_dependency_failure(episode: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(episode, dict):
+        return None
+    return {
+        key: episode.get(key)
+        for key in (
+            "version",
+            "episode_id",
+            "dependency_key",
+            "source",
+            "scope",
+            "operation_stage",
+            "classification",
+            "lifecycle",
+            "action_required",
+            "auto_retry_active",
+            "attempts",
+            "first_seen_at",
+            "last_seen_at",
+            "age_seconds",
+            "next_retry_at",
+            "error_type",
+            "error_summary",
+            "error_fingerprint",
+        )
+        if key in episode
+    }
+
+
+def apply_dependency_resolution(state: dict[str, Any], summary: dict[str, Any] | None) -> None:
+    if not isinstance(summary, dict):
+        return
+    key = summary.get("dependency_key")
+    state["dependency_failures"] = [
+        item
+        for item in (state.get("dependency_failures") or [])
+        if isinstance(item, dict) and item.get("dependency_key") != key
+    ]
+    current = state.get("current_failure")
+    if isinstance(current, dict) and current.get("dependency_key") == key:
+        state["current_failure"] = None
+        live_agents = to_non_negative_int(state.get("live_agents"))
+        state["lifecycle"] = "running_degraded" if live_agents else "pending"
+        state["classification"] = "running_degraded" if live_agents else "capacity_pending"
+    state["attention_reasons"] = [
+        item for item in (state.get("attention_reasons") or [])
+        if item != summary.get("classification")
+    ]
+    state["last_resolved_failure"] = summary
+
+
 def compact_agent_probe(probe: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(probe, dict):
         return None
@@ -5241,6 +5926,7 @@ def compact_agent_reconcile_remote(result: dict[str, Any] | None) -> dict[str, A
         "launched": compact_agent_assignments(result.get("launched")),
         "failed": list(result.get("failed") or [])[:10],
         "skipped": list(result.get("skipped") or [])[:10],
+        "stale_receipts": list(result.get("stale_receipts") or [])[:20],
         "occupied_gpus": list(result.get("occupied_gpus") or []),
         "receipt_root": result.get("receipt_root"),
         "observed_at": result.get("observed_at"),
@@ -5261,19 +5947,19 @@ def compact_agent_reconciler(state: dict[str, Any] | None) -> dict[str, Any] | N
             "remaining_runs",
             "desired_agents",
             "live_agents",
-            "eligible_gpu_indices",
-            "consecutive_failures",
+            "hardware_eligible_gpus",
+            "allocatable_gpus",
             "consecutive_launch_failures",
-            "zero_capacity_failures",
-            "zero_capacity_age_seconds",
-            "first_zero_capacity_at",
             "first_agent_at",
             "last_attempt_at",
             "last_success_at",
             "next_reconcile_at",
             "attention_reasons",
-            "attention_episode",
-            "last_error",
+            "current_failure",
+            "last_resolved_failure",
+            "launch_failure_episode",
+            "dependency_failures",
+            "last_agent_observation",
             "created_at",
             "updated_at",
         ]

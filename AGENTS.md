@@ -30,6 +30,11 @@ Run `./scripts/exp authority` before mutating work. If the tunnel or authority
 check fails, repair the bridge/tunnel; do not start a second local Console as a
 fallback.
 
+The production v2 transition is a one-time fresh-ledger cutover. Do not seed or
+import historical jobs/W&B sweeps. Verify the empty v2 ledger and changed
+ledger id before repinning runner/Desktop; after `cutover_committed_at` appears,
+only forward deployments are allowed.
+
 Long-running experiment waits belong to the Console monitor worker. Supply an
 explicit `ResultContract` and `CODEX_THREAD_ID` when a job must wake Codex on a
 terminal or attention event. Do not keep a Goal active and do not create Codex
@@ -55,9 +60,11 @@ does not already authorize the operation, or when the action is destructive,
 credential-sensitive, concurrent/costly, or blocked by platform approval.
 
 Managed sweeps use the Console agent-capacity reconciler. `recover-agents`
-only triggers one immediate reconciliation pass for a managed job; it does not
-accept GPU, max-agent, or conda launch overrides and cannot adopt historical
-jobs. Do not use or recreate a separate `launch-agents` path.
+only triggers one immediate reconciliation pass for a managed job. Refresh
+`status` first; if `current_failure` remains set, repair and verify the cause
+before using `--confirmed-fixed`. It does not accept GPU, max-agent, or conda
+launch overrides and cannot adopt historical jobs. Do not use or recreate a
+separate `launch-agents` path.
 
 ## Multi-Dataset Experiment Ordering
 

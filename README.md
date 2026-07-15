@@ -47,7 +47,9 @@ Running sweeps often means juggling a YAML config, W&B sweep creation, GPU selec
 - Stop actions only target remote commands matching the tracked `wandb agent <entity>/<project>/<sweep_id>` string.
 - Managed agent starts use per-GPU locks and credential-free generation receipts under
   `~/.local/state/experiment-console`; `recover-agents` only requests an immediate
-  controller pass and cannot change the launch-time capacity contract.
+  controller pass and cannot change the launch-time capacity contract. It
+  refuses unresolved `current_failure` unless the diagnosed cause was repaired
+  and the caller explicitly confirms that fact.
 - The API binds only to Yggdrasil loopback and requires a bearer token.
 - Result readiness requires both terminal execution evidence and a complete,
   valid, run-id-associated artifact set under the job's explicit
@@ -74,7 +76,8 @@ Running sweeps often means juggling a YAML config, W&B sweep creation, GPU selec
 
 ## Production Use
 
-Provision, migrate, deploy, verify, and roll back with
+Provision, perform the one-time fresh v2 cutover, deploy, verify, and roll back
+before the first v2 Job write with
 [`docs/yggdrasil-production.md`](docs/yggdrasil-production.md). Configure and
 install the Mac bridge with [`docs/desktop-bridge.md`](docs/desktop-bridge.md).
 
@@ -196,9 +199,12 @@ Runner-facing `launch-sweep` defaults to `queue_policy=sequential`. If another s
 
 After a managed sweep is created, the monitor worker also owns agent-capacity
 reconciliation. It preserves existing agents, never preempts or migrates them,
-and only fills missing capacity on currently eligible GPUs. `recover-agents`
-triggers the same reconciler immediately; it does not use a separate launch
-path and cannot adopt historical jobs.
+and only fills missing capacity on allocatable GPUs. Hardware eligibility and
+receipt ownership are reported separately. W&B and SSH failures use shared
+dependency episodes, continue bounded automatic retries, and become attention
+only when manual action is required. `recover-agents --confirmed-fixed`
+triggers the same reconciler immediately after a verified repair; it does not
+use a separate launch path and cannot adopt historical jobs.
 
 For multi-dataset experiment batches, prepare the sweep YAML for every dataset before launching the first dataset, validate them together, and include them in the same GitHub sync/pull handoff. Do not wait for one dataset to finish before creating and syncing the next dataset's sweep YAML. When one dataset reaches a terminal state and another dataset still needs to run, prioritize starting or advancing the next dataset first. After the next dataset is confirmed running, return to the previous dataset's `pull-results` and result review.
 

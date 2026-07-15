@@ -130,6 +130,8 @@ def health():
         "authority_role": settings.authority_role,
         "instance_id": settings.instance_id,
         "ledger_id": service.store.metadata("ledger_id"),
+        "ledger_schema_version": service.store.metadata("ledger_schema_version"),
+        "cutover_committed_at": service.store.metadata("cutover_committed_at"),
         "monitor_worker": monitor_worker.status(),
         "wandb_api_key_present": bool(service._wandb_api_key()),
         "console_api_auth_configured": bool(_configured_console_api_token()),

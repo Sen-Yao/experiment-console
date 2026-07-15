@@ -157,6 +157,45 @@ class ConsoleStore:
                     "INSERT INTO metadata(key, value, updated_at) VALUES ('ledger_id', ?, ?)",
                     (f"ledger_{uuid4().hex}", now_iso()),
                 )
+            conn.execute(
+                "INSERT INTO metadata(key, value, updated_at) VALUES ('ledger_schema_version', '2', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                (now_iso(),),
+            )
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS dependency_episodes (
+                    dependency_key TEXT PRIMARY KEY,
+                    episode_id TEXT NOT NULL UNIQUE,
+                    source TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    operation_stage TEXT NOT NULL,
+                    classification TEXT NOT NULL,
+                    lifecycle TEXT NOT NULL,
+                    action_required INTEGER NOT NULL,
+                    auto_retry_active INTEGER NOT NULL,
+                    attempts INTEGER NOT NULL,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    next_retry_at TEXT,
+                    error_type TEXT NOT NULL,
+                    error_summary TEXT NOT NULL,
+                    error_fingerprint TEXT NOT NULL,
+                    error_fingerprints_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dependency_episodes_retry ON dependency_episodes(auto_retry_active, next_retry_at)")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS dependency_impacts (
+                    episode_id TEXT NOT NULL,
+                    dependency_key TEXT NOT NULL,
+                    job_id TEXT NOT NULL,
+                    thread_id TEXT,
+                    attached_at TEXT NOT NULL,
+                    PRIMARY KEY(episode_id, job_id)
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dependency_impacts_key ON dependency_impacts(dependency_key, episode_id)")
 
     def write_audit(self, event: AuditEvent) -> AuditEvent:
         cleaned = event.model_copy(update={"detail": redact_value(compact_audit_value(event.detail))})
@@ -193,6 +232,140 @@ class ConsoleStore:
         with self._connect() as conn:
             row = conn.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
         return str(row["value"]) if row else None
+
+    def set_metadata(self, key: str, value: str) -> None:
+        stamp = now_iso()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO metadata(key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                (key, value, stamp),
+            )
+
+    def get_dependency_episode(self, dependency_key: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM dependency_episodes WHERE dependency_key = ?",
+                (dependency_key,),
+            ).fetchone()
+        return self._dependency_episode_from_row(row) if row else None
+
+    def upsert_dependency_episode(
+        self,
+        episode: dict[str, Any],
+        *,
+        job_id: str,
+        thread_id: str | None,
+    ) -> dict[str, Any]:
+        normalized_thread_id = str(thread_id or "").strip() or None
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("""
+                INSERT INTO dependency_episodes(
+                    dependency_key, episode_id, source, scope, operation_stage,
+                    classification, lifecycle, action_required, auto_retry_active,
+                    attempts, first_seen_at, last_seen_at, next_retry_at,
+                    error_type, error_summary, error_fingerprint,
+                    error_fingerprints_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(dependency_key) DO UPDATE SET
+                    episode_id = excluded.episode_id,
+                    source = excluded.source,
+                    scope = excluded.scope,
+                    operation_stage = excluded.operation_stage,
+                    classification = excluded.classification,
+                    lifecycle = excluded.lifecycle,
+                    action_required = excluded.action_required,
+                    auto_retry_active = excluded.auto_retry_active,
+                    attempts = excluded.attempts,
+                    first_seen_at = excluded.first_seen_at,
+                    last_seen_at = excluded.last_seen_at,
+                    next_retry_at = excluded.next_retry_at,
+                    error_type = excluded.error_type,
+                    error_summary = excluded.error_summary,
+                    error_fingerprint = excluded.error_fingerprint,
+                    error_fingerprints_json = excluded.error_fingerprints_json,
+                    updated_at = excluded.updated_at
+            """, (
+                episode["dependency_key"], episode["episode_id"], episode["source"],
+                episode["scope"], episode["operation_stage"], episode["classification"],
+                episode["lifecycle"], int(bool(episode["action_required"])),
+                int(bool(episode["auto_retry_active"])), int(episode["attempts"]),
+                episode["first_seen_at"], episode["last_seen_at"], episode.get("next_retry_at"),
+                episode["error_type"], episode["error_summary"], episode["error_fingerprint"],
+                json.dumps(episode.get("error_fingerprints") or [], ensure_ascii=True), episode["updated_at"],
+            ))
+            conn.execute("""
+                INSERT INTO dependency_impacts(
+                    episode_id, dependency_key, job_id, thread_id, attached_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(episode_id, job_id) DO UPDATE SET
+                    thread_id = COALESCE(excluded.thread_id, dependency_impacts.thread_id)
+            """, (
+                episode["episode_id"], episode["dependency_key"], job_id,
+                normalized_thread_id, episode["last_seen_at"],
+            ))
+            row = conn.execute(
+                "SELECT * FROM dependency_episodes WHERE dependency_key = ?",
+                (episode["dependency_key"],),
+            ).fetchone()
+        return self._dependency_episode_from_row(row)
+
+    def dependency_impacts(self, episode_id: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM dependency_impacts WHERE episode_id = ? ORDER BY attached_at, job_id",
+                (episode_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_dependency_episode(self, dependency_key: str) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM dependency_episodes WHERE dependency_key = ?",
+                (dependency_key,),
+            ).fetchone()
+            if not row:
+                return None, []
+            episode = self._dependency_episode_from_row(row)
+            impacts = [
+                dict(item)
+                for item in conn.execute(
+                    "SELECT * FROM dependency_impacts WHERE episode_id = ? ORDER BY attached_at, job_id",
+                    (episode["episode_id"],),
+                ).fetchall()
+            ]
+            conn.execute("DELETE FROM dependency_impacts WHERE episode_id = ?", (episode["episode_id"],))
+            conn.execute("DELETE FROM dependency_episodes WHERE dependency_key = ?", (dependency_key,))
+        return episode, impacts
+
+    @staticmethod
+    def _dependency_episode_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        first_seen_at = str(row["first_seen_at"])
+        age_seconds = max(0, int((datetime.now(timezone.utc) - _parse_timestamp(first_seen_at)).total_seconds()))
+        return {
+            "version": 2,
+            "dependency_key": row["dependency_key"],
+            "episode_id": row["episode_id"],
+            "source": row["source"],
+            "scope": row["scope"],
+            "operation_stage": row["operation_stage"],
+            "classification": row["classification"],
+            "lifecycle": row["lifecycle"],
+            "action_required": bool(row["action_required"]),
+            "auto_retry_active": bool(row["auto_retry_active"]),
+            "attempts": int(row["attempts"]),
+            "first_seen_at": first_seen_at,
+            "last_seen_at": row["last_seen_at"],
+            "age_seconds": age_seconds,
+            "next_retry_at": row["next_retry_at"],
+            "error_type": row["error_type"],
+            "error_summary": row["error_summary"],
+            "error_fingerprint": row["error_fingerprint"],
+            "error_fingerprints": json.loads(row["error_fingerprints_json"] or "[]"),
+            "updated_at": row["updated_at"],
+        }
 
     def save_intent_if_absent(self, intent: IntentRecord) -> tuple[IntentRecord, bool]:
         with self._lock:
@@ -493,6 +666,12 @@ class ConsoleStore:
         return job
 
     def _upsert_job_conn(self, conn: sqlite3.Connection, job: JobRecord) -> None:
+        stamp = now_iso()
+        conn.execute(
+            "INSERT INTO metadata(key, value, updated_at) VALUES ('cutover_committed_at', ?, ?) "
+            "ON CONFLICT(key) DO NOTHING",
+            (stamp, stamp),
+        )
         conn.execute("""
                 INSERT INTO jobs (
                     job_id, name, status, operation_id, idempotency_key, entity, project, sweep_id, config_path,

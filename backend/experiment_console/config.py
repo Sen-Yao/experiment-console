@@ -29,7 +29,7 @@ class Settings(BaseModel):
     default_remote_cwd: str = Field(default_factory=lambda: os.environ.get("EXPERIMENT_CONSOLE_DEFAULT_REMOTE_CWD", "/home/linziyao/DualRefGAD"))
     default_conda_env: str | None = Field(default_factory=lambda: os.environ.get("EXPERIMENT_CONSOLE_DEFAULT_CONDA_ENV", "DualRefGAD"))
     default_conda_sh: str = Field(default_factory=lambda: os.environ.get("EXPERIMENT_CONSOLE_DEFAULT_CONDA_SH", "/opt/anaconda3/etc/profile.d/conda.sh"))
-    contract_version: str = "runner_console_agent_v1"
+    contract_version: str = "runner_console_agent_v2"
     monitor_worker_enabled: bool = Field(default_factory=lambda: os.environ.get("EXPERIMENT_CONSOLE_MONITOR_WORKER", "1").lower() not in {"0", "false", "no"})
     monitor_worker_poll_seconds: int = int(os.environ.get("EXPERIMENT_CONSOLE_MONITOR_POLL_SECONDS", "5"))
     monitor_lease_seconds: int = int(os.environ.get("EXPERIMENT_CONSOLE_MONITOR_LEASE_SECONDS", "30"))

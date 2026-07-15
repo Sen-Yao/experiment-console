@@ -8,10 +8,11 @@ SSH_USER="root"
 REMOTE_BASE="/mnt/user/appdata/experiment-console"
 SEED_STATE_DIR=""
 LEGACY_ARCHIVE=""
+FRESH_V2_LEDGER=0
 APPLY=0
 
 usage() {
-  echo "Usage: $0 [--apply] [--seed-state-dir DIR] [--legacy-archive FILE] [--host HOST] [--port PORT] [--user USER] [--remote-base PATH]" >&2
+  echo "Usage: $0 [--apply] [--fresh-v2-ledger | --seed-state-dir DIR] [--legacy-archive FILE] [--host HOST] [--port PORT] [--user USER] [--remote-base PATH]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -23,10 +24,16 @@ while [[ $# -gt 0 ]]; do
     --remote-base) REMOTE_BASE="$2"; shift 2 ;;
     --seed-state-dir) SEED_STATE_DIR="$2"; shift 2 ;;
     --legacy-archive) LEGACY_ARCHIVE="$2"; shift 2 ;;
+    --fresh-v2-ledger) FRESH_V2_LEDGER=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage; exit 2 ;;
   esac
 done
+
+if [[ "$FRESH_V2_LEDGER" == "1" && -n "$SEED_STATE_DIR" ]]; then
+  echo "--fresh-v2-ledger and --seed-state-dir are mutually exclusive" >&2
+  exit 2
+fi
 
 [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || { echo "Invalid SSH port" >&2; exit 2; }
 [[ "$SSH_HOST" =~ ^[A-Za-z0-9.-]+$ ]] || { echo "Invalid SSH host" >&2; exit 2; }
@@ -59,6 +66,7 @@ echo "release=$remote_release"
 echo "secrets=pre-provisioned-on-Yggdrasil (never uploaded or printed)"
 echo "seed_state=${SEED_STATE_DIR:-none}"
 echo "legacy_archive=${LEGACY_ARCHIVE:-none}"
+echo "fresh_v2_ledger=$FRESH_V2_LEDGER"
 if [[ "$APPLY" != "1" ]]; then
   echo "DRY RUN: no SSH, rsync, Docker, or remote write was performed."
   exit 0
@@ -98,5 +106,9 @@ if [[ -n "$LEGACY_ARCHIVE" ]]; then
   rsync -az -e "$rsync_ssh" "$LEGACY_ARCHIVE" "$LEGACY_ARCHIVE.sha256" "$LEGACY_ARCHIVE.manifest.json" "$target:$REMOTE_BASE/archives/"
   ssh "${ssh_opts[@]}" "$target" "chmod 0400 '$REMOTE_BASE/archives/$archive_name' '$REMOTE_BASE/archives/$archive_name.sha256' '$REMOTE_BASE/archives/$archive_name.manifest.json'"
 fi
+activation_args=(--base "$REMOTE_BASE" --release "$remote_release" --apply)
+if [[ "$FRESH_V2_LEDGER" == "1" ]]; then
+  activation_args+=(--fresh-v2-ledger)
+fi
 ssh "${ssh_opts[@]}" "$target" /bin/bash "$remote_release/deploy/yggdrasil/activate-release.sh" \
-  --base "$REMOTE_BASE" --release "$remote_release" --apply
+  "${activation_args[@]}"

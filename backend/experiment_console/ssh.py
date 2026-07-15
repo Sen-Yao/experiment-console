@@ -403,7 +403,18 @@ try:
     state = getattr(sweep, "state", None) if sweep is not None else None
     print(json.dumps({"ok": True, "classification": "auth_ok", "has_key": True, "target_accessible": True, "sweep_state": state}))
 except Exception as exc:
-    print(json.dumps({"ok": False, "classification": "wandb_auth_failed", "has_key": True, "target_accessible": False, "error": str(exc)}))
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    classification = "auth_required" if status_code in (401, 403) else "wandb_unavailable_reconciling"
+    print(json.dumps({
+        "ok": False,
+        "classification": classification,
+        "has_key": True,
+        "target_accessible": False,
+        "status_code": status_code,
+        "error_type": type(exc).__name__,
+        "error": str(exc),
+    }))
 """
         script = script.replace("__SWEEP_PATH__", repr(sweep_path))
         prefix = f"cd {shlex.quote(remote_cwd)} && " if remote_cwd else ""
@@ -714,6 +725,7 @@ def live_receipts_for_gpu(gpu_index, agents=None):
 launched = []
 failed = []
 skipped = []
+stale_receipts = []
 agents = discover_agents()
 assignments = current_assignments(agents)
 
@@ -727,6 +739,18 @@ for gpu_index in sorted({int(item) for item in eligible_gpu_indices if int(item)
     with os.fdopen(lock_descriptor, "r+") as lock_handle:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
         agents = discover_agents()
+        pattern = "*/*/gpu_%d_generation_*.json" % gpu_index
+        for stale_path in root.glob(pattern):
+            stale_receipt = read_json(stale_path)
+            if stale_receipt and not receipt_is_live(stale_receipt, agents):
+                archived = stale_path.with_name(stale_path.name + ".stale." + stamp().replace(":", ""))
+                os.replace(stale_path, archived)
+                stale_receipts.append({
+                    "gpu_index": gpu_index,
+                    "receipt_path": str(stale_path),
+                    "archived_path": str(archived),
+                    "classification": "stale_receipt_reclaimed",
+                })
         occupied = [item for item in agents if item.get("gpu_index") == gpu_index]
         occupied_receipts = live_receipts_for_gpu(gpu_index, agents)
         same_sweep = [item for item in occupied if item.get("sweep_path") == sweep_path]
@@ -832,6 +856,7 @@ print(json.dumps({
     "launched": launched,
     "failed": failed,
     "skipped": skipped,
+    "stale_receipts": stale_receipts,
     "occupied_gpus": occupied_gpus,
     "receipt_root": str(root),
     "observed_at": stamp(),
@@ -1077,6 +1102,30 @@ def read_cmdline(pid):
         return []
     return [part.decode("utf-8", "replace") for part in raw.split(b"\\0") if part]
 
+def read_environ(pid):
+    try:
+        raw = open(os.path.join(proc_root, str(pid), "environ"), "rb").read()
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+        return {}
+    values = {}
+    for part in raw.split(b"\\0"):
+        if b"=" in part:
+            key, value = part.split(b"=", 1)
+            values[key.decode("utf-8", "replace")] = value.decode("utf-8", "replace")
+    return values
+
+def process_identity(pid):
+    try:
+        text = open(os.path.join(proc_root, str(pid), "stat"), encoding="utf-8").read()
+        tail = text[text.rfind(")") + 2:].split()
+        return {"session_id": int(tail[3]), "pid_start_ticks": int(tail[19])}
+    except Exception:
+        return {"session_id": None, "pid_start_ticks": None}
+
+def visible_gpu(pid):
+    value = str(read_environ(pid).get("CUDA_VISIBLE_DEVICES") or "").strip()
+    return int(value) if value.isdigit() else None
+
 def matches_sweep(argv):
     if not argv or not sweep_path:
         return False
@@ -1093,7 +1142,7 @@ all_pids = sorted({int(path.rsplit("/", 1)[-1]) for path in glob.glob(os.path.jo
 for pid in all_pids:
     argv = read_cmdline(pid)
     if matches_sweep(argv):
-        matched.append({"pid": str(pid)})
+        matched.append({"pid": str(pid), "gpu_index": visible_gpu(pid), **process_identity(pid)})
 for pid in pids:
     argv = read_cmdline(pid)
     if argv is None:

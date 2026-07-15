@@ -25,6 +25,11 @@ not hold a second ledger and does not monitor experiments with a model turn.
   the first observation, but bridge events are emitted only after the configured
   consecutive-count and grace-time thresholds. Any mismatch blocks queue
   advancement immediately; the grace window delays escalation, not safety.
+- W&B dependency health is aggregated by endpoint/credential scope and SSH
+  health by remote host. Transient failures remain `*_unavailable_reconciling`
+  until both 15 minutes and three attempts have elapsed; attention does not
+  stop the bounded 10-minute retry loop. Explicit authentication and SSH
+  configuration failures pause immediately for repair.
 
 ## Four-Credential Isolation
 
@@ -83,54 +88,32 @@ The production env file contains paths and identity settings, never secret
 values. `activate-release.sh` refuses a non-authoritative role, a development
 instance id, missing credential files, or any shared credential path.
 
-## Selective Runtime Migration
+## One-Time Fresh V2 Cutover
 
-Freeze the local Console mutating path before migration. Run a dry-run first.
-The allow-list contains exactly the current Elliptic training job and the
-authorized Amazon queued job; names and broad `CJNV` matches are not accepted.
+The v2 controller is a hard cutover. It does not import jobs, intents, monitor
+schedules, wake events, dependency episodes, results, or W&B sweep references
+from the previous ledger. There is no runtime compatibility switch.
 
-```bash
-python3 scripts/migrate_runtime_to_yggdrasil.py \
-  --source-state-dir /private/tmp/experiment-console-runtime \
-  --target-state-dir /private/tmp/experiment-console-production-seed \
-  --archive-dir "$HOME/Documents/Codex/experiment-console-archives" \
-  --thread-id THREAD_ID_FOR_CURRENT_CJNV_TASK \
-  --job-id job_20260711_233447_cjnv_a3_elliptic_fixedtail_training_permutation_audit_5x_85d0254a \
-  --reconcile-job-id job_20260711_233447_cjnv_a3_elliptic_fixedtail_training_permutation_audit_5x_85d0254a \
-  --result-contract job_20260711_233447_cjnv_a3_elliptic_fixedtail_training_permutation_audit_5x_85d0254a=deploy/yggdrasil/result-contracts/cjnv-a3-elliptic-training.json \
-  --job-id job_20260711_225120_cjnv_a3_amazon_fixedtail_training_permutation_audit_5x5_4988b076 \
-  --result-contract job_20260711_225120_cjnv_a3_amazon_fixedtail_training_permutation_audit_5x5_4988b076=deploy/yggdrasil/result-contracts/cjnv-a3-amazon-training.json
-```
+Before applying the cutover, verify every job in the current authority is
+terminal. Activation repeats this check inside the running source container and
+refuses to stop it when any job is `planned`, `queued`, `validating`, `running`,
+`finalizing`, `attention`, or `unknown`.
 
-The dry-run must report `selected_count=2`, no ambiguities, Elliptic
-`finished -> unknown`, and Amazon `queued -> queued`. Then repeat with:
+Activation then:
 
-```text
---apply --confirm-source-frozen
-```
+- stops the current Console and creates a paired, checksummed cold backup of
+  state and results;
+- empties both hot paths and lets the v2 application create a new SQLite
+  ledger at `/mnt/user/appdata/experiment-console/state/console.sqlite3`;
+- requires contract `runner_console_agent_v2`, schema version `2`, the two
+  dependency-health tables, a changed ledger id, zero operational records, and
+  no `cutover_committed_at` value;
+- writes a read-only receipt under
+  `/mnt/user/appdata/experiment-console/cutovers/` with the old/new ledger ids
+  and backup path.
 
-Migration behavior:
-
-- archives the complete old runtime, including the large audit and historical
-  results, plus a consistent SQLite backup;
-- makes the archive and checksum read-only (`0400`);
-- initializes the target schema through the current application, not copied
-  legacy DDL;
-- imports exactly the two allow-listed jobs and no old intents/events;
-- clears operation payloads and cron/Hermes/OpenClaw/heartbeat metadata;
-- preserves Amazon's queue group, payload, `created_at`, and sequential policy,
-  while dropping the stale blocker id so the authoritative reconciler derives
-  the real blocker;
-- embeds a validated `ResultContract` for each job;
-- creates one active monitor schedule per imported job with the same task id
-  and `next_run_at` set to migration time;
-- does not import the multi-gigabyte audit/results history into the hot state.
-
-`migration_manifest.json` records the exact source-to-target status mapping,
-contract digests, schedule count, reconcile list, original queue blocker, and
-all excluded legacy categories. Any ambiguous terminal classification, missing
-contract, missing explicit job id, source change during archive, or target
-verification failure aborts the migration. Target installation is atomic.
+The operation is one-time. A second fresh cutover is refused after the first v2
+Job write records `cutover_committed_at`.
 
 ## Deploy And Verify
 
@@ -139,36 +122,40 @@ All mutating wrappers are dry-run by default and use the direct Yggdrasil route
 
 ```bash
 ./scripts/deploy_yggdrasil_experiment_console.sh \
-  --seed-state-dir /private/tmp/experiment-console-production-seed \
-  --legacy-archive /path/to/legacy-runtime-MIGRATION_ID.tar.gz
+  --fresh-v2-ledger
 
 ./scripts/deploy_yggdrasil_experiment_console.sh --apply \
-  --seed-state-dir /private/tmp/experiment-console-production-seed \
-  --legacy-archive /path/to/legacy-runtime-MIGRATION_ID.tar.gz
+  --fresh-v2-ledger
 
 ./scripts/verify_yggdrasil_experiment_console.sh \
-  --expected-instance yggdrasil-production
+  --expected-instance yggdrasil-production \
+  --require-fresh-v2-cutover \
+  --require-empty-ledger
 ```
 
-The seed is accepted only when the remote authoritative ledger does not yet
-exist. Verification requires:
+Fresh cutover and seed migration flags are mutually exclusive. Verification
+before the smoke requires:
 
 - healthy non-root `linux/amd64` container;
 - loopback-only published API port;
 - read-only credential/config mounts and writable state/results mounts;
-- `authority_role=authoritative`, matching `instance_id`, and non-empty stable
-  `ledger_id`;
+- `authority_role=authoritative`, matching `instance_id`, contract
+  `runner_console_agent_v2`, schema version `2`, and a ledger id different from
+  the receipt's previous id;
 - worker enabled, ready, running, and holding the singleton lease;
 - non-empty Console API secret mounted read-only; protected APIs reject missing
   or incorrect bearer credentials;
-- SQLite `quick_check=ok` with all control-plane tables;
-- every imported migration job has a schedule, and every non-terminal/queued
-  job with a result contract has an active schedule. Future sweep/register
-  calls bind their schedule atomically when both `result_contract` and
-  `thread_id` are supplied.
+- SQLite `quick_check=ok`, including `dependency_episodes` and
+  `dependency_impacts`;
+- zero jobs, intents, schedules, wake events, source observations, dependency
+  episodes, and dependency impacts, with no `cutover_committed_at`;
+- direct Console-to-W&B and Console-to-HCCS W&B authentication probes.
 
-Only after this verification should `./scripts/exp` and the Desktop bridge use
-the local SSH forward. Do not run local and Yggdrasil mutating Consoles in
+Only after this verification should the runner and stopped Desktop bridge be
+repinned to the receipt's new ledger id. Then run the single-run/single-agent
+smoke. After the smoke, run the verifier again without
+`--require-empty-ledger`; the health response must now include a non-empty
+`cutover_committed_at`. Do not run local and Yggdrasil mutating Consoles in
 parallel.
 
 ## Backup And Rollback
@@ -200,3 +187,8 @@ Manual rollback requires an explicit backup path and `--apply`:
 
 Rollback retains the displaced state/results directories for a second recovery
 path rather than deleting them.
+
+For the fresh v2 cutover, full rollback is permitted only while
+`cutover_committed_at` is absent. The first v2 Job write sets that metadata.
+Afterward `rollback-release.sh` refuses the restore and operations must deploy a
+forward fix against the new ledger.

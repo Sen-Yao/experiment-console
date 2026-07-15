@@ -5,6 +5,7 @@ import os
 import signal
 import subprocess
 import time
+from pathlib import Path
 
 import pytest
 
@@ -218,6 +219,59 @@ def test_agent_reconciler_recovers_lost_ssh_ack_from_remote_receipt_without_dupl
             pass
 
 
+def test_agent_reconciler_atomically_archives_confirmed_stale_receipt_before_reuse(tmp_path, monkeypatch):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    wandb = bin_dir / "wandb"
+    wandb.write_text("#!/usr/bin/env python3\nimport time\ntime.sleep(30)\n", encoding="utf-8")
+    wandb.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+    receipt_root = tmp_path / "remote-state" / "agent-receipts"
+    stale_dir = receipt_root / "old-job" / "HCCS_DualRefGAD_old-sweep"
+    stale_dir.mkdir(parents=True)
+    stale_path = stale_dir / "gpu_3_generation_1.json"
+    stale_path.write_text(json.dumps({
+        "version": 1,
+        "job_id": "old-job",
+        "sweep_path": "HCCS/DualRefGAD/old-sweep",
+        "gpu_index": 3,
+        "generation": 1,
+        "pid": "99999999",
+        "session_id": 99999999,
+        "pid_start_ticks": 1,
+    }), encoding="utf-8")
+    ssh = SSHExecutor(Settings(state_dir=tmp_path, command_timeout_seconds=10), runner=LocalRemotePythonRunner())
+
+    result = ssh.reconcile_agent_capacity(
+        host="local",
+        job_id="new-job",
+        remote_cwd=str(tmp_path),
+        sweep_path="HCCS/DualRefGAD/new-sweep",
+        desired_agents=1,
+        eligible_gpu_indices=[3],
+        conda_env=None,
+        conda_sh="/unused/conda.sh",
+        wandb_api_key="secret",
+        receipt_root=str(receipt_root),
+    )
+    new_receipt = result["assignments"][0]
+    try:
+        assert result["live_agents"] == 1
+        assert result["stale_receipts"] == [{
+            "gpu_index": 3,
+            "receipt_path": str(stale_path),
+            "archived_path": result["stale_receipts"][0]["archived_path"],
+            "classification": "stale_receipt_reclaimed",
+        }]
+        assert not stale_path.exists()
+        assert Path(result["stale_receipts"][0]["archived_path"]).exists()
+    finally:
+        try:
+            os.killpg(int(new_receipt["session_id"]), signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+
 def test_stop_agents_uses_exact_proc_cmdline_matching(tmp_path):
     runner = RecordingRunner()
     ssh = SSHExecutor(Settings(state_dir=tmp_path), runner=runner)
@@ -280,6 +334,12 @@ def test_agent_probe_and_stop_match_exact_wandb_sweep_process(tmp_path):
         )
         assert probe["alive_pids"] == [str(agent.pid)]
         assert probe["unmatched_reused_pids"] == []
+        assert probe["pgrep"] == [{
+            "pid": str(agent.pid),
+            "gpu_index": None,
+            "session_id": None,
+            "pid_start_ticks": None,
+        }]
 
         stopped = ssh.stop_agents(
             host="local", sweep_path=sweep_path, pids=[str(agent.pid)], proc_root=str(proc_root),

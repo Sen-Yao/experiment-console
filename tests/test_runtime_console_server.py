@@ -35,7 +35,7 @@ def test_runtime_health_exposes_console_contract():
     data = client.get("/health").json()
     assert data["status"] == "ok"
     assert data["runtime"] == "experiment_console_runtime"
-    assert data["contract"] == "runner_console_agent_v1"
+    assert data["contract"] == "runner_console_agent_v2"
 
 
 def test_runtime_mounts_runner_contract(monkeypatch):

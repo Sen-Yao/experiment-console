@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import hashlib
 import os
+import sqlite3
 import subprocess
 import tarfile
 from pathlib import Path
@@ -82,17 +83,27 @@ def test_container_health_requires_authority_ledger_and_worker_lease():
     assert not module.worker_ready({
         "monitor_worker": {"enabled": True, "ready": True, "running": True, "lease_held": False}
     }, require_lease=True)
+    source = path.read_text(encoding="utf-8")
+    assert 'payload.get("contract") != "runner_console_agent_v2"' in source
+    assert 'str(payload.get("ledger_schema_version")) != "2"' in source
 
 
-def test_production_activation_requires_seed_and_verifier_probes_real_dependencies():
+def test_production_activation_supports_fresh_v2_cutover_and_verifier_probes_real_dependencies():
     activation = (ROOT / "deploy" / "yggdrasil" / "activate-release.sh").read_text(encoding="utf-8")
-    assert "first authoritative deployment requires an explicit migration seed" in activation
+    assert "first authoritative deployment requires an explicit migration seed or --fresh-v2-ledger" in activation
     assert "migration seed refused because the authoritative ledger already exists" in activation
+    assert "fresh v2 cutover refused while" in activation
+    assert "dependency_episodes" in activation
+    assert "dependency_impacts" in activation
+    assert "verified_empty=1" in activation
     assert 'NEW_RELEASE="$RELEASE"' in activation
     assert 'RELEASE="$NEW_RELEASE"' in activation
     verifier = (ROOT / "deploy" / "yggdrasil" / "verify-release.sh").read_text(encoding="utf-8")
     assert "WandBClient(settings).discover_sweeps" in verifier
-    assert "/api/runner/auth-check" in verifier
+    assert "SSHExecutor(settings).auth_check" in verifier
+    assert 'health.get("contract") == "runner_console_agent_v2"' in verifier
+    assert 'str(health.get("ledger_schema_version")) == "2"' in verifier
+    assert "require_empty_ledger" in verifier
     assert '"hccs_wandb_auth_probe": "ok"' in verifier
 
 
@@ -317,6 +328,23 @@ def _write_fake_activation_commands(fake_bin: Path) -> None:
 if [[ "${FAIL_ACTIVATION_STEP:-}" == "start" && " $* " == *" up "* ]]; then
   exit 43
 fi
+if [[ "${FAKE_DOCKER_MODE:-}" == "fresh" ]]; then
+  if [[ "$1" == "compose" && " $* " == *" ps "* ]]; then
+    echo fake-console-cid
+  elif [[ "$1" == "compose" && " $* " == *" up "* ]]; then
+    touch "$FAKE_DOCKER_STATE"
+  elif [[ "$1" == "inspect" && "$*" == *".State.Running"* ]]; then
+    echo true
+  elif [[ "$1" == "inspect" && "$*" == *".State.Health"* ]]; then
+    echo healthy
+  elif [[ "$1" == "exec" && -e "$FAKE_DOCKER_STATE" ]]; then
+    echo ledger_new_v2
+  elif [[ "$1" == "exec" ]]; then
+    echo ledger_old_v1
+    echo "${FAKE_NONTERMINAL_JOBS:-0}"
+    echo __none__
+  fi
+fi
 exit 0
 """,
         "cp": """#!/bin/bash
@@ -395,7 +423,9 @@ def test_post_backup_activation_failure_rolls_back_exactly_once(tmp_path: Path, 
     _write_production_context(base, release, state, results)
     seed = release / "migration-seed"
     seed.mkdir()
-    (seed / "console.sqlite3").write_text("seed-ledger", encoding="utf-8")
+    with sqlite3.connect(seed / "console.sqlite3") as connection:
+        connection.execute("CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)")
+        connection.execute("INSERT INTO metadata VALUES ('ledger_id', 'ledger_seed', 'now')")
     (seed / "migration_manifest.json").write_text("{}\n", encoding="utf-8")
 
     fake_bin = tmp_path / "fake-bin"
@@ -427,6 +457,105 @@ def test_post_backup_activation_failure_rolls_back_exactly_once(tmp_path: Path, 
     assert not (state / "console.sqlite3").exists()
     assert not (base / "current").exists()
     assert len([path for path in (base / "backups").iterdir() if not path.name.startswith(".")]) == 1
+
+
+def test_fresh_v2_activation_backs_up_then_starts_empty_ledger(tmp_path: Path):
+    base = tmp_path / "experiment-console"
+    old_release = base / "releases" / "old"
+    new_release = base / "releases" / "new"
+    state = base / "state"
+    results = base / "results"
+    state.mkdir(parents=True)
+    results.mkdir(parents=True)
+    (state / "console.sqlite3").write_text("old-ledger-placeholder", encoding="utf-8")
+    (state / "old-audit.jsonl").write_text("old", encoding="utf-8")
+    (results / "old-result.json").write_text("old", encoding="utf-8")
+    _write_production_context(base, new_release, state, results)
+    old_release.mkdir(parents=True)
+    (old_release / "compose.yggdrasil.yaml").write_text("services: {}\n", encoding="utf-8")
+    (base / "current").symlink_to(old_release)
+
+    fake_bin = tmp_path / "fake-bin"
+    _write_fake_activation_commands(fake_bin)
+    fake_state = tmp_path / "console-started"
+    environment = {
+        **os.environ,
+        "PATH": f"{fake_bin}:/usr/bin:/bin:/usr/sbin:/sbin",
+        "FAKE_DOCKER_MODE": "fresh",
+        "FAKE_DOCKER_STATE": str(fake_state),
+    }
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            str(ROOT / "deploy" / "yggdrasil" / "activate-release.sh"),
+            "--base", str(base),
+            "--release", str(new_release),
+            "--fresh-v2-ledger",
+            "--apply",
+        ],
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (base / "current").resolve() == new_release.resolve()
+    assert not list(state.iterdir())
+    assert not list(results.iterdir())
+    backups = [path for path in (base / "backups").iterdir() if not path.name.startswith(".")]
+    assert len(backups) == 1
+    receipt = base / "cutovers" / "new.meta"
+    receipt_text = receipt.read_text(encoding="utf-8")
+    assert "previous_ledger_id=ledger_old_v1" in receipt_text
+    assert "new_ledger_id=ledger_new_v2" in receipt_text
+    assert "verified_empty=1" in receipt_text
+
+
+def test_fresh_v2_activation_refuses_nonterminal_jobs(tmp_path: Path):
+    base = tmp_path / "experiment-console"
+    old_release = base / "releases" / "old"
+    new_release = base / "releases" / "new"
+    state = base / "state"
+    results = base / "results"
+    state.mkdir(parents=True)
+    results.mkdir(parents=True)
+    (state / "console.sqlite3").write_text("old-ledger-placeholder", encoding="utf-8")
+    (state / "preserve").write_text("yes", encoding="utf-8")
+    _write_production_context(base, new_release, state, results)
+    old_release.mkdir(parents=True)
+    (old_release / "compose.yggdrasil.yaml").write_text("services: {}\n", encoding="utf-8")
+    (base / "current").symlink_to(old_release)
+    fake_bin = tmp_path / "fake-bin"
+    _write_fake_activation_commands(fake_bin)
+    environment = {
+        **os.environ,
+        "PATH": f"{fake_bin}:/usr/bin:/bin:/usr/sbin:/sbin",
+        "FAKE_DOCKER_MODE": "fresh",
+        "FAKE_DOCKER_STATE": str(tmp_path / "console-started"),
+        "FAKE_NONTERMINAL_JOBS": "2",
+    }
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            str(ROOT / "deploy" / "yggdrasil" / "activate-release.sh"),
+            "--base", str(base),
+            "--release", str(new_release),
+            "--fresh-v2-ledger",
+            "--apply",
+        ],
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "refused while 2 jobs are nonterminal" in result.stderr
+    assert (state / "preserve").read_text(encoding="utf-8") == "yes"
+    assert not (base / "backups").exists()
 
 
 @pytest.mark.parametrize("failed_directory", ["state", "results"])
@@ -479,6 +608,47 @@ exec /bin/mv "$@"
     assert (results / "live-result").read_text(encoding="utf-8") == "result"
     assert not list(base.glob("state.pre-rollback-*"))
     assert not list(base.glob("results.pre-rollback-*"))
+
+
+def test_rollback_refuses_after_cutover_commit(tmp_path: Path):
+    base = tmp_path / "experiment-console"
+    release = base / "releases" / "current"
+    state = base / "state"
+    results = base / "results"
+    backup = base / "backups" / "pre-cutover"
+    state.mkdir(parents=True)
+    results.mkdir(parents=True)
+    _write_production_context(base, release, state, results)
+    (base / "current").symlink_to(release)
+    with sqlite3.connect(state / "console.sqlite3") as connection:
+        connection.execute("CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)")
+        connection.execute(
+            "INSERT INTO metadata VALUES ('cutover_committed_at', '2026-07-15T01:02:03+00:00', '2026-07-15T01:02:03+00:00')"
+        )
+    (results / "live-result").write_text("preserve", encoding="utf-8")
+    _write_paired_backup(backup, state, results)
+    fake_bin = tmp_path / "fake-bin"
+    _write_fake_activation_commands(fake_bin)
+    environment = {**os.environ, "PATH": f"{fake_bin}:/usr/bin:/bin:/usr/sbin:/sbin"}
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            str(ROOT / "deploy" / "yggdrasil" / "rollback-release.sh"),
+            "--base", str(base),
+            "--backup-dir", str(backup),
+            "--apply",
+        ],
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "rollback refused after cutover_committed_at=" in result.stderr
+    assert (state / "console.sqlite3").exists()
+    assert (results / "live-result").read_text(encoding="utf-8") == "preserve"
 
 
 @pytest.mark.parametrize("layout", ["same", "nested", "reverse-nested", "outside"])

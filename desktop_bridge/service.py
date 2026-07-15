@@ -426,7 +426,8 @@ class BridgeService:
         if len(encoded.encode("utf-8")) > self.config.max_handoff_bytes:
             raise ConsoleContractError("actionable event handoff exceeds max_handoff_bytes after compaction")
         return (
-            "Experiment Console emitted actionable state changes for this existing research task. "
+            "Experiment Console emitted state changes for this existing research task. "
+            "Use each payload's action_required field to distinguish attention from recovery. "
             "Handle the merged handoff below. Do not create a heartbeat or keep a Goal active merely "
             "to wait for external experiments; the Console will emit another event when action is needed.\n\n"
             f"```json\n{encoded}\n```"

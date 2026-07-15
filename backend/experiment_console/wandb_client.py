@@ -14,7 +14,28 @@ from .validation import expected_run_count, load_yaml
 
 
 class WandBUnavailable(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        classification: str = "wandb_unavailable_reconciling",
+        transient: bool = True,
+        status_code: int | None = None,
+    ):
+        self.classification = classification
+        self.transient = transient
+        self.status_code = status_code
+        super().__init__(message)
+
+
+class WandBAuthRequired(WandBUnavailable):
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(
+            message,
+            classification="auth_required",
+            transient=False,
+            status_code=status_code,
+        )
 
 
 def parse_sweep_id(text: str) -> str | None:
@@ -44,7 +65,7 @@ class WandBClient:
     def _headers(self) -> dict[str, str]:
         api_key = self._api_key()
         if not api_key:
-            raise WandBUnavailable(f"{self.settings.wandb_api_key_env} is not set")
+            raise WandBAuthRequired(f"{self.settings.wandb_api_key_env} is not set")
         return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
     def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
@@ -58,6 +79,11 @@ class WandBClient:
         except Exception as exc:
             if isinstance(exc, WandBUnavailable):
                 raise
+            if isinstance(exc, requests.HTTPError):
+                status_code = exc.response.status_code if exc.response is not None else None
+                if status_code in {401, 403}:
+                    raise WandBAuthRequired(f"W&B API returned HTTP {status_code}", status_code=status_code) from exc
+                raise WandBUnavailable(str(exc), status_code=status_code) from exc
             raise WandBUnavailable(str(exc)) from exc
 
     def create_sweep(self, config_path: Path, *, entity: str, project: str) -> dict[str, Any]:

@@ -44,6 +44,12 @@ def main() -> int:
     if not payload.get("ledger_id"):
         print("API ledger id is empty", file=sys.stderr)
         return 1
+    if payload.get("contract") != "runner_console_agent_v2":
+        print("API runner contract is not v2", file=sys.stderr)
+        return 1
+    if str(payload.get("ledger_schema_version")) != "2":
+        print("API ledger schema is not v2", file=sys.stderr)
+        return 1
     if not payload.get("console_api_auth_configured"):
         print("Console API bearer auth is not configured", file=sys.stderr)
         return 1

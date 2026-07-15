@@ -202,6 +202,7 @@ class RecoverAgentsPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     job_id: str
+    confirmed_failure_resolved: bool = False
     idempotency_key: str | None = None
 
 

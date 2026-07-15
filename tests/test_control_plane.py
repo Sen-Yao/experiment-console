@@ -14,6 +14,7 @@ from experiment_console.service import ConsoleService
 from experiment_console.monitor import MonitorWorker
 from experiment_console.state import InvalidTransition, validate_job_transition
 from experiment_console.store import ConsoleStore
+from experiment_console.wandb_client import WandBUnavailable
 
 
 class FakeWandB:
@@ -1762,7 +1763,9 @@ def test_agent_reconciler_treats_no_eligible_gpu_as_normal_wait(tmp_path):
     assert launched.classification == "agent_capacity_pending"
     assert launched.job.status == JobStatus.running
     assert launched.job.monitor["agent_reconciler"]["classification"] == "resource_wait"
-    assert launched.job.monitor["agent_reconciler"]["zero_capacity_failures"] == 0
+    assert "zero_capacity_failures" not in launched.job.monitor["agent_reconciler"]
+    assert launched.job.monitor["agent_reconciler"]["hardware_eligible_gpus"] == []
+    assert launched.job.monitor["agent_reconciler"]["allocatable_gpus"] == []
     assert status.classification == "ok"
     assert status.result["agent"]["health"] == "waiting_for_capacity"
 
@@ -1812,15 +1815,18 @@ def test_agent_reconciler_wakes_once_after_three_eligible_launch_failures(tmp_pa
     events = service.store.claim_wake_events(consumer_id="bridge", limit=10, lease_seconds=60)
 
     assert third["classification"] == "agent_capacity_attention"
-    assert "eligible_gpu_launch_failures" in third["attention_reasons"]
+    assert "agent_launch_failed" in third["attention_reasons"]
     assert fourth["classification"] == "agent_capacity_attention"
     assert service.store.get_job(launched.job_id).status == JobStatus.attention
     assert [(event["kind"], event["payload"]["classification"]) for event in events] == [
-        ("attention", "agent_capacity_attention")
+        ("attention", "agent_launch_failed")
     ]
+    assert events[0]["payload"]["duration_seconds"] >= 0
+    assert events[0]["payload"]["capacity"]["desired_agents"] == 1
+    assert events[0]["payload"]["capacity"]["live_agents"] == 0
 
 
-def test_agent_reconciler_wakes_after_fifteen_minutes_without_first_agent(tmp_path):
+def test_agent_reconciler_keeps_resource_wait_non_actionable_after_fifteen_minutes(tmp_path):
     settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
     ssh = FakeSSH()
     ssh.gpu_rows = []
@@ -1835,14 +1841,167 @@ def test_agent_reconciler_wakes_after_fifteen_minutes_without_first_agent(tmp_pa
     })
     job = service.store.get_job(launched.job_id)
     state = job.monitor["agent_reconciler"]
-    state["first_zero_capacity_at"] = (datetime.now(timezone.utc) - timedelta(minutes=16)).isoformat(timespec="seconds")
     state["next_reconcile_at"] = "2000-01-01T00:00:00+00:00"
     service.store.upsert_job(job)
 
     result = service.reconcile_agent_capacity(job.job_id, force=True)
 
-    assert result["classification"] == "agent_capacity_attention"
-    assert result["attention_reasons"] == ["zero_capacity_timeout"]
+    assert result["classification"] == "resource_wait"
+    assert result["attention_reasons"] == []
+    assert service.store.get_job(job.job_id).status == JobStatus.running
+
+
+def test_wandb_outage_aggregates_jobs_escalates_by_time_and_recovers_from_status(tmp_path):
+    class FlakyWandB(FakeWandB):
+        unavailable = True
+
+        def get_sweep_state(self, entity, project, sweep_id):
+            if self.unavailable:
+                raise WandBUnavailable("TLS EOF while reading W&B GraphQL response")
+            return super().get_sweep_state(entity, project, sweep_id)
+
+    settings = Settings(
+        state_dir=tmp_path,
+        default_entity="my-team",
+        default_project="my-project",
+        authority_role="authoritative",
+    )
+    ssh = FakeSSH()
+    wandb = FlakyWandB()
+    service = ConsoleService(
+        settings=settings,
+        store=ConsoleStore(settings.sqlite_path, settings.audit_path),
+        wandb=wandb,
+        ssh=ssh,
+    )
+    payload = {
+        "config_path": write_sweep_config(tmp_path / "wandb-outage.yaml"),
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "max_agents": 1,
+        "queue_policy": "immediate",
+        "thread_id": "thread-shared-wandb-outage",
+        "result_contract": {
+            "expected_runs": 1,
+            "output_globs": ["outputs/cora_{run_id}.json"],
+            "discovery_mode": "run_id_output_globs_v1",
+        },
+    }
+    first = service.runner_command(IntentType.launch_sweep, {
+        **payload,
+        "job_name": "wandb-outage-a",
+        "idempotency_key": "wandb-outage-a",
+    })
+    second = service.runner_command(IntentType.launch_sweep, {
+        **payload,
+        "job_name": "wandb-outage-b",
+        "idempotency_key": "wandb-outage-b",
+    })
+
+    first_job = service.store.get_job(first.job_id)
+    failure = first_job.monitor["agent_reconciler"]["current_failure"]
+    assert failure["classification"] == "wandb_unavailable_reconciling"
+    assert failure["action_required"] is False
+    assert "zero_capacity_failures" not in first_job.monitor["agent_reconciler"]
+    assert service.store.claim_wake_events(consumer_id="early", limit=10, lease_seconds=60) == []
+
+    episode = service.store.get_dependency_episode(failure["dependency_key"])
+    episode["first_seen_at"] = (datetime.now(timezone.utc) - timedelta(minutes=16)).isoformat(timespec="seconds")
+    episode["next_retry_at"] = "2000-01-01T00:00:00+00:00"
+    service.store.upsert_dependency_episode(
+        episode,
+        job_id=first.job_id,
+        thread_id="thread-shared-wandb-outage",
+    )
+    escalated = service.reconcile_agent_capacity(first.job_id, force=True)
+    events_before_recovery = service.store.claim_wake_events(consumer_id="bridge", limit=10, lease_seconds=60)
+
+    assert escalated["classification"] == "wandb_unavailable_reconciling"
+    assert service.store.get_job(first.job_id).status == JobStatus.attention
+    assert len(events_before_recovery) == 1
+    assert events_before_recovery[0]["kind"] == "attention"
+    assert sorted(events_before_recovery[0]["payload"]["affected_job_ids"]) == sorted([first.job_id, second.job_id])
+    assert events_before_recovery[0]["payload"]["auto_retry_active"] is True
+    assert events_before_recovery[0]["payload"]["next_retry_at"] > datetime.now(timezone.utc).isoformat(timespec="seconds")
+    assert sorted(events_before_recovery[0]["payload"]["capacity"]) == sorted([first.job_id, second.job_id])
+    assert events_before_recovery[0]["payload"]["forbidden_actions"] == ["create_duplicate_sweep", "blind_recover_agents"]
+    with pytest.raises(ValueError, match="current_failure is unresolved"):
+        service.runner_command(IntentType.recover_agents, {"job_id": first.job_id})
+
+    launches_before_status = len(ssh.launches)
+    wandb.unavailable = False
+    status = service.runner_command(IntentType.status_query, {"job_id": first.job_id})
+    refreshed_first = service.store.get_job(first.job_id)
+    refreshed_second = service.store.get_job(second.job_id)
+    recovery_events = service.store.claim_wake_events(consumer_id="bridge-recovery", limit=10, lease_seconds=60)
+
+    assert status.classification == "ok"
+    assert len(ssh.launches) == launches_before_status
+    assert refreshed_first.monitor["agent_reconciler"]["current_failure"] is None
+    assert refreshed_first.monitor["agent_reconciler"]["last_resolved_failure"]["source"] == "wandb"
+    assert refreshed_first.monitor["agent_reconciler"]["next_reconcile_at"] <= datetime.now(timezone.utc).isoformat(timespec="seconds")
+    assert refreshed_second.monitor["agent_reconciler"]["next_reconcile_at"] <= datetime.now(timezone.utc).isoformat(timespec="seconds")
+    assert [event["kind"] for event in recovery_events] == ["resolved"]
+    assert recovery_events[0]["payload"]["action_required"] is False
+
+
+def test_partial_agent_capacity_never_escalates_launch_failures(tmp_path):
+    class PartialCapacitySSH(FakeSSH):
+        def reconcile_agent_capacity(self, **kwargs):
+            assignment = {
+                "job_id": kwargs["job_id"],
+                "sweep_path": kwargs["sweep_path"],
+                "gpu_index": 0,
+                "pid": "1000",
+                "classification": "live_receipt",
+            }
+            return {
+                "classification": "capacity_launch_failed",
+                "desired_agents": kwargs["desired_agents"],
+                "live_agents": 1,
+                "assignments": [assignment],
+                "launched": [assignment],
+                "failed": [{"gpu_index": 1, "classification": "agent_launch_failed", "error": "deterministic failure"}],
+                "skipped": [],
+                "occupied_gpus": [0],
+            }
+
+    settings = Settings(
+        state_dir=tmp_path,
+        default_entity="my-team",
+        default_project="my-project",
+        authority_role="authoritative",
+    )
+    service = ConsoleService(
+        settings=settings,
+        store=ConsoleStore(settings.sqlite_path, settings.audit_path),
+        wandb=FakeWandB(),
+        ssh=PartialCapacitySSH(),
+    )
+    launched = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "partial-capacity",
+        "config_path": write_sweep_config(tmp_path / "partial-capacity.yaml"),
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "max_agents": 2,
+        "thread_id": "thread-partial-capacity",
+        "result_contract": {
+            "expected_runs": 5,
+            "output_globs": ["outputs/cora_{run_id}.json"],
+            "discovery_mode": "run_id_output_globs_v1",
+        },
+        "idempotency_key": "partial-capacity",
+    })
+    for _ in range(4):
+        result = service.reconcile_agent_capacity(launched.job_id, force=True)
+
+    refreshed = service.store.get_job(launched.job_id)
+    assert result["classification"] == "running_degraded"
+    assert refreshed.status == JobStatus.running
+    assert refreshed.monitor["agent_reconciler"]["live_agents"] == 1
+    assert refreshed.monitor["agent_reconciler"]["launch_failure_episode"] is None
+    assert refreshed.monitor["agent_reconciler"]["attention_reasons"] == []
+    assert service.store.claim_wake_events(consumer_id="bridge", limit=10, lease_seconds=60) == []
 
 
 def test_monitor_worker_runs_due_agent_reconciliation_without_monitor_schedule(tmp_path):
@@ -1990,8 +2149,19 @@ def test_agent_reconciler_marks_auth_failure_fatal_immediately(tmp_path):
     })
 
     assert launched.job.status == JobStatus.attention
-    assert launched.job.monitor["agent_reconciler"]["lifecycle"] == "fatal"
-    assert launched.job.monitor["agent_reconciler"]["classification"] == "wandb_auth_missing"
+    assert launched.job.monitor["agent_reconciler"]["lifecycle"] == "attention"
+    assert launched.job.monitor["agent_reconciler"]["classification"] == "auth_required"
+    assert launched.job.monitor["agent_reconciler"]["current_failure"]["auto_retry_active"] is False
+    assert launched.job.monitor["agent_reconciler"]["next_reconcile_at"] is None
+
+    ssh.auth_ok = True
+    auth = service.runner_command(IntentType.auth_check, {"job_id": launched.job_id})
+    refreshed = service.store.get_job(launched.job_id)
+
+    assert auth.classification == "auth_ok"
+    assert refreshed.status == JobStatus.running
+    assert refreshed.monitor["agent_reconciler"]["current_failure"] is None
+    assert refreshed.monitor["agent_reconciler"]["last_resolved_failure"]["classification"] == "auth_required"
     assert launched.job.monitor["agent_reconciler"]["next_reconcile_at"] is None
     assert ssh.agent_reconcile_calls == []
 
@@ -2884,7 +3054,7 @@ def test_monitor_tick_graces_degraded_wandb_status_before_wake(tmp_path):
     second = service.monitor_tick("job-wandb-outage")
     events = service.store.claim_wake_events(consumer_id="bridge", limit=10, lease_seconds=60)
 
-    assert first["classification"] == "degraded"
+    assert first["classification"] == "external_unavailable_reconciling"
     assert first["event_created"] is False
     assert second["classification"] == "external_unavailable"
     assert [(event["kind"], event["payload"]["classification"]) for event in events] == [("sync_error", "external_unavailable")]

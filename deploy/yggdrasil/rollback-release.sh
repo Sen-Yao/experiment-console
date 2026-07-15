@@ -105,6 +105,37 @@ if [[ -n "$CURRENT_RELEASE" && -r "$CURRENT_RELEASE/compose.yggdrasil.yaml" ]]; 
   load_production_context "$BASE" "$CURRENT_RELEASE"
   [[ "$STATE_PATH" == "$BACKUP_STATE_PATH" ]] || fail "backup state path does not match the current release context"
   [[ "$RESULTS_PATH" == "$BACKUP_RESULTS_PATH" ]] || fail "backup results path does not match the current release context"
+  cutover_commit=""
+  current_cid="$(container_id)"
+  if [[ -n "$current_cid" ]] && [[ "$(docker inspect -f '{{.State.Running}}' "$current_cid")" == "true" ]]; then
+    cutover_commit="$(docker exec "$current_cid" python - <<'PY'
+import sqlite3
+
+with sqlite3.connect("/var/lib/experiment-console/state/console.sqlite3") as connection:
+    row = connection.execute("SELECT value FROM metadata WHERE key = 'cutover_committed_at'").fetchone()
+print(row[0] if row else "")
+PY
+)"
+  elif [[ -e "$STATE_PATH/console.sqlite3" ]]; then
+    if command -v python3 >/dev/null 2>&1; then
+      cutover_commit="$(python3 - "$STATE_PATH/console.sqlite3" <<'PY'
+import sqlite3
+import sys
+
+with sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True) as connection:
+    row = connection.execute("SELECT value FROM metadata WHERE key = 'cutover_committed_at'").fetchone()
+print(row[0] if row else "")
+PY
+)"
+    else
+      current_image="$("${COMPOSE[@]}" config --images | sed -n '1p')"
+      [[ -n "$current_image" ]] || fail "cannot verify the v2 cutover commit state"
+      cutover_commit="$(docker run --rm --network none --read-only \
+        --entrypoint python -v "$STATE_PATH:/ledger:ro" "$current_image" -c \
+        'import sqlite3; c=sqlite3.connect("file:/ledger/console.sqlite3?mode=ro", uri=True); r=c.execute("SELECT value FROM metadata WHERE key = '\''cutover_committed_at'\''").fetchone(); print(r[0] if r else "")')"
+    fi
+  fi
+  [[ -z "$cutover_commit" ]] || fail "rollback refused after cutover_committed_at=$cutover_commit; deploy a forward fix"
   "${COMPOSE[@]}" stop console || true
 fi
 STATE_PATH="$BACKUP_STATE_PATH"

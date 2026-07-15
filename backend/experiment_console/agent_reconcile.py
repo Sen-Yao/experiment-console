@@ -4,11 +4,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 
-AGENT_RECONCILER_VERSION = 1
+AGENT_RECONCILER_VERSION = 2
 AGENT_RETRY_BACKOFF_SECONDS = (30, 120, 300, 600)
 AGENT_STEADY_RECONCILE_SECONDS = 30
 AGENT_FAILURE_ATTENTION_THRESHOLD = 3
-AGENT_ZERO_CAPACITY_ATTENTION_SECONDS = 15 * 60
 AGENT_TERMINAL_LIFECYCLES = {"terminal", "stopped", "fatal"}
 
 
@@ -35,10 +34,12 @@ def initial_agent_reconciler(
         "desired_agents": min(ceiling, expected),
         "live_agents": 0,
         "assignments": [],
-        "consecutive_failures": 0,
         "consecutive_launch_failures": 0,
-        "zero_capacity_failures": 0,
-        "first_zero_capacity_at": stamp,
+        "launch_failure_episode": None,
+        "current_failure": None,
+        "last_resolved_failure": None,
+        "hardware_eligible_gpus": [],
+        "allocatable_gpus": [],
         "first_agent_at": None,
         "last_attempt_at": None,
         "last_success_at": None,
