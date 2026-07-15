@@ -890,6 +890,21 @@ def test_sweep_preflight_detects_entrypoint_probe_failure(tmp_path):
     assert "ModuleNotFoundError" in response.result["entrypoint_probe"]["stderr_tail"]
 
 
+def test_mini_preflight_uses_the_same_remote_contract(tmp_path):
+    service = make_service(tmp_path)
+    config_path = write_sweep_config(tmp_path / "mini_preflight.yaml")
+
+    response = service.runner_command(IntentType.preflight, {
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "config_path": config_path,
+        "profile": "mini",
+    })
+
+    assert response.classification == "ok"
+    assert response.result["ok"] is True
+
+
 def test_launch_sweep_blocks_failed_entrypoint_before_creating_wandb_sweep(tmp_path):
     settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
     ssh = FakeSSH()

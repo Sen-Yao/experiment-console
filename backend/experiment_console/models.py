@@ -313,7 +313,7 @@ class PreflightPayload(BaseModel):
     config_path: str | None = None
     conda_env: str | None = None
     conda_sh: str | None = None
-    profile: Literal["sweep", "single-run"] | None = None
+    profile: Literal["sweep", "mini", "single-run"] | None = None
     argv_probe: bool = True
 
 
