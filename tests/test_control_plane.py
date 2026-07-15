@@ -2875,6 +2875,55 @@ def test_monitor_artifact_grace_then_ready_emits_only_result_ready(tmp_path):
     assert after_storage_loss["state"]["result_readiness"] == "artifact_storage_missing"
 
 
+def test_monitor_emits_preexisting_result_ready_and_disables_schedule(tmp_path):
+    class FinishedWandB(FakeWandB):
+        def get_sweep_state(self, entity, project, sweep_id):
+            return {
+                "id": sweep_id, "entity": entity, "project": project, "state": "FINISHED",
+                "runCount": 2, "expectedRunCount": 2,
+                "runs": [{"name": "run-a", "state": "finished"}, {"name": "run-b", "state": "finished"}],
+            }
+
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    service = ConsoleService(
+        settings=settings,
+        store=ConsoleStore(settings.sqlite_path, settings.audit_path),
+        wandb=FinishedWandB(),
+        ssh=FakeSSH(),
+    )
+    contract = {
+        "version": 1, "expected_runs": 2, "max_runs": 2,
+        "output_globs": ["outputs/result_{run_id}.json"], "discovery_mode": "run_id_output_globs_v1",
+        "allow_partial": False, "export_artifacts": True,
+    }
+    service.store.upsert_job(JobRecord(
+        job_id="job-preexisting-results", name="preexisting-results", status=JobStatus.running,
+        entity="my-team", project="my-project", sweep_id="abc123",
+        remote_host="gpu-host-1", remote_cwd="/tmp/demo", monitor={"result_contract": contract},
+    ))
+    pulled = service._pull_results(PullResultsPayload(
+        job_id="job-preexisting-results",
+        max_runs=2,
+        output_globs=contract["output_globs"],
+        discovery_mode=contract["discovery_mode"],
+        export_artifacts=True,
+    ))
+    service.store.upsert_monitor_schedule(
+        job_id="job-preexisting-results", interval_seconds=60, timeout_seconds=300, thread_id="thread-1",
+    )
+
+    result = service.monitor_tick("job-preexisting-results")
+    events = service.store.claim_wake_events(consumer_id="bridge", limit=10, lease_seconds=60)
+
+    assert pulled["complete"] is True
+    assert result["classification"] == "result_ready"
+    assert result["artifact_sync"] is None
+    assert result["event_created"] is True
+    assert result["monitor_disabled"] is True
+    assert [event["kind"] for event in events] == ["result_ready"]
+    assert service.store.get_monitor_schedule("job-preexisting-results")["active"] == 0
+
+
 def test_artifact_manifest_rejects_cross_run_duplicate_paths(tmp_path):
     service = make_service(tmp_path)
     rows = [

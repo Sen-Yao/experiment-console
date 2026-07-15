@@ -4828,7 +4828,11 @@ class ConsoleService:
             if queue_group:
                 queue_advance = self._advance_queue(AdvanceQueuePayload(queue_group=str(queue_group)), requested_by="console-monitor")
 
-        if raw_execution_complete and not gates.get("result_ready"):
+        if raw_execution_complete and gates.get("result_ready"):
+            actionable_kind = "result_ready"
+            actionable_classification = "result_ready"
+            summary = f"job {job_id} final artifact manifest is complete and validated"
+        elif raw_execution_complete:
             contract = job.monitor.get("result_contract") if isinstance(job.monitor.get("result_contract"), dict) else None
             if not contract:
                 actionable_kind = "attention"
