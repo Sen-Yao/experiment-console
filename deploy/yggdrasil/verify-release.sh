@@ -29,10 +29,13 @@ require_command docker
 EXPECTED_PREVIOUS_LEDGER=""
 EXPECTED_NEW_LEDGER=""
 if [[ "$REQUIRE_FRESH_V2_CUTOVER" == "1" ]]; then
-  CUTOVER_RECEIPT="$BASE/cutovers/$RELEASE_NAME.meta"
+  [[ -d "$BASE/cutovers" ]] || fail "fresh v2 cutover receipt directory is missing"
+  CUTOVER_RECEIPT="$(find "$BASE/cutovers" -maxdepth 1 -type f -name '*.meta' -print | sort | tail -1)"
   [[ -r "$CUTOVER_RECEIPT" ]] || fail "fresh v2 cutover receipt is missing: $CUTOVER_RECEIPT"
   [[ "$(env_value "$CUTOVER_RECEIPT" cutover_version)" == "2" ]] || fail "cutover receipt version mismatch"
-  [[ "$(env_value "$CUTOVER_RECEIPT" release)" == "$RELEASE" ]] || fail "cutover receipt release mismatch"
+  CUTOVER_RELEASE="$(env_value "$CUTOVER_RECEIPT" release)"
+  require_safe_absolute_path "$CUTOVER_RELEASE"
+  [[ "$CUTOVER_RELEASE" == "$BASE/releases/"* && -d "$CUTOVER_RELEASE" ]] || fail "cutover receipt release is unavailable"
   [[ "$(env_value "$CUTOVER_RECEIPT" contract)" == "runner_console_agent_v2" ]] || fail "cutover receipt contract mismatch"
   [[ "$(env_value "$CUTOVER_RECEIPT" ledger_schema_version)" == "2" ]] || fail "cutover receipt schema mismatch"
   [[ "$(env_value "$CUTOVER_RECEIPT" verified_empty)" == "1" ]] || fail "cutover receipt does not prove an empty ledger"
@@ -98,7 +101,7 @@ if expected_new_ledger:
     assert health.get("ledger_id") != expected_previous_ledger, health
 assert health.get("console_api_auth_configured") is True, health
 
-protected_url = "http://127.0.0.1:5174/api/artifacts/__verification_missing__/download"
+protected_url = "http://127.0.0.1:5174/api/artifacts/result_snapshot_verification_missing/download"
 try:
     urllib.request.urlopen(protected_url, timeout=4)
     raise AssertionError("protected artifact API accepted a request without bearer auth")

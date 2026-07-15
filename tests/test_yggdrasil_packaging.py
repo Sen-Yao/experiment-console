@@ -107,6 +107,8 @@ def test_production_activation_supports_fresh_v2_cutover_and_verifier_probes_rea
     assert 'str(health.get("ledger_schema_version")) == "2"' in verifier
     assert "require_empty_ledger" in verifier
     assert "docker exec -i" in verifier
+    assert "result_snapshot_verification_missing" in verifier
+    assert "find \"$BASE/cutovers\"" in verifier
     assert "docker exec -i" in rollback
     assert '"hccs_wandb_auth_probe": "ok"' in verifier
 
