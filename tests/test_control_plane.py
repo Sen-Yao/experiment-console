@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 from datetime import datetime, timedelta, timezone
@@ -10,7 +11,7 @@ import pytest
 from experiment_console.config import Settings
 from experiment_console.models import AuditEvent, ConfirmRequest, IntentPreviewRequest, IntentType, JobRecord, JobStatus, PullResultsPayload, RepairWatchdogPayload, StatusQueryPayload
 from experiment_console.redaction import redact_value
-from experiment_console.service import ConsoleService
+from experiment_console.service import ConsoleService, apply_dependency_resolution
 from experiment_console.monitor import MonitorWorker
 from experiment_console.state import InvalidTransition, validate_job_transition
 from experiment_console.store import ConsoleStore
@@ -1785,9 +1786,51 @@ def test_agent_reconciler_treats_no_eligible_gpu_as_normal_wait(tmp_path):
     assert status.result["agent"]["health"] == "waiting_for_capacity"
 
 
+def test_agent_reconciler_distinguishes_hardware_eligible_from_allocatable_gpus(tmp_path):
+    class OccupiedGPUFakeSSH(FakeSSH):
+        def reconcile_agent_capacity(self, **kwargs):
+            self.agent_reconcile_calls.append(dict(kwargs))
+            return {
+                "classification": "resource_wait",
+                "desired_agents": kwargs["desired_agents"],
+                "live_agents": 0,
+                "assignments": [],
+                "launched": [],
+                "failed": [],
+                "skipped": [
+                    {"gpu_index": gpu_index, "classification": "gpu_owned_by_other_agent"}
+                    for gpu_index in kwargs["eligible_gpu_indices"]
+                ],
+                "occupied_gpus": list(kwargs["eligible_gpu_indices"]),
+            }
+
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = OccupiedGPUFakeSSH()
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=FakeWandB(), ssh=ssh)
+
+    launched = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "occupied-capacity",
+        "config_path": write_sweep_config(tmp_path / "occupied-capacity.yaml"),
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "max_agents": 2,
+        "idempotency_key": "occupied-capacity",
+    })
+
+    state = launched.job.monitor["agent_reconciler"]
+    assert state["classification"] == "resource_wait"
+    assert state["hardware_eligible_gpus"] == [0, 1]
+    assert state["allocatable_gpus"] == []
+    assert state["attention_reasons"] == []
+
+
 def test_agent_reconciler_wakes_once_after_three_eligible_launch_failures(tmp_path):
     class FailingLaunchSSH(FakeSSH):
+        fail_launch = True
+
         def reconcile_agent_capacity(self, **kwargs):
+            if not self.fail_launch:
+                return super().reconcile_agent_capacity(**kwargs)
             self.agent_reconcile_calls.append(dict(kwargs))
             return {
                 "classification": "capacity_launch_failed",
@@ -1836,9 +1879,29 @@ def test_agent_reconciler_wakes_once_after_three_eligible_launch_failures(tmp_pa
     assert [(event["kind"], event["payload"]["classification"]) for event in events] == [
         ("attention", "agent_launch_failed")
     ]
+    assert events[0]["payload"]["failure_source"] == "agent_launch"
+    assert events[0]["payload"]["operation_stage"] == "launch_agent"
+    assert events[0]["payload"]["episode_id"]
+    assert events[0]["payload"]["attempts"] == 3
     assert events[0]["payload"]["duration_seconds"] >= 0
+    assert events[0]["payload"]["next_retry_at"]
     assert events[0]["payload"]["capacity"]["desired_agents"] == 1
     assert events[0]["payload"]["capacity"]["live_agents"] == 0
+    assert events[0]["payload"]["error_fingerprint"]
+    assert events[0]["payload"]["recommended_actions"]
+    assert events[0]["payload"]["forbidden_actions"] == ["create_duplicate_sweep", "blind_recover_agents"]
+
+    service.ssh.fail_launch = False
+    recovered = service.reconcile_agent_capacity(launched.job_id, force=True)
+    refreshed = service.store.get_job(launched.job_id)
+    recovery_events = service.store.claim_wake_events(consumer_id="bridge-recovery", limit=10, lease_seconds=60)
+    audit_events = service.store.read_audit(limit=100)
+
+    assert recovered["classification"] == "capacity_satisfied"
+    assert refreshed.monitor["agent_reconciler"]["current_failure"] is None
+    assert refreshed.monitor["agent_reconciler"]["last_resolved_failure"]["source"] == "agent_launch"
+    assert [event["kind"] for event in recovery_events] == ["resolved"]
+    assert any(event.event_type == "agent_launch_failure_resolved" for event in audit_events)
 
 
 def test_agent_reconciler_keeps_resource_wait_non_actionable_after_fifteen_minutes(tmp_path):
@@ -1929,16 +1992,24 @@ def test_wandb_outage_aggregates_jobs_escalates_by_time_and_recovers_from_status
         thread_id="thread-shared-wandb-outage",
     )
     escalated = service.reconcile_agent_capacity(first.job_id, force=True)
+    service.reconcile_agent_capacity(second.job_id, force=True)
     events_before_recovery = service.store.claim_wake_events(consumer_id="bridge", limit=10, lease_seconds=60)
 
     assert escalated["classification"] == "wandb_unavailable_reconciling"
     assert service.store.get_job(first.job_id).status == JobStatus.attention
     assert len(events_before_recovery) == 1
     assert events_before_recovery[0]["kind"] == "attention"
+    assert events_before_recovery[0]["payload"]["failure_source"] == "wandb"
+    assert events_before_recovery[0]["payload"]["operation_stage"] == "get_sweep_state"
+    assert events_before_recovery[0]["payload"]["episode_id"] == failure["episode_id"]
+    assert events_before_recovery[0]["payload"]["duration_seconds"] >= 15 * 60
+    assert events_before_recovery[0]["payload"]["attempts"] >= 3
     assert sorted(events_before_recovery[0]["payload"]["affected_job_ids"]) == sorted([first.job_id, second.job_id])
     assert events_before_recovery[0]["payload"]["auto_retry_active"] is True
     assert events_before_recovery[0]["payload"]["next_retry_at"] > datetime.now(timezone.utc).isoformat(timespec="seconds")
     assert sorted(events_before_recovery[0]["payload"]["capacity"]) == sorted([first.job_id, second.job_id])
+    assert events_before_recovery[0]["payload"]["error_fingerprint"]
+    assert events_before_recovery[0]["payload"]["recommended_actions"]
     assert events_before_recovery[0]["payload"]["forbidden_actions"] == ["create_duplicate_sweep", "blind_recover_agents"]
     with pytest.raises(ValueError, match="current_failure is unresolved"):
         service.runner_command(IntentType.recover_agents, {"job_id": first.job_id})
@@ -1958,6 +2029,221 @@ def test_wandb_outage_aggregates_jobs_escalates_by_time_and_recovers_from_status
     assert refreshed_second.monitor["agent_reconciler"]["next_reconcile_at"] <= datetime.now(timezone.utc).isoformat(timespec="seconds")
     assert [event["kind"] for event in recovery_events] == ["resolved"]
     assert recovery_events[0]["payload"]["action_required"] is False
+    assert any(event.event_type == "dependency_failure_resolved" for event in service.store.read_audit(limit=100))
+
+
+def test_wandb_outage_observes_and_preserves_existing_agents_without_capacity_change(tmp_path):
+    class SwitchableWandB(FakeWandB):
+        unavailable = False
+
+        def get_sweep_state(self, entity, project, sweep_id):
+            if self.unavailable:
+                raise WandBUnavailable("TLS EOF while reading W&B GraphQL response")
+            return super().get_sweep_state(entity, project, sweep_id)
+
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = FakeSSH()
+    wandb = SwitchableWandB()
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=wandb, ssh=ssh)
+    launched = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "preserve-live-agent",
+        "config_path": write_sweep_config(tmp_path / "preserve-live-agent.yaml"),
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "max_agents": 1,
+        "idempotency_key": "preserve-live-agent",
+    })
+    before_calls = len(ssh.agent_reconcile_calls)
+    before_pids = list(launched.job.agent_pids)
+    wandb.unavailable = True
+
+    result = service.reconcile_agent_capacity(launched.job_id, force=True)
+    refreshed = service.store.get_job(launched.job_id)
+    state = refreshed.monitor["agent_reconciler"]
+
+    assert result["classification"] == "wandb_unavailable_reconciling"
+    assert refreshed.status == JobStatus.running
+    assert refreshed.agent_pids == before_pids
+    assert state["lifecycle"] == "running_degraded"
+    assert state["live_agents"] == 1
+    assert state["last_agent_observation"]["alive_pids"] == before_pids
+    assert len(ssh.agent_reconcile_calls) == before_calls
+
+
+def test_ssh_outage_shares_episode_and_retry_throttle_across_jobs(tmp_path):
+    class FlakyObservationSSH(FakeSSH):
+        unavailable = False
+
+        def __init__(self):
+            super().__init__()
+            self.observation_calls = 0
+
+        def check_agent_processes(self, **kwargs):
+            self.observation_calls += 1
+            if self.unavailable:
+                raise TimeoutError("SSH process observation timed out")
+            return super().check_agent_processes(**kwargs)
+
+    class CountingWandB(FakeWandB):
+        def __init__(self):
+            super().__init__()
+            self.state_calls = 0
+
+        def get_sweep_state(self, entity, project, sweep_id):
+            self.state_calls += 1
+            return super().get_sweep_state(entity, project, sweep_id)
+
+    settings = Settings(state_dir=tmp_path, default_entity="my-team", default_project="my-project")
+    ssh = FlakyObservationSSH()
+    wandb = CountingWandB()
+    service = ConsoleService(settings=settings, store=ConsoleStore(settings.sqlite_path, settings.audit_path), wandb=wandb, ssh=ssh)
+    jobs = [
+        service.runner_command(IntentType.launch_sweep, {
+            "job_name": f"shared-ssh-{suffix}",
+            "config_path": write_sweep_config(tmp_path / f"shared-ssh-{suffix}.yaml"),
+            "remote_host": "gpu-host-1",
+            "remote_cwd": "/tmp/demo",
+            "max_agents": 1,
+            "queue_policy": "immediate",
+            "idempotency_key": f"shared-ssh-{suffix}",
+        })
+        for suffix in ("a", "b")
+    ]
+    for launched in jobs:
+        job = service.store.get_job(launched.job_id)
+        job.monitor["agent_reconciler"]["next_reconcile_at"] = "2000-01-01T00:00:00+00:00"
+        service.store.upsert_job(job)
+    observation_calls_before = ssh.observation_calls
+    wandb_calls_before = wandb.state_calls
+    ssh.unavailable = True
+
+    first = service.reconcile_agent_capacity(jobs[0].job_id)
+    second = service.reconcile_agent_capacity(jobs[1].job_id)
+    first_failure = service.store.get_job(jobs[0].job_id).monitor["agent_reconciler"]["current_failure"]
+    second_failure = service.store.get_job(jobs[1].job_id).monitor["agent_reconciler"]["current_failure"]
+    impacts = service.store.dependency_impacts(first_failure["episode_id"])
+
+    assert first["classification"] == "ssh_unavailable_reconciling"
+    assert second["classification"] == "ssh_unavailable_reconciling"
+    assert first_failure["episode_id"] == second_failure["episode_id"]
+    assert first_failure["attempts"] == second_failure["attempts"] == 1
+    assert ssh.observation_calls == observation_calls_before + 1
+    assert wandb.state_calls == wandb_calls_before + 2
+    assert sorted(impact["job_id"] for impact in impacts) == sorted(job.job_id for job in jobs)
+
+
+def test_dependency_resolution_keeps_another_active_failure_as_current():
+    resolved = {
+        "dependency_key": "dependency_wandb_a",
+        "classification": "wandb_unavailable_reconciling",
+        "source": "wandb",
+    }
+    remaining = {
+        "dependency_key": "dependency_ssh_b",
+        "classification": "ssh_unavailable_reconciling",
+        "action_required": False,
+        "auto_retry_active": True,
+    }
+    state = {
+        "live_agents": 1,
+        "current_failure": {**resolved, "action_required": True, "auto_retry_active": True},
+        "dependency_failures": [{**resolved, "action_required": True, "auto_retry_active": True}, remaining],
+        "attention_reasons": ["wandb_unavailable_reconciling"],
+    }
+
+    apply_dependency_resolution(state, resolved)
+
+    assert state["current_failure"]["dependency_key"] == "dependency_ssh_b"
+    assert state["classification"] == "ssh_unavailable_reconciling"
+    assert state["lifecycle"] == "running_degraded"
+    assert state["attention_reasons"] == []
+    assert state["last_resolved_failure"] == resolved
+
+
+def test_ssh_transient_and_target_configuration_failures_have_distinct_semantics(tmp_path):
+    service = make_service(tmp_path)
+    transient = service._dependency_failure_spec(
+        TimeoutError("SSH command timed out"),
+        source="ssh",
+        scope="gpu-host-1",
+        operation_stage="remote_agent_reconcile",
+    )
+
+    class Result:
+        stdout = ""
+        stderr = "bash: cd: /missing/project: No such file or directory"
+
+    configuration_error = RuntimeError("remote command failed")
+    configuration_error.result = Result()
+    deterministic = service._dependency_failure_spec(
+        configuration_error,
+        source="ssh",
+        scope="gpu-host-1",
+        operation_stage="remote_agent_reconcile",
+    )
+
+    assert transient["classification"] == "remote_agent_reconcile_unavailable_reconciling"
+    assert transient["retry_active"] is True
+    assert transient["action_required_immediately"] is False
+    assert deterministic["classification"] == "ssh_configuration_required"
+    assert deterministic["retry_active"] is False
+    assert deterministic["action_required_immediately"] is True
+
+
+def test_ssh_target_configuration_failure_is_immediate_attention_and_paused(tmp_path):
+    class ConfigurationFailingSSH(FakeSSH):
+        def reconcile_agent_capacity(self, **kwargs):
+            class Result:
+                stdout = ""
+                stderr = "bash: cd: /missing/project: No such file or directory"
+
+            error = RuntimeError("remote command failed")
+            error.result = Result()
+            raise error
+
+    settings = Settings(
+        state_dir=tmp_path,
+        default_entity="my-team",
+        default_project="my-project",
+        authority_role="authoritative",
+    )
+    service = ConsoleService(
+        settings=settings,
+        store=ConsoleStore(settings.sqlite_path, settings.audit_path),
+        wandb=FakeWandB(),
+        ssh=ConfigurationFailingSSH(),
+    )
+    launched = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "ssh-config-failure",
+        "config_path": write_sweep_config(tmp_path / "ssh-config-failure.yaml"),
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/missing/project",
+        "max_agents": 1,
+        "idempotency_key": "ssh-config-failure",
+        "thread_id": "thread-ssh-config-failure",
+        "result_contract": {
+            "expected_runs": 5,
+            "output_globs": ["outputs/cora_{run_id}.json"],
+            "discovery_mode": "run_id_output_globs_v1",
+        },
+    })
+    state = launched.job.monitor["agent_reconciler"]
+    failure = state["current_failure"]
+    events = service.store.claim_wake_events(consumer_id="bridge", limit=10, lease_seconds=60)
+
+    assert launched.job.status == JobStatus.attention
+    assert state["lifecycle"] == "attention"
+    assert state["classification"] == "ssh_configuration_required"
+    assert state["next_reconcile_at"] is None
+    assert failure["action_required"] is True
+    assert failure["auto_retry_active"] is False
+    assert failure["next_retry_at"] is None
+    assert [(event["kind"], event["payload"]["classification"]) for event in events] == [
+        ("attention", "ssh_configuration_required")
+    ]
+    assert events[0]["payload"]["duration_seconds"] == 0
+    assert events[0]["payload"]["auto_retry_active"] is False
+    assert events[0]["payload"]["next_retry_at"] is None
 
 
 def test_partial_agent_capacity_never_escalates_launch_failures(tmp_path):
@@ -2179,6 +2465,71 @@ def test_agent_reconciler_marks_auth_failure_fatal_immediately(tmp_path):
     assert refreshed.monitor["agent_reconciler"]["last_resolved_failure"]["classification"] == "auth_required"
     assert launched.job.monitor["agent_reconciler"]["next_reconcile_at"] is None
     assert ssh.agent_reconcile_calls == []
+
+
+def test_fatal_agent_reconcile_recovery_is_audited_and_emits_resolved_once(tmp_path):
+    class IdentityWandB(FakeWandB):
+        mismatch = True
+
+        def get_sweep_state(self, entity, project, sweep_id):
+            result = super().get_sweep_state(entity, project, sweep_id)
+            if self.mismatch:
+                result["id"] = "unexpected-sweep"
+            return result
+
+    settings = Settings(
+        state_dir=tmp_path,
+        default_entity="my-team",
+        default_project="my-project",
+        authority_role="authoritative",
+    )
+    wandb = IdentityWandB()
+    service = ConsoleService(
+        settings=settings,
+        store=ConsoleStore(settings.sqlite_path, settings.audit_path),
+        wandb=wandb,
+        ssh=FakeSSH(),
+    )
+    launched = service.runner_command(IntentType.launch_sweep, {
+        "job_name": "fatal-recovery",
+        "config_path": write_sweep_config(tmp_path / "fatal-recovery.yaml"),
+        "remote_host": "gpu-host-1",
+        "remote_cwd": "/tmp/demo",
+        "max_agents": 1,
+        "idempotency_key": "fatal-recovery",
+        "thread_id": "thread-fatal-recovery",
+        "result_contract": {
+            "expected_runs": 5,
+            "output_globs": ["outputs/cora_{run_id}.json"],
+            "discovery_mode": "run_id_output_globs_v1",
+        },
+    })
+    attention_events = service.store.claim_wake_events(consumer_id="bridge", limit=10, lease_seconds=60)
+    failure = launched.job.monitor["agent_reconciler"]["current_failure"]
+
+    assert launched.job.status == JobStatus.attention
+    assert failure["classification"] == "sweep_identity_mismatch"
+    assert failure["auto_retry_active"] is False
+    assert attention_events[0]["payload"]["auto_retry_active"] is False
+    assert attention_events[0]["payload"]["next_retry_at"] is None
+
+    wandb.mismatch = False
+    recovered = service.runner_command(IntentType.recover_agents, {
+        "job_id": launched.job_id,
+        "confirmed_failure_resolved": True,
+    })
+    refreshed = service.store.get_job(launched.job_id)
+    resolved_events = service.store.claim_wake_events(consumer_id="bridge-recovery", limit=10, lease_seconds=60)
+    audit_events = service.store.read_audit(limit=100)
+
+    assert recovered.classification == "agent_reconcile_triggered"
+    assert refreshed.status == JobStatus.running
+    assert refreshed.monitor["agent_reconciler"]["current_failure"] is None
+    assert refreshed.monitor["agent_reconciler"]["last_resolved_failure"]["classification"] == "sweep_identity_mismatch"
+    assert [(event["kind"], event["payload"]["classification"]) for event in resolved_events] == [
+        ("resolved", "agent_reconcile_recovered")
+    ]
+    assert any(event.event_type == "agent_reconcile_failure_resolved" for event in audit_events)
 
 
 def test_terminal_job_cannot_transition_to_running():
@@ -3454,6 +3805,9 @@ def test_pull_results_snapshot_groups_metrics(tmp_path):
     assert snapshot["comparison_summaries"]["topo_gt_minus_mlp"]["count"] == 3
     bundle = snapshot["artifact_bundle"]
     assert bundle["raw_files"][0]["path"].endswith("raw/run-a__run-a.json")
+    raw_path = Path(bundle["raw_files"][0]["path"])
+    assert hashlib.sha256(raw_path.read_bytes()).hexdigest() == bundle["raw_files"][0]["sha256"]
+    assert bundle["raw_files"][0]["sha256"] == snapshot["artifact_manifest"]["artifact_inventory"][0]["sha256"]
     assert (tmp_path / "exported_artifacts" / "result_snapshot.json").exists()
     assert (tmp_path / "exported_artifacts" / "summary.json").exists()
     assert (tmp_path / "exported_artifacts" / "summary.md").exists()

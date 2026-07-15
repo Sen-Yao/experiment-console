@@ -583,10 +583,7 @@ class ConsoleService:
                 if artifact_key in seen_raw_artifacts:
                     continue
                 seen_raw_artifacts.add(artifact_key)
-                if isinstance(content, (dict, list)):
-                    write_json_file(raw_path, content)
-                else:
-                    raw_path.write_text(str(content), encoding="utf-8")
+                write_text_file(raw_path, content_text)
                 raw_record = {
                     "run_id": artifact.get("run_id"),
                     "source_path": artifact.get("path"),
@@ -1506,42 +1503,68 @@ class ConsoleService:
 
         dependency_failures: list[dict[str, Any]] = []
         remote_probe = None
-        try:
-            remote_probe = self.ssh.check_agent_processes(
-                host=job.remote_host,
-                sweep_path=sweep_path,
-                pids=job.agent_pids,
-            )
-            state["last_agent_observation"] = compact_agent_probe(remote_probe)
-            observed_live = observed_agent_count(remote_probe)
-            state["live_agents"] = observed_live
-            if observed_live > 0:
-                state["first_agent_at"] = state.get("first_agent_at") or now
-            resolved = self._resolve_dependency_success(
-                source="ssh",
-                scope=job.remote_host,
-                operation_stage="observe_agent_processes",
-                current_job_id=job.job_id,
-            )
-            apply_dependency_resolution(state, resolved)
-        except Exception as exc:
-            dependency_failures.append(self._dependency_failure_spec(
-                exc,
-                source="ssh",
-                scope=job.remote_host,
-                operation_stage="observe_agent_processes",
-            ))
+        deferred_ssh_observation = self._deferred_dependency_episode(
+            job,
+            source="ssh",
+            scope=job.remote_host,
+            operation_stage="observe_agent_processes",
+            force=force,
+            now=now,
+        )
+        if deferred_ssh_observation:
+            dependency_failures.append({"episode": deferred_ssh_observation})
+        else:
+            try:
+                remote_probe = self.ssh.check_agent_processes(
+                    host=job.remote_host,
+                    sweep_path=sweep_path,
+                    pids=job.agent_pids,
+                )
+                state["last_agent_observation"] = compact_agent_probe(remote_probe)
+                observed_live = observed_agent_count(remote_probe)
+                state["live_agents"] = observed_live
+                if observed_live > 0:
+                    state["first_agent_at"] = state.get("first_agent_at") or now
+                resolved = self._resolve_dependency_success(
+                    source="ssh",
+                    scope=job.remote_host,
+                    operation_stage="observe_agent_processes",
+                    current_job_id=job.job_id,
+                )
+                apply_dependency_resolution(state, resolved)
+            except Exception as exc:
+                dependency_failures.append(self._dependency_failure_spec(
+                    exc,
+                    source="ssh",
+                    scope=job.remote_host,
+                    operation_stage="observe_agent_processes",
+                ))
 
         wandb_scope = self._wandb_dependency_scope()
+        remote_auth_scope = f"{wandb_scope}|remote:{job.remote_host}"
         auth = job.monitor.get("auth") if isinstance(job.monitor.get("auth"), dict) else {}
         auth_classification = str(auth.get("classification") or "auth_check_pending")
         if not auth.get("ok"):
-            if auth_classification in {"wandb_auth_missing", "auth_required"} and not force:
+            deferred_auth = []
+            for source, scope in (("wandb", remote_auth_scope), ("ssh", job.remote_host)):
+                episode = self._deferred_dependency_episode(
+                    job,
+                    source=source,
+                    scope=scope,
+                    operation_stage="remote_auth_check",
+                    force=force,
+                    now=now,
+                )
+                if episode:
+                    deferred_auth.append(episode)
+            if deferred_auth:
+                dependency_failures.extend({"episode": episode} for episode in deferred_auth)
+            elif auth_classification in {"wandb_auth_missing", "auth_required"} and not force:
                 auth_error = WandBAuthRequired(str(auth.get("error") or "remote W&B credentials are unavailable"))
                 dependency_failures.append(self._dependency_failure_spec(
                     auth_error,
                     source="wandb",
-                    scope=f"{wandb_scope}|remote:{job.remote_host}",
+                    scope=remote_auth_scope,
                     operation_stage="remote_auth_check",
                 ))
             else:
@@ -1561,7 +1584,7 @@ class ConsoleService:
                         raise WandBUnavailable(str(auth.get("error") or "remote W&B API is unavailable"))
                     resolved = self._resolve_dependency_success(
                         source="wandb",
-                        scope=f"{wandb_scope}|remote:{job.remote_host}",
+                        scope=remote_auth_scope,
                         operation_stage="remote_auth_check",
                         current_job_id=job.job_id,
                     )
@@ -1570,19 +1593,19 @@ class ConsoleService:
                     dependency_failures.append(self._dependency_failure_spec(
                         exc,
                         source="wandb" if isinstance(exc, WandBUnavailable) else "ssh",
-                        scope=f"{wandb_scope}|remote:{job.remote_host}" if isinstance(exc, WandBUnavailable) else job.remote_host,
+                        scope=remote_auth_scope if isinstance(exc, WandBUnavailable) else job.remote_host,
                         operation_stage="remote_auth_check",
                     ))
-        wandb_key = dependency_key(source="wandb", scope=wandb_scope, operation_stage="get_sweep_state")
-        active_wandb_episode = self.store.get_dependency_episode(wandb_key)
+        active_wandb_episode = self._deferred_dependency_episode(
+            job,
+            source="wandb",
+            scope=wandb_scope,
+            operation_stage="get_sweep_state",
+            force=force,
+            now=now,
+        )
         sweep = None
-        if active_wandb_episode and not force and not dependency_retry_due(active_wandb_episode, now=now):
-            schedule = self.store.get_monitor_schedule(job.job_id) or {}
-            active_wandb_episode = self.store.upsert_dependency_episode(
-                active_wandb_episode,
-                job_id=job.job_id,
-                thread_id=str(schedule.get("thread_id") or "").strip() or None,
-            )
+        if active_wandb_episode:
             dependency_failures.append({"episode": active_wandb_episode})
         else:
             try:
@@ -1656,6 +1679,22 @@ class ConsoleService:
             job.monitor["agent_reconciler"] = state
             self.store.upsert_job(job)
             return self._agent_reconcile_result(job, state, classification="terminal")
+        deferred_gpu_probe = self._deferred_dependency_episode(
+            job,
+            source="ssh",
+            scope=job.remote_host,
+            operation_stage="probe_gpus",
+            force=force,
+            now=now,
+        )
+        if deferred_gpu_probe:
+            return self._persist_dependency_wait(
+                job,
+                state,
+                [deferred_gpu_probe],
+                requested_by=requested_by,
+                now=now,
+            )
         try:
             gpu_probe = self.ssh.probe_gpus(job.remote_host)
             hardware_eligible = [
@@ -1685,6 +1724,22 @@ class ConsoleService:
                 **failure,
             )
             return self._persist_dependency_wait(job, state, [episode], requested_by=requested_by, now=now)
+        deferred_remote_reconcile = self._deferred_dependency_episode(
+            job,
+            source="ssh",
+            scope=job.remote_host,
+            operation_stage="remote_agent_reconcile",
+            force=force,
+            now=now,
+        )
+        if deferred_remote_reconcile:
+            return self._persist_dependency_wait(
+                job,
+                state,
+                [deferred_remote_reconcile],
+                requested_by=requested_by,
+                now=now,
+            )
         try:
             remote = self.ssh.reconcile_agent_capacity(
                 host=job.remote_host,
@@ -1736,6 +1791,7 @@ class ConsoleService:
             state["first_agent_at"] = state.get("first_agent_at") or now
         attention_reasons = []
         launch_episode = None
+        previous_current_failure = state.get("current_failure") if isinstance(state.get("current_failure"), dict) else None
         previous_launch_episode = state.get("launch_failure_episode") if isinstance(state.get("launch_failure_episode"), dict) else None
         if launch_failures and live_agents == 0:
             launch_episode = advance_launch_failure_episode(previous_launch_episode, launch_failures, now=now)
@@ -1746,8 +1802,25 @@ class ConsoleService:
                 attention_reasons.append("agent_launch_failed")
         else:
             if previous_launch_episode:
-                state["last_resolved_failure"] = resolved_launch_failure_summary(previous_launch_episode, resolved_at=now)
+                resolved_summary = resolved_agent_failure_summary(previous_launch_episode, resolved_at=now)
+                state["last_resolved_failure"] = resolved_summary
+                self.store.write_audit(AuditEvent(
+                    event_type="agent_launch_failure_resolved",
+                    job_id=job.job_id,
+                    message="Agent launch failure recovered.",
+                    detail=resolved_summary,
+                ))
                 self._enqueue_agent_reconcile_resolved(job, previous_launch_episode, state, requested_by=requested_by)
+            elif previous_current_failure and not previous_current_failure.get("dependency_key"):
+                resolved_summary = resolved_agent_failure_summary(previous_current_failure, resolved_at=now)
+                state["last_resolved_failure"] = resolved_summary
+                self.store.write_audit(AuditEvent(
+                    event_type="agent_reconcile_failure_resolved",
+                    job_id=job.job_id,
+                    message="Agent reconciler failure recovered.",
+                    detail=resolved_summary,
+                ))
+                self._enqueue_agent_reconcile_resolved(job, previous_current_failure, state, requested_by=requested_by)
             state["launch_failure_episode"] = None
             state["consecutive_launch_failures"] = 0
             state["current_failure"] = None
@@ -1805,6 +1878,29 @@ class ConsoleService:
         credential_scope = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12] if api_key else "missing"
         return f"{getattr(self.wandb, 'endpoint', 'wandb')}|credential:{credential_scope}"
 
+    def _deferred_dependency_episode(
+        self,
+        job: JobRecord,
+        *,
+        source: str,
+        scope: str,
+        operation_stage: str,
+        force: bool,
+        now: str,
+    ) -> dict[str, Any] | None:
+        if force:
+            return None
+        key = dependency_key(source=source, scope=scope, operation_stage=operation_stage)
+        episode = self.store.get_dependency_episode(key)
+        if not episode or dependency_retry_due(episode, now=now):
+            return None
+        schedule = self.store.get_monitor_schedule(job.job_id) or {}
+        return self.store.upsert_dependency_episode(
+            episode,
+            job_id=job.job_id,
+            thread_id=str(schedule.get("thread_id") or "").strip() or None,
+        )
+
     def _dependency_failure_spec(
         self,
         exc: Exception,
@@ -1836,15 +1932,11 @@ class ConsoleService:
                 str(getattr(result, "stderr", "") or ""),
                 str(getattr(result, "stdout", "") or ""),
             ])
-        deterministic = any(marker in error_text for marker in (
-            "Permission denied",
-            "REMOTE HOST IDENTIFICATION HAS CHANGED",
-            "Host key verification failed",
-        ))
+        deterministic = ssh_error_requires_configuration(error_text, operation_stage=operation_stage)
         classification = (
             "ssh_configuration_required"
             if deterministic
-            else "remote_agent_reconcile_unavailable"
+            else "remote_agent_reconcile_unavailable_reconciling"
             if operation_stage == "remote_agent_reconcile"
             else "ssh_unavailable_reconciling"
         )
@@ -1926,10 +2018,8 @@ class ConsoleService:
             if isinstance(episode, dict) and episode.get("dependency_key")
         }
         failures = list(unique.values())
-        primary = sorted(
-            failures,
-            key=lambda item: (not bool(item.get("action_required")), bool(item.get("auto_retry_active"))),
-        )[0]
+        primary = select_primary_dependency_failure(failures)
+        assert primary is not None
         action_required = any(bool(item.get("action_required")) for item in failures)
         retry_times = sorted(str(item["next_retry_at"]) for item in failures if item.get("next_retry_at"))
         state.update({
@@ -2126,6 +2216,11 @@ class ConsoleService:
         thread_id = str(schedule.get("thread_id") or "").strip()
         if not thread_id:
             return
+        duration_seconds = episode.get("age_seconds")
+        if duration_seconds is None:
+            duration_seconds = age_seconds(episode.get("first_seen_at"), now=utc_now())
+        auto_retry_active = bool(episode.get("auto_retry_active"))
+        next_retry_at = (episode.get("next_retry_at") or state.get("next_reconcile_at")) if auto_retry_active else None
         self.store.enqueue_wake_event(
             dedupe_key=f"{job.job_id}:attention:agent_capacity:{episode_id}",
             job_id=job.job_id,
@@ -2143,9 +2238,9 @@ class ConsoleService:
                 "live_agents": state.get("live_agents"),
                 "attempts": episode.get("attempts"),
                 "first_seen_at": episode.get("first_seen_at"),
-                "duration_seconds": episode.get("age_seconds"),
-                "auto_retry_active": True,
-                "next_retry_at": state.get("next_reconcile_at"),
+                "duration_seconds": duration_seconds,
+                "auto_retry_active": auto_retry_active,
+                "next_retry_at": next_retry_at,
                 "capacity": {
                     "desired_agents": state.get("desired_agents"),
                     "live_agents": state.get("live_agents"),
@@ -2175,17 +2270,20 @@ class ConsoleService:
         if not thread_id:
             return
         episode_id = str(episode.get("episode_id") or "")
+        failure_source = str(episode.get("source") or "agent_reconciler")
+        operation_stage = str(episode.get("operation_stage") or "reconcile")
+        classification = "agent_launch_recovered" if failure_source == "agent_launch" else "agent_reconcile_recovered"
         self.store.enqueue_wake_event(
             dedupe_key=f"{job.job_id}:resolved:agent_capacity:{episode_id}",
             job_id=job.job_id,
             thread_id=thread_id,
             kind="resolved",
-            summary=f"job {job.job_id} agent launch failure recovered",
+            summary=f"job {job.job_id} {failure_source} failure recovered",
             payload={
                 "action_required": False,
-                "classification": "agent_launch_recovered",
-                "failure_source": "agent_launch",
-                "operation_stage": "launch_agent",
+                "classification": classification,
+                "failure_source": failure_source,
+                "operation_stage": operation_stage,
                 "episode_id": episode_id,
                 "live_agents": state.get("live_agents"),
                 "desired_agents": state.get("desired_agents"),
@@ -5798,7 +5896,7 @@ def advance_launch_failure_episode(
     }
 
 
-def resolved_launch_failure_summary(episode: dict[str, Any], *, resolved_at: str) -> dict[str, Any]:
+def resolved_agent_failure_summary(episode: dict[str, Any], *, resolved_at: str) -> dict[str, Any]:
     return {
         key: episode.get(key)
         for key in (
@@ -5843,26 +5941,83 @@ def compact_dependency_failure(episode: dict[str, Any] | None) -> dict[str, Any]
     }
 
 
+def select_primary_dependency_failure(failures: list[dict[str, Any]]) -> dict[str, Any] | None:
+    candidates = [item for item in failures if isinstance(item, dict) and item.get("dependency_key")]
+    if not candidates:
+        return None
+    return sorted(
+        candidates,
+        key=lambda item: (not bool(item.get("action_required")), bool(item.get("auto_retry_active"))),
+    )[0]
+
+
 def apply_dependency_resolution(state: dict[str, Any], summary: dict[str, Any] | None) -> None:
     if not isinstance(summary, dict):
         return
     key = summary.get("dependency_key")
-    state["dependency_failures"] = [
+    remaining = [
         item
         for item in (state.get("dependency_failures") or [])
         if isinstance(item, dict) and item.get("dependency_key") != key
     ]
+    state["dependency_failures"] = remaining
     current = state.get("current_failure")
     if isinstance(current, dict) and current.get("dependency_key") == key:
-        state["current_failure"] = None
-        live_agents = to_non_negative_int(state.get("live_agents"))
-        state["lifecycle"] = "running_degraded" if live_agents else "pending"
-        state["classification"] = "running_degraded" if live_agents else "capacity_pending"
-    state["attention_reasons"] = [
+        primary = select_primary_dependency_failure(remaining)
+        state["current_failure"] = compact_dependency_failure(primary)
+        if primary:
+            action_required = any(bool(item.get("action_required")) for item in remaining)
+            state["lifecycle"] = (
+                "attention"
+                if action_required
+                else "running_degraded"
+                if to_non_negative_int(state.get("live_agents"))
+                else "pending"
+            )
+            state["classification"] = primary.get("classification")
+        else:
+            live_agents = to_non_negative_int(state.get("live_agents"))
+            state["lifecycle"] = "running_degraded" if live_agents else "pending"
+            state["classification"] = "running_degraded" if live_agents else "capacity_pending"
+    attention_reasons = [
         item for item in (state.get("attention_reasons") or [])
         if item != summary.get("classification")
     ]
+    attention_reasons.extend(
+        str(item.get("classification"))
+        for item in remaining
+        if item.get("action_required") and item.get("classification")
+    )
+    state["attention_reasons"] = sorted(set(attention_reasons))
     state["last_resolved_failure"] = summary
+
+
+def ssh_error_requires_configuration(error_text: str, *, operation_stage: str) -> bool:
+    text = str(error_text or "")
+    if any(marker in text for marker in (
+        "Permission denied",
+        "REMOTE HOST IDENTIFICATION HAS CHANGED",
+        "Host key verification failed",
+    )):
+        return True
+    if operation_stage not in {"observe_agent_processes", "probe_gpus", "remote_agent_reconcile", "remote_auth_check"}:
+        return False
+    lowered = text.lower()
+    target_marker = any(marker in lowered for marker in (
+        "remote_cwd does not exist",
+        "not a directory",
+        "cd: ",
+        "python3: command not found",
+        "conda: command not found",
+        "wandb: command not found",
+    ))
+    deterministic_cause = any(marker in lowered for marker in (
+        "no such file or directory",
+        "not a directory",
+        "command not found",
+        "remote_cwd does not exist",
+    ))
+    return target_marker and deterministic_cause
 
 
 def compact_agent_probe(probe: dict[str, Any] | None) -> dict[str, Any] | None:
