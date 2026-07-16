@@ -12,7 +12,10 @@ from .config import Settings
 from .redaction import redact_text
 
 
-MAX_RESULT_ARTIFACT_FILE_BYTES = 8 * 1024 * 1024
+# R11 result JSONs contain the full candidate/checkpoint audit matrix and are
+# larger than the historical 8 MiB single-file ceiling. Keep the aggregate
+# ceiling unchanged so the remote pull remains bounded across runs.
+MAX_RESULT_ARTIFACT_FILE_BYTES = 16 * 1024 * 1024
 MAX_RESULT_ARTIFACT_TOTAL_BYTES = 64 * 1024 * 1024
 SSH_CONNECTION_OPTIONS = (
     "-o",

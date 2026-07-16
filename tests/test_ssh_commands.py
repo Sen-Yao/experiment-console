@@ -618,6 +618,11 @@ def test_pull_results_rejects_single_artifact_over_file_byte_limit(monkeypatch, 
     assert result["discovery_sources"]["run-a"]["classification"] == "artifact_file_size_limit_exceeded"
 
 
+def test_default_artifact_file_limit_covers_r11_json_scale():
+    assert ssh_module.MAX_RESULT_ARTIFACT_FILE_BYTES == 16 * 1024 * 1024
+    assert ssh_module.MAX_RESULT_ARTIFACT_FILE_BYTES > 13_350_850
+
+
 def test_pull_results_enforces_total_artifact_byte_limit_across_runs(monkeypatch, tmp_path):
     monkeypatch.setattr(ssh_module, "MAX_RESULT_ARTIFACT_FILE_BYTES", 1024)
     monkeypatch.setattr(ssh_module, "MAX_RESULT_ARTIFACT_TOTAL_BYTES", 100)
