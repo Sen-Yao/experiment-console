@@ -623,6 +623,66 @@ def test_default_artifact_file_limit_covers_r11_json_scale():
     assert ssh_module.MAX_RESULT_ARTIFACT_FILE_BYTES > 13_350_850
 
 
+def test_default_artifact_total_limit_accepts_five_run_r11_bundle_and_rejects_overflow(tmp_path):
+    assert ssh_module.MAX_RESULT_ARTIFACT_TOTAL_BYTES == 80 * 1024 * 1024
+
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    run_ids = [f"run-{index}" for index in range(6)]
+    artifact_sizes = []
+    padding_sizes = [13_500 * 1024] * 5 + [15_000 * 1024]
+    for run_id, padding_size in zip(run_ids, padding_sizes, strict=True):
+        write_run_config(tmp_path, run_id)
+        artifact = outputs / f"{run_id}.json"
+        artifact.write_text(
+            json.dumps({"final_test_auc": 0.9, "padding": "x" * padding_size}),
+            encoding="utf-8",
+        )
+        artifact_sizes.append(artifact.stat().st_size)
+
+    first_five_bytes = sum(artifact_sizes[:5])
+    all_six_bytes = sum(artifact_sizes)
+    assert 64 * 1024 * 1024 < first_five_bytes < 80 * 1024 * 1024
+    assert all(size < ssh_module.MAX_RESULT_ARTIFACT_FILE_BYTES for size in artifact_sizes)
+    assert all_six_bytes > ssh_module.MAX_RESULT_ARTIFACT_TOTAL_BYTES
+
+    ssh = SSHExecutor(Settings(state_dir=tmp_path), runner=LocalRemotePythonRunner())
+    accepted = ssh.pull_results(
+        host="local",
+        remote_cwd=str(tmp_path),
+        sweep_id="abc123",
+        run_ids=run_ids[:5],
+        budget_seconds=30,
+        max_runs=5,
+        metric_keys=["final_test_auc"],
+        group_keys=[],
+        output_globs=[str(outputs / "{run_id}.json")],
+        discovery_mode="run_id_output_globs_v1",
+        include_raw_artifacts=True,
+    )
+    overflow = ssh.pull_results(
+        host="local",
+        remote_cwd=str(tmp_path),
+        sweep_id="abc123",
+        run_ids=run_ids,
+        budget_seconds=30,
+        max_runs=6,
+        metric_keys=["final_test_auc"],
+        group_keys=[],
+        output_globs=[str(outputs / "{run_id}.json")],
+        discovery_mode="run_id_output_globs_v1",
+        include_raw_artifacts=True,
+    )
+
+    assert accepted["valid_results"] == 5
+    assert accepted["missing_results"] == 0
+    assert accepted["artifact_bytes_read"] == first_five_bytes
+    assert overflow["valid_results"] == 5
+    assert overflow["missing_results"] == 1
+    assert overflow["artifact_bytes_read"] == first_five_bytes
+    assert overflow["discovery_sources"]["run-5"]["classification"] == "artifact_total_size_limit_exceeded"
+
+
 def test_pull_results_enforces_total_artifact_byte_limit_across_runs(monkeypatch, tmp_path):
     monkeypatch.setattr(ssh_module, "MAX_RESULT_ARTIFACT_FILE_BYTES", 1024)
     monkeypatch.setattr(ssh_module, "MAX_RESULT_ARTIFACT_TOTAL_BYTES", 100)
