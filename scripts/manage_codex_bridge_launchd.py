@@ -14,24 +14,32 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(description="Install or remove the Experiment Console bridge LaunchAgent.")
+    result = argparse.ArgumentParser(
+        description="Install or remove the Experiment Console v3 bridge LaunchAgent."
+    )
     result.add_argument("command", choices=["render", "install", "uninstall"])
     result.add_argument(
         "--config",
         default=str(Path.home() / ".config" / "experiment-console" / "bridge.json"),
         help="Absolute bridge config path (contains paths, not secret values).",
     )
-    result.add_argument("--python", default=sys.executable, help="Absolute Python 3 executable.")
+    result.add_argument(
+        "--python", default=sys.executable, help="Absolute Python 3 executable."
+    )
     result.add_argument(
         "--plist",
         default=str(Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"),
     )
-    result.add_argument("--no-load", action="store_true", help="Write/remove the plist without calling launchctl.")
+    result.add_argument(
+        "--no-load",
+        action="store_true",
+        help="Write/remove the plist without calling launchctl.",
+    )
     return result
 
 
 def make_plist(*, python: Path, config: Path) -> dict[str, object]:
-    log_dir = Path.home() / "Library" / "Logs" / "Experiment Console Bridge"
+    log_dir = Path.home() / "Library" / "Logs" / "Experiment Console Bridge v3"
     return {
         "Label": LABEL,
         "ProgramArguments": [
@@ -71,10 +79,12 @@ def main(argv: list[str] | None = None) -> int:
             parser().error(f"bridge config does not exist: {config}")
         plist.parent.mkdir(parents=True, exist_ok=True)
         if args.command == "install":
-            log_dir = Path.home() / "Library" / "Logs" / "Experiment Console Bridge"
+            log_dir = Path.home() / "Library" / "Logs" / "Experiment Console Bridge v3"
             log_dir.mkdir(parents=True, exist_ok=True)
         with plist.open("wb") as handle:
-            plistlib.dump(make_plist(python=python, config=config), handle, sort_keys=True)
+            plistlib.dump(
+                make_plist(python=python, config=config), handle, sort_keys=True
+            )
         os.chmod(plist, 0o600)
         print(plist)
         if args.command == "install" and not args.no_load:
