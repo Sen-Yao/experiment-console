@@ -1,66 +1,6 @@
 #!/usr/bin/env python3
-from __future__ import annotations
+"""Container factory entry module for the v3 Console API."""
 
-import json
-import os
-from pathlib import Path
+from experiment_console.api import create_app
 
-from fastapi.staticfiles import StaticFiles
-
-
-STATE_DIR = Path(os.environ.get("EXPERIMENT_CONSOLE_STATE_DIR", "/private/tmp/experiment-console-runtime"))
-STATE_DIR.mkdir(parents=True, exist_ok=True)
-os.environ.setdefault("EXPERIMENT_CONSOLE_STATE_DIR", str(STATE_DIR))
-os.environ.setdefault("EXPERIMENT_CONSOLE_DEFAULT_ENTITY", "HCCS")
-os.environ.setdefault("EXPERIMENT_CONSOLE_DEFAULT_PROJECT", "DualRefGAD")
-os.environ.setdefault("EXPERIMENT_CONSOLE_DEFAULT_CONDA_ENV", "DualRefGAD")
-
-ROOT_DIR = Path(__file__).resolve().parents[1]
-FRONTEND_DIST = ROOT_DIR / "frontend" / "dist"
-
-from experiment_console.api import app, service  # noqa: E402
-from experiment_console.models import JobRecord  # noqa: E402
-
-
-def migrate_legacy_state() -> None:
-    legacy_jobs = STATE_DIR / "jobs.json"
-    legacy_cache = STATE_DIR / "sweep_summary_cache.json"
-    try:
-        if legacy_cache.exists() and not service.settings.sweeps_cache_path.exists():
-            service.settings.sweeps_cache_path.write_text(legacy_cache.read_text(encoding="utf-8"), encoding="utf-8")
-    except Exception:
-        pass
-    try:
-        if not legacy_jobs.exists() or service.list_jobs():
-            return
-        raw = json.loads(legacy_jobs.read_text(encoding="utf-8"))
-        if not isinstance(raw, list):
-            return
-        for item in raw:
-            try:
-                service.store.upsert_job(JobRecord.model_validate(item))
-            except Exception:
-                continue
-    except Exception:
-        return
-
-
-migrate_legacy_state()
-
-
-for route in app.routes:
-    if getattr(route, "path", None) != "/health":
-        continue
-    backend_health = route.endpoint
-
-    def runtime_health():
-        payload = backend_health()
-        payload["runtime"] = "experiment_console_runtime"
-        return payload
-
-    route.endpoint = runtime_health
-    route.dependant.call = runtime_health
-    break
-
-if FRONTEND_DIST.exists():
-    app.mount("/", StaticFiles(directory=str(FRONTEND_DIST), html=True), name="frontend")
+__all__ = ["create_app"]

@@ -1,0 +1,18 @@
+{
+  "profiles": {
+    "hccs-25": {
+      "ssh_target": "HCCS-25",
+      "allowed_roots": [
+        "/home/linziyao"
+      ],
+      "state_root": "/home/linziyao/.local/state/experiment-console-v3",
+      "bootstrap_argv": [
+        "/opt/anaconda3/bin/conda",
+        "run",
+        "--no-capture-output",
+        "-n",
+        "DualRefGAD"
+      ]
+    }
+  }
+}

@@ -6,6 +6,7 @@
 .conda-pkgs
 .local_deps
 .state
+.state-v3
 __pycache__
 *.py[cod]
 *.sqlite3
@@ -22,7 +23,5 @@ id_rsa
 id_ed25519
 **/console_api_token
 **/secrets/*
-frontend/node_modules
-frontend/dist
 tests
 docs

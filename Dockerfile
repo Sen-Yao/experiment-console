@@ -1,31 +1,17 @@
-ARG BASE_REGISTRY=docker.m.daocloud.io/library
+ARG BASE_REGISTRY=docker.io/library
 
-FROM --platform=$BUILDPLATFORM ${BASE_REGISTRY}/node:22-bookworm-slim AS frontend-build
-
-WORKDIR /build/frontend
-COPY frontend/package.json frontend/package-lock.json ./
-RUN npm ci --no-audit --no-fund
-COPY frontend/ ./
-RUN npm run build
-
-FROM --platform=$TARGETPLATFORM ${BASE_REGISTRY}/python:3.13-slim-bookworm AS runtime
+FROM ${BASE_REGISTRY}/python:3.13-slim-bookworm
 
 ARG CONSOLE_UID=10001
 ARG CONSOLE_GID=10001
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app:/app/backend:/app/scripts \
-    EXPERIMENT_CONSOLE_STATE_DIR=/var/lib/experiment-console/state \
-    EXPERIMENT_CONSOLE_DEFAULT_ENTITY=HCCS \
-    EXPERIMENT_CONSOLE_DEFAULT_PROJECT=DualRefGAD \
-    EXPERIMENT_CONSOLE_DEFAULT_REMOTE_HOST=HCCS-25 \
-    EXPERIMENT_CONSOLE_DEFAULT_REMOTE_CWD=/home/linziyao/DualRefGAD \
-    EXPERIMENT_CONSOLE_DEFAULT_CONDA_ENV=DualRefGAD \
-    EXPERIMENT_CONSOLE_AUTHORITY_ROLE=local-development \
-    EXPERIMENT_CONSOLE_MONITOR_WORKER=1 \
-    EXPERIMENT_CONSOLE_HEALTH_REQUIRE_WORKER=1 \
-    EXPERIMENT_CONSOLE_HEALTH_REQUIRE_LEASE=1 \
+    PYTHONPATH=/app/backend:/app:/app/scripts \
+    EXPERIMENT_CONSOLE_STATE_DIR=/var/lib/experiment-console-v3 \
+    EXPERIMENT_CONSOLE_SERVER_PROFILES=/etc/experiment-console/server-profiles.json \
+    EXPERIMENT_CONSOLE_INSTANCE_ID=yggdrasil-production-v3 \
+    EXPERIMENT_CONSOLE_REQUIRE_API_TOKEN=1 \
     HOME=/home/console
 
 RUN apt-get update \
@@ -34,23 +20,22 @@ RUN apt-get update \
     && groupadd --gid "$CONSOLE_GID" console \
     && useradd --uid "$CONSOLE_UID" --gid "$CONSOLE_GID" --create-home --shell /usr/sbin/nologin console \
     && install -d -o "$CONSOLE_UID" -g "$CONSOLE_GID" -m 0700 /home/console/.ssh \
-    && install -d -o "$CONSOLE_UID" -g "$CONSOLE_GID" -m 0750 /var/lib/experiment-console/state/results
+    && install -d -o "$CONSOLE_UID" -g "$CONSOLE_GID" -m 0750 /var/lib/experiment-console-v3 \
+    && install -d -o "$CONSOLE_UID" -g "$CONSOLE_GID" -m 0750 /etc/experiment-console
 
 WORKDIR /app
 COPY pyproject.toml ./
 COPY backend/ ./backend/
 RUN python -m pip install --no-cache-dir .
-
+COPY config/server-profiles.json /etc/experiment-console/server-profiles.json
 COPY scripts/runtime_console_server.py ./scripts/runtime_console_server.py
-COPY --from=frontend-build /build/frontend/dist ./frontend/dist
 COPY deploy/yggdrasil/container-entrypoint.sh /usr/local/bin/experiment-console-entrypoint
 COPY deploy/yggdrasil/container-healthcheck.py /usr/local/bin/experiment-console-healthcheck
 
 RUN chmod 0555 /usr/local/bin/experiment-console-entrypoint /usr/local/bin/experiment-console-healthcheck \
-    && chown -R console:console /app
+    && chown -R console:console /app /etc/experiment-console /var/lib/experiment-console-v3
 
 USER console:console
 EXPOSE 5174
-
 ENTRYPOINT ["/usr/local/bin/experiment-console-entrypoint"]
-CMD ["python", "-m", "uvicorn", "runtime_console_server:app", "--host", "0.0.0.0", "--port", "5174", "--no-server-header"]
+CMD ["python", "-m", "uvicorn", "runtime_console_server:create_app", "--factory", "--host", "0.0.0.0", "--port", "5174", "--no-server-header"]
