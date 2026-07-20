@@ -1,78 +1,78 @@
 # Experiment Console Agent Notes
 
-## Local Runner Commands
+## v3 Boundary
 
-When running the installed `experiment-runner` from this repository, use the
-repo wrapper:
-
-```bash
-./scripts/exp <runner-command> [args...]
-```
-
-Do not invoke the runner as an inline environment assignment plus Python, such
-as:
+This repository contains the v3 durable remote command executor. The only
+agent-facing entry point is:
 
 ```bash
-EXPERIMENT_CONSOLE_URL=http://127.0.0.1:5174 python3 /Users/oliver/.agents/skills/experiment-runner/scripts/experiment.py ...
+./scripts/exp <resources|run|status|logs|fetch|cancel> ...
 ```
 
-The wrapper sets `EXPERIMENT_CONSOLE_URL`, `PYTHONPATH`, and
-`PYTHONPYCACHEPREFIX` before delegating to the installed runner. Keeping commands
-in the `./scripts/exp ...` form makes Codex approval prefix rules stable because
-dynamic values such as job ids, sweep ids, and remote config paths stay ordinary
-arguments instead of becoming part of the approval prefix.
+The runner submits a structured `argv[]`, `env`, named `server_profile`, remote
+working directory, explicit GPU indices, optional `total_runs`, and the current
+Codex task id. Console owns only remote execution, receipt tracking, resource
+locks, bounded log reads, progress/ETA calculation, file fetches, cancellation,
+fixed-interval monitoring, and terminal outbox delivery.
 
-## Production Authority
+Agent owns server/GPU choice, sequencing, retry decisions, result validity,
+W&B interaction, and scientific interpretation. Do not add W&B, sweep, queue,
+artifact, result-contract, scheduler, or experiment-policy concepts to Console.
 
-The default `http://127.0.0.1:5174` endpoint is the Desktop bridge's SSH tunnel
-to the authoritative Yggdrasil Console. It is not a local production service.
-Run `./scripts/exp authority` before mutating work. If the tunnel or authority
-check fails, repair the bridge/tunnel; do not start a second local Console as a
-fallback.
+## Safety
 
-The production v2 transition is a one-time fresh-ledger cutover. Do not seed or
-import historical jobs/W&B sweeps. Verify the empty v2 ledger and changed
-ledger id before repinning runner/Desktop; after `cutover_committed_at` appears,
-only forward deployments are allowed.
+- `server_profile` is read-only deployment configuration. Runner may select a
+  profile but cannot create or mutate one.
+- `cwd` must be inside the profile's absolute `allowed_roots`.
+- `argv` is structured. Do not add a free-form shell command API.
+- API `env` rejects secret-like keys. Provision credentials in the remote
+  profile/bootstrap instead of persisting them in the Console ledger.
+- Console locks explicitly requested GPUs atomically and rejects conflicts; it
+  never queues, swaps, or auto-selects GPUs.
+- Remote receipts bind job id, command digest, PID, process group, and Linux
+  `/proc` start time. Never terminate a process by a fuzzy command match.
+- `cancel` sends `SIGTERM` to the owned process group, waits the configured
+  grace period, then sends `SIGKILL`.
+- `fetch` is limited to files under the job working directory and uses bounded
+  chunks. Never accept a local Mac path as a remote path.
+- v3 uses a new empty ledger. Do not import or reinterpret v2 state.
 
-Long-running experiment waits belong to the Console monitor worker. Supply an
-explicit `ResultContract` and `CODEX_THREAD_ID` when a job must wake Codex on a
-terminal or attention event. Do not keep a Goal active and do not create Codex
-Automations/heartbeat turns to poll a healthy experiment. A task may finish its
-current useful analysis and yield while the Console continues monitoring.
+## Verification
 
-For result downloads, `--artifact-dir` is a local runner destination. The
-runner must fetch a controlled bundle from the Console artifact API and safely
-extract it locally; never send a Mac `/Users/...` path in a Yggdrasil payload.
-
-For read-only runner checks, prefer narrow subcommand prefixes such as:
+Run the focused checks after changes:
 
 ```bash
-./scripts/exp status --job-id job_...
-./scripts/exp show-job --job-id job_...
-./scripts/exp preflight --profile sweep --config /remote/config.yaml --remote-host HCCS-25 --remote-cwd /home/linziyao/DualRefGAD
+./scripts/run_tests.sh
+./scripts/exp --help
 ```
 
-For mutating commands such as `launch-sweep`, `launch-run`, `recover-agents`,
-`stop`, or `cancel-sweep`, keep the same wrapper form and rely on Console
-safety/idempotency semantics. Ask before acting only when the current request
-does not already authorize the operation, or when the action is destructive,
-credential-sensitive, concurrent/costly, or blocked by platform approval.
+Use `python3 -m pytest` for a fast local run. Production uses the Yggdrasil
+Compose service and the Desktop bridge tunnel; do not start a second mutating
+Console on the production port.
 
-Managed sweeps use the Console agent-capacity reconciler. `recover-agents`
-only triggers one immediate reconciliation pass for a managed job. Refresh
-`status` first; if `current_failure` remains set, repair and verify the cause
-before using `--confirmed-fixed`. It does not accept GPU, max-agent, or conda
-launch overrides and cannot adopt historical jobs. Do not use or recreate a
-separate `launch-agents` path.
+## Progress Protocol
 
-## Multi-Dataset Experiment Ordering
+The remote command receives `EXPERIMENT_CONSOLE_JOB_ID` and
+`EXPERIMENT_CONSOLE_PROGRESS_FILE`. A training program may atomically replace
+that file with JSON such as:
 
-When a batch needs experiments on multiple datasets, keep GPU time moving: after
-the current dataset reaches a terminal state, immediately start or advance the
-next dataset if one remains. Prepare the sweep YAML for every dataset in the
-batch before launching the first dataset, validate them together, and include
-them in the same GitHub sync/pull handoff. Do not wait for one dataset to finish
-before creating and syncing the next dataset's sweep YAML. Confirm the next
-dataset has entered a healthy running state, then come back to pull and organize
-the previous dataset's results.
+```json
+{"completed_runs": 3, "total_runs": 10, "message": "run 3/10"}
+```
+
+Console does not parse ordinary output or call W&B to infer progress. ETA is a
+transparent estimate based on elapsed time and completed runs; with no completed
+run it is `null`.
+
+## Bridge
+
+The bridge maintains only the SSH tunnel, a singleton lock, bounded status JSON,
+and at-least-once outbox delivery. It uses the stable outbox `event_id` as
+`clientUserMessageId`; repeated deliveries are safe to deduplicate. It does not
+pin ledger ids or keep a delivery history.
+
+## Cleanup Rule
+
+Do not restore deleted v2 modules, compatibility aliases, old references, or
+archived SOPs to active paths. Historical material belongs outside the active
+runner skill and v3 runtime.

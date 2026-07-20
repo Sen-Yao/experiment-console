@@ -2,10 +2,9 @@
 .conda/
 .conda-pkgs/
 .state/
+.state-v3/
 __pycache__/
 .pytest_cache/
-frontend/node_modules/
-frontend/dist/
 *.pyc
 .env
 .env.*
