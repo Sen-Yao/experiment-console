@@ -1,109 +1,59 @@
-# Experiment Console v3
+# Experiment Wake Bridge
 
-Experiment Console is a small, durable remote command executor for Codex
-agents. It runs a structured command on a named GPU server profile, records the
-remote receipt, exposes bounded status/log/file reads, and notifies the task
-that started the job when execution reaches a terminal state.
+This repository now provides the small control-plane component Codex actually
+needs for long HCCS experiments: a Mac bridge that wakes a blocked Codex Goal
+when a tagged tmux session needs attention or reaches a terminal state.
 
-It is intentionally not a W&B controller, scheduler, result validator, artifact
-store, or experiment policy engine. The agent chooses the server, GPU, command,
-retry policy, and scientific interpretation.
-
-## Runtime Shape
+## Active Runtime
 
 ```text
 Codex agent
-  -> ./scripts/exp resources|run|status|logs|fetch|cancel
-  -> SSH tunnel
-  -> Console v3
-  -> server_profile + remote helper
-  -> GPU server
+  -> SSH HCCS-25
+  -> committed code in a detached worktree
+  -> tmux panes on explicitly selected GPUs
+  -> native W&B sweep/agents
+  -> blocked Goal
+
+Mac bridge
+  -> fixed read-only tmux inspection over SSH
+  -> session-level attention/terminal event
+  -> Codex app-server Goal-aware delivery
 ```
 
-Console stores only a v3 SQLite ledger with `jobs`, `events`, `resource_locks`,
-and `outbox`. Every job has a remote receipt. A fixed monitor worker checks
-active jobs without per-job schedules or model polling.
+The bridge does not understand W&B, schedule work, lock GPUs, terminate panes,
+or certify scientific results. It retains only a bounded status file and a
+mode-600 JSON event outbox for restart-safe delivery deduplication.
 
-## Runner
+See [`docs/desktop-bridge.md`](docs/desktop-bridge.md) for the tmux registration
+contract and deployment commands.
 
-The repository wrapper is the canonical command shape:
+## Development
 
-```bash
-./scripts/exp resources --profile hccs-25
-
-./scripts/exp run \
-  --profile hccs-25 \
-  --cwd /home/linziyao/DualRefGAD \
-  --gpu 0 \
-  --total-runs 10 \
-  --env MODE=experiment \
-  -- python train.py --dataset elliptic
-
-./scripts/exp status job_<id>
-./scripts/exp logs job_<id> --stream stderr
-./scripts/exp fetch job_<id> results/summary.json --output ./summary.json
-./scripts/exp cancel job_<id> --reason "stop requested"
-```
-
-`run` uses `CODEX_THREAD_ID` automatically when available. Pass
-`--task-id` outside Codex. A generated `request_id` is printed on every
-submission; pass `--request-id` again after a network timeout to make the retry
-idempotent.
-
-The command receives `EXPERIMENT_CONSOLE_JOB_ID` and
-`EXPERIMENT_CONSOLE_PROGRESS_FILE`. Write progress JSON there when the command
-contains multiple runs. Console calculates ETA only after at least one
-completed run.
-
-## Local Development
-
-Requirements: Python 3.11+, the project dependencies, and SSH access to the
-profiled host for real execution.
+Requirements: Python 3.11+ and SSH access to HCCS-25.
 
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -e ".[dev]"
 ./scripts/run_tests.sh
+python3 -m desktop_bridge \
+  --config config/desktop-bridge.example.json dry-run
 ```
 
-Start an isolated local Console:
+## Legacy Console v3 Rollback
 
-```bash
-./scripts/start_local_console.sh
-```
+The v3 durable executor remains under `backend/experiment_console`, with its
+runner, Compose definition, and state format unchanged. It is not the active
+agent path. Keep the old Yggdrasil deployment and Mac config disabled during
+initial validation so the whole system can be rolled back without importing or
+rewriting ledger state.
 
-It serves `http://127.0.0.1:5174` with the local `config/server-profiles.json`
-and a disposable `.state-v3` ledger. Set
-`EXPERIMENT_CONSOLE_EXPECTED_INSTANCE_ID=local-experiment-console-v3` before
-using the runner against it.
+The retained v3 implementation includes its existing structured argv, allowed
+root, request-id, receipt ownership, bounded read, cancellation, and GPU
+process-classification safeguards. Do not extend it while it is in rollback
+status.
 
-## Deployment
-
-Yggdrasil runs one Compose service with one mounted v3 state directory, one
-server-profile file, SSH configuration, and a bearer token. See
-[`compose.yggdrasil.yaml`](compose.yggdrasil.yaml). The service may be stopped
-for backup and replacement; v2 state is never imported.
-
-The Desktop bridge keeps the SSH tunnel alive and delivers terminal events:
-
-```bash
-python3 -m desktop_bridge --config ~/.config/experiment-console/bridge.json run
-```
-
-The bridge config example is [`config/desktop-bridge.example.json`](config/desktop-bridge.example.json).
-
-## API Surface
-
-- `GET /health`
-- `GET /api/resources`
-- `POST /api/jobs`
-- `GET /api/jobs/{job_id}`
-- `GET /api/jobs/{job_id}/logs`
-- `GET /api/jobs/{job_id}/files`
-- `POST /api/jobs/{job_id}/cancel`
-- `POST /api/outbox/claim`
-- `POST /api/outbox/{event_id}/ack`
-
-There is no `/api/runner` compatibility namespace, W&B endpoint, intent API,
-frontend, result aggregation endpoint, or artifact bundle endpoint.
+Its launch resource check remains fail-closed: a GPU with a foreign or unknown
+compute process is unavailable even when its free-memory threshold passes.
+While a v3 job is running, a newly observed foreign process remains an
+operational warning; Console does not kill or cancel an unrelated process.

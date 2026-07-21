@@ -16,7 +16,7 @@ def load_launchd_module():
     return module
 
 
-def test_launchd_runs_only_the_v3_bridge(tmp_path):
+def test_launchd_runs_only_the_tmux_wake_bridge(tmp_path):
     module = load_launchd_module()
     payload = module.make_plist(
         python=Path("/usr/bin/python3"), config=tmp_path / "bridge.json"
@@ -27,7 +27,7 @@ def test_launchd_runs_only_the_v3_bridge(tmp_path):
     assert "repin-authority" not in arguments
 
 
-def test_packaging_has_no_frontend_or_domain_controller():
+def test_legacy_console_packaging_remains_available_for_rollback():
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     compose = (ROOT / "compose.yggdrasil.yaml").read_text(encoding="utf-8")
     local_start = (ROOT / "scripts" / "start_local_console.sh").read_text(

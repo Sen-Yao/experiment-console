@@ -4,6 +4,7 @@ import json
 import select
 import subprocess
 import time
+from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Protocol
 
 from .config import BridgeConfig
@@ -15,6 +16,13 @@ class AppServerError(RuntimeError):
 
 class ThreadBusy(AppServerError):
     pass
+
+
+@dataclass(frozen=True)
+class DeliveryOutcome:
+    status: str
+    turn_id: str | None = None
+    reason: str | None = None
 
 
 class LineTransport(Protocol):
@@ -94,9 +102,9 @@ class CodexAppServerSession:
                 "initialize",
                 {
                     "clientInfo": {
-                        "name": "experiment_console_bridge_v3",
-                        "title": "Experiment Console Bridge v3",
-                        "version": "3.0.0",
+                        "name": "experiment_wake_bridge",
+                        "title": "Experiment Wake Bridge",
+                        "version": "1.0.0",
                     },
                     "capabilities": {
                         "optOutNotificationMethods": [
@@ -118,13 +126,39 @@ class CodexAppServerSession:
     def __exit__(self, exc_type, exc, traceback) -> None:
         self.transport.close()
 
-    def deliver(self, task_id: str, text: str, *, event_id: str) -> str:
-        result = self._request("thread/resume", {"threadId": task_id})
-        self._require_idle(result)
+    def deliver(
+        self, task_id: str, text: str, *, event_id: str
+    ) -> DeliveryOutcome:
+        thread, archived = self._find_thread(task_id)
+        if thread is None:
+            return DeliveryOutcome("orphaned", reason="thread_not_found")
+        if archived:
+            return DeliveryOutcome("orphaned", reason="thread_archived")
+        status_type = self._status_type(thread)
+        if status_type == "active":
+            return DeliveryOutcome("deferred", reason="thread_active")
+        if status_type not in {"idle", "notLoaded"}:
+            raise AppServerError(f"target Codex task status is {status_type!r}")
+
         goal_result = self._request("thread/goal/get", {"threadId": task_id})
         goal = goal_result.get("goal")
-        if isinstance(goal, dict) and goal.get("status") == "active":
-            raise ThreadBusy("target Codex task has an active Goal")
+        if not isinstance(goal, dict):
+            return DeliveryOutcome("orphaned", reason="goal_missing")
+        goal_status = goal.get("status")
+        if goal_status == "complete":
+            return DeliveryOutcome("orphaned", reason="goal_complete")
+        if goal_status in {
+            "active",
+            "paused",
+            "usageLimited",
+            "budgetLimited",
+        }:
+            return DeliveryOutcome("deferred", reason=f"goal_{goal_status}")
+        if goal_status != "blocked":
+            raise AppServerError(f"target Goal status is {goal_status!r}")
+
+        result = self._request("thread/resume", {"threadId": task_id})
+        self._require_idle(result)
         turn_result = self._request(
             "turn/start",
             {
@@ -137,13 +171,50 @@ class CodexAppServerSession:
         turn_id = turn.get("id") if isinstance(turn, dict) else None
         if not isinstance(turn_id, str) or not turn_id:
             raise AppServerError("turn/start did not return a turn id")
-        return turn_id
+        return DeliveryOutcome("delivered", turn_id=turn_id)
+
+    def _find_thread(
+        self, task_id: str
+    ) -> tuple[Mapping[str, Any] | None, bool]:
+        for archived in (False, True):
+            cursor: str | None = None
+            for _ in range(100):
+                params: dict[str, Any] = {
+                    "archived": archived,
+                    "limit": 100,
+                    "sourceKinds": [],
+                    "useStateDbOnly": True,
+                }
+                if cursor:
+                    params["cursor"] = cursor
+                result = self._request("thread/list", params)
+                data = result.get("data")
+                if not isinstance(data, list):
+                    raise AppServerError("thread/list returned no data array")
+                for item in data:
+                    if isinstance(item, dict) and item.get("id") == task_id:
+                        return item, archived
+                next_cursor = result.get("nextCursor")
+                if not isinstance(next_cursor, str) or not next_cursor:
+                    break
+                cursor = next_cursor
+            else:
+                raise AppServerError("thread/list archive scan exceeded page limit")
+        return None, False
+
+    @staticmethod
+    def _status_type(thread: Mapping[str, Any]) -> str | None:
+        status = thread.get("status")
+        return status.get("type") if isinstance(status, dict) else None
 
     @staticmethod
     def _require_idle(result: Mapping[str, Any]) -> None:
         thread = result.get("thread")
-        status = thread.get("status") if isinstance(thread, dict) else None
-        status_type = status.get("type") if isinstance(status, dict) else None
+        status_type = (
+            CodexAppServerSession._status_type(thread)
+            if isinstance(thread, dict)
+            else None
+        )
         if status_type == "active":
             raise ThreadBusy("target Codex task is active")
         if status_type not in {"idle", "notLoaded"}:

@@ -18,7 +18,7 @@ DEFAULT_CONFIG = Path.home() / ".config" / "experiment-console" / "bridge.json"
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
-        description="Experiment Console v3 terminal-event bridge"
+        description="HCCS tmux-to-Codex Goal wake bridge"
     )
     result.add_argument(
         "--config",
@@ -57,10 +57,10 @@ def main(argv: list[str] | None = None) -> int:
         print(
             json.dumps(
                 {
-                    "consumer_id": config.consumer_id,
-                    "console_url": config.console_url,
-                    "ssh_command": config.ssh_command(),
+                    "ssh_target": config.ssh_target,
+                    "ssh_command": config.ssh_command("tmux list-panes -a"),
                     "codex_command": config.app_server_command(),
+                    "event_file": str(config.event_file),
                 },
                 indent=2,
             )

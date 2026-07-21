@@ -164,6 +164,11 @@ def format_job(job: dict[str, Any]) -> str:
         lines.append(f"message: {job.get('progress_message')}")
     if job.get("last_error"):
         lines.append(f"last_error: {job.get('last_error')}")
+    if job.get("resource_conflicts"):
+        lines.append(
+            "resource_conflicts: "
+            + json.dumps(job["resource_conflicts"], ensure_ascii=False, sort_keys=True)
+        )
     return "\n".join(lines)
 
 

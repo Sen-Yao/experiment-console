@@ -1,7 +1,14 @@
-"""Lightweight macOS bridge for Experiment Console and Codex Desktop."""
+"""Lightweight HCCS tmux-to-Codex wake bridge."""
 
 from .config import BridgeConfig, ConfigError
-from .models import OutboxEvent
+from .models import PaneSnapshot, SessionSnapshot, WakeEvent
 from .service import BridgeService
 
-__all__ = ["BridgeConfig", "BridgeService", "ConfigError", "OutboxEvent"]
+__all__ = [
+    "BridgeConfig",
+    "BridgeService",
+    "ConfigError",
+    "PaneSnapshot",
+    "SessionSnapshot",
+    "WakeEvent",
+]

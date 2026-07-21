@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "skill" / "experiment-runner" / "scripts" / "experiment.py"
+SCRIPT = ROOT / "legacy" / "experiment-console-v3-runner" / "scripts" / "experiment.py"
 
 
 def load_runner():
@@ -17,7 +17,7 @@ def load_runner():
     return module
 
 
-def test_command_surface_is_v3_only():
+def test_legacy_command_surface_is_v3_only():
     module = load_runner()
     parser = module.parser()
     subparsers = next(
@@ -35,9 +35,10 @@ def test_command_surface_is_v3_only():
     }
 
 
-def test_repo_wrapper_delegates_directly_to_the_v3_skill():
+def test_repo_wrapper_requires_explicit_legacy_rollback():
     wrapper = (ROOT / "scripts" / "exp").read_text(encoding="utf-8")
-    assert "skill/experiment-runner/scripts/experiment.py" in wrapper
+    assert "legacy/experiment-console-v3-runner/scripts/experiment.py" in wrapper
+    assert "EXPERIMENT_CONSOLE_ENABLE_LEGACY_V3" in wrapper
     assert "EXPERIMENT_CONSOLE_URL" in wrapper
     assert "launch-sweep" not in wrapper
 

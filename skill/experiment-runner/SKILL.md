@@ -1,113 +1,152 @@
 ---
 name: experiment-runner
-description: "Use when Codex needs to inspect GPU resources, start or observe a durable remote experiment command, read its console output, fetch an explicit result file, or cancel an Experiment Console v3 job."
+description: "Use when Codex needs to inspect HCCS-25 GPUs, prepare a committed execution worktree, launch or inspect tmux experiment panes, operate native W&B sweeps, stop a pane, or hand a long experiment to the Goal wake bridge."
 ---
 
 # Experiment Runner
 
-Use the v3 runner as the only Experiment Console client. It submits structured
-commands to the Yggdrasil executor; it does not execute SSH, W&B, scheduling, or
-result-analysis side effects locally.
+Treat this skill as operational knowledge, not a runtime service. Run commands
+directly over the `HCCS-25` SSH alias. Use native Git, tmux, NVIDIA, conda, and
+W&B interfaces; do not route new work through Experiment Console v3.
 
-Within the Console repository, use the stable wrapper:
+## Ownership Boundary
+
+Codex owns server/GPU choice, Git state, worktree creation, commands, W&B,
+retry/stop decisions, result validation, and scientific interpretation. The Mac
+bridge only observes tagged tmux panes and wakes the bound Codex Goal.
+
+Do not add a queue, GPU allocator, experiment database, remote daemon, W&B
+adapter, watchdog, or result aggregator to this skill. Keep repeated scientific
+operations in project scripts and W&B sweep configs.
+
+## Start With Live Facts
+
+HCCS is shared and drift-prone. Re-probe before every launch:
 
 ```bash
-cd /Users/oliver/Developer/experiment-console
-./scripts/exp <command> ...
+ssh HCCS-25 hostname
+ssh HCCS-25 tmux -V
+ssh HCCS-25 nvidia-smi \
+  --query-gpu=index,name,memory.free,utilization.gpu \
+  --format=csv,noheader,nounits
+ssh HCCS-25 nvidia-smi \
+  --query-compute-apps=gpu_uuid,pid,used_gpu_memory \
+  --format=csv,noheader,nounits
 ```
 
-## Boundary
+Choose GPUs explicitly from both memory/utilization and live compute-process
+evidence. Do not rely on a previous probe, kill another process, or assume that
+an apparently idle GPU belongs to this task.
 
-Console owns durable process execution, explicit GPU locks, remote receipts,
-bounded logs and file reads, fixed monitoring, cancellation, and terminal task
-notification. Agent owns GPU choice, command construction, ordering, retries,
-W&B access, and scientific result interpretation.
+Read [references/hccs25-runtime.md](references/hccs25-runtime.md) when preparing
+Git, conda, credentials, proxy, or storage on HCCS-25.
 
-Do not add experiment-framework control, scheduling policy, result validation,
-aggregation, local profile validation, or raw Console API commands to runner.
+## Freeze Before Formal Work
+
+Use `/home/linziyao/DualRefGAD` only as the mutable development checkout. Make
+all code edits, tests, commits, pushes, and Git operations there. A formal run
+must use a detached worktree created from the committed full SHA; never run it
+from the mutable checkout.
+
+Before launch, commit and push both:
+
+- the code/config commit used by the run;
+- the research protocol/config and prepared run manifest.
+
+The run manifest binds the investigation, code SHA, research protocol commit,
+config digest, seeds, W&B destination, and later the sweep/run/result digests.
+Do not require an atomic transaction across Git, HCCS, and W&B. Record the
+manifest state as `prepared`, `launched`, `completed`, or `invalid`.
 
 ## Execution Unit
 
-Default to one runner job per resolved trial attempt: one dataset, seed, and
-method/config identity. Keep epochs and checkpoints from the same training
-trajectory in that job, but split hidden loops over datasets, seeds, method
-families, readers, or other independently retryable configurations.
+Default to one W&B run per independently retryable trial: one dataset, seed,
+and resolved method/config identity. Keep epochs and checkpoints from the same
+training trajectory together, but split hidden loops over datasets, seeds,
+method families, readers, or other independently retryable configurations.
 
-Tightly coupled branches may remain in one job only when shared initialization,
-state, or RNG is part of the scientific estimand. Such jobs must expose
-per-branch progress, artifacts, timing, and bounded recovery. Before submission,
-inspect the entrypoint and config for hidden scans; the top-level `argv` or a
-seed-only W&B grid does not prove that a job is atomic.
+Keep tightly coupled branches together only when shared initialization, state,
+or RNG is part of the scientific estimand. Expose per-branch progress,
+artifacts, timing, and bounded recovery. Inspect the entrypoint and config for
+hidden scans; a seed-only sweep grid does not prove the trial is atomic.
 
-## Commands
+## W&B Native Sweeps
 
-Inspect a server profile before choosing GPUs:
+Prefer native W&B sweeps and agents for parameter assignment, run identity,
+aggregation, and audit. Read
+[references/wandb-native-sweeps.md](references/wandb-native-sweeps.md) before
+creating a sweep or diagnosing network/auth failures.
+
+Run the direct network/project preflight before `wandb.sweep`; OpenClash is a
+diagnosed network fallback, not the default path and not an authentication
+repair. Create a sweep exactly once, record its ID in the run manifest, then
+start one tmux pane per explicitly selected GPU. W&B agents may run in
+parallel. Do not implement local sweep scheduling or automatically downgrade
+to offline mode.
+
+For SenyaoLab investigations, the standing user authorization allows execution
+on HCCS and transmission to `HCCS/DualRefGAD` of experiment config, seed, run
+status, metadata, AUROC, and AP. It excludes raw data, source code, credentials,
+and undeclared artifacts. Ask again only if destination, data classes, or the
+investigation lifecycle changes; experiment count is not an authorization
+limit unless the user or platform explicitly makes it one.
+
+## Tmux And Goal Handoff
+
+Read [references/tmux-goal-watch.md](references/tmux-goal-watch.md) for the
+exact registration contract. In summary:
+
+1. Create the session and all experiment panes in the detached worktree.
+2. Set window `remain-on-exit=on`.
+3. Set thread, generation, investigation, start, expected, and attention
+   options on the session.
+4. Set `@codex_watch=1` last.
+5. Verify the bridge sees the session before handing off.
+
+Use `expected_seconds` and `attention_after` as advisory timing. An overrun only
+wakes Codex; it never stops work. When external execution is the only remaining
+dependency, checkpoint the manifest/investigation, follow current Goal rules to
+enter `blocked`, and end the turn. Do not keep a Goal active for model polling.
+
+After a wake event, re-probe tmux, processes, GPUs, W&B, the run manifest, and
+declared artifacts. A pane terminal state alone is not scientific readiness.
+
+## Inspect And Stop
+
+Use bounded tmux output and exact pane IDs:
 
 ```bash
-./scripts/exp resources --profile hccs-25
+ssh HCCS-25 "tmux list-panes -t <session> -F '#{pane_id}|#{pane_dead}|#{pane_dead_status}|#{pane_current_command}'"
+ssh HCCS-25 "tmux capture-pane -p -t %<pane-id> -S -80"
 ```
 
-Run one durable command. Pass the command after `--`; runner automatically uses
-`CODEX_THREAD_ID` when available.
+Codex may stop an abnormal pane after inspecting evidence:
 
 ```bash
-./scripts/exp run \
-  --profile hccs-25 \
-  --cwd /home/linziyao/DualRefGAD \
-  --gpu 0 \
-  --total-runs 5 \
-  -- python train.py --dataset elliptic
+ssh HCCS-25 "tmux kill-pane -t %<pane-id>"
 ```
 
-Read execution state, logs, or an explicit file:
-
-```bash
-./scripts/exp status job_<id>
-./scripts/exp logs job_<id> --stream stderr
-./scripts/exp fetch job_<id> results/summary.json --output ./summary.json
-```
-
-Cancel only when the user or current task has authorized termination:
-
-```bash
-./scripts/exp cancel job_<id> --reason "requested by user"
-```
-
-After `run`, retain the printed `request_id`. If submission times out, retry
-with `--request-id <same-id>`; do not create a new id until status proves the
-first request did not create a job.
-
-## Progress
-
-The command receives `EXPERIMENT_CONSOLE_JOB_ID` and
-`EXPERIMENT_CONSOLE_PROGRESS_FILE`. A multi-run program may atomically replace
-the progress file with:
-
-```json
-{"completed_runs": 3, "total_runs": 10, "message": "run 3/10"}
-```
-
-Console estimates ETA only after one completed run. Treat it as a transparent
-arithmetic estimate, not a completion guarantee.
-
-When a healthy job is the only remaining dependency, rely on Console's terminal
-event and end the current turn. Do not keep a Codex Goal active solely for the
-wait, and do not create model polling or heartbeat tasks.
+Use only `tmux kill-pane`. Accept that child processes can survive, then
+re-probe exact process identity and GPU state. Never fuzzy-match or broadly kill
+processes. Healthy sibling panes continue.
 
 ## Gotchas
 
-- **Wrong Console instance**: runner reports an instance mismatch when the
-  loopback port targets local development or an old service. Repair the Desktop
-  bridge/tunnel or set the expected local instance for isolated testing; do not
-  mutate client identity state.
-- **GPU rejected after resource inspection**: another job acquired the atomic
-  lock between observations. Query `resources` again and let the agent choose;
-  Console does not queue or auto-select another GPU.
-- **Hidden experiment matrix**: do not package independently retryable trials
-  into one job merely to reduce Console or W&B run count. Split the trials or
-  record a scientifically necessary coupling exception before launch.
-- **No ETA**: the command has not published a completed run. Check `logs` and
-  the progress writer instead of asking Console to parse W&B or ordinary output.
-- **Fetch denied**: the requested path resolves outside the job working
-  directory. Fetch only an explicit result or `.experiment-console-v3` log path
-  owned by that job.
+- Non-interactive SSH does not automatically load proxy variables. This is
+  correct for the direct default. Source the mode-600 HCCS environment without
+  printing it only after a diagnosed network failure selects proxy fallback.
+- Native `wandb agent` needs the W&B backend for assignments. Offline runs do
+  not preserve native sweep scheduling; any `offline-manual` fallback is a new
+  explicit protocol.
+- A native agent resolves assigned-trial `python` from `PATH`. Activate the
+  project conda environment inside the tmux pane; invoking only the environment's
+  `wandb` executable can still run trials with system Python.
+- Set `@codex_watch=1` last. A fast command can finish before an incomplete
+  registration becomes visible.
+- `remain-on-exit` preserves normal terminal panes across bridge downtime.
+  Killing the final pane may remove the session; cancellation is already an
+  agent-observed action and does not rely on another wake.
+- One generation emits at most one attention and one terminal event. Re-arm a
+  continuing session with a new generation after Codex has handled attention.
+- Never put W&B keys, proxy credentials, tokens, raw data, or source payloads in
+  tmux options, argv, manifests, investigation prose, or logs.

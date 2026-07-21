@@ -1,13 +1,35 @@
-# Desktop Bridge v3
+# Experiment Wake Bridge
 
-The bridge runs on the Mac. It supervises one SSH local forward to Yggdrasil,
-claims terminal events from Console, and starts a turn in the originating Codex
-task. Healthy jobs produce no bridge messages.
+The Mac bridge polls only tagged tmux sessions on HCCS-25. It does not launch
+commands, allocate GPUs, inspect W&B, validate results, or maintain an
+experiment ledger. A watched tmux session is the remote execution fact.
 
-The bridge has no ledger pin or delivery history. Console outbox events use a
-stable `event_id`; the bridge sends it as `clientUserMessageId` and acknowledges
-only after `turn/start` accepts the message. A failed ack causes the same event
-to be claimed again, which is the intended at-least-once behavior.
+Register a session by setting these tmux user options after its panes exist:
+
+```text
+@codex_thread_id
+@codex_generation
+@codex_investigation_id
+@codex_started_at
+@codex_expected_seconds
+@codex_attention_after
+```
+
+Set `remain-on-exit=on`, then set `@codex_watch=1` last. The bridge ignores
+incomplete registrations. It emits one attention event and one terminal event
+per generation. Attention never terminates a pane.
+
+Events are kept in a mode-600 JSON outbox. Delivery uses the stable event id as
+`clientUserMessageId`. A blocked Goal is resumed; active, paused, or limited
+Goals are deferred; complete, missing, and archived Goals are marked orphaned.
+Pending events remain until delivery is resolved. Delivered and orphaned
+records remain only while their source tmux generation exists, and the outbox
+has a hard record limit; reaching it makes bridge health fail explicitly.
+
+For pending delivery, the bridge starts the bundled Codex
+`app-server --stdio` process, checks the target task and Goal, submits at most
+the bounded pending batch, and closes the process. It does not require a
+standalone Codex daemon or app-server control socket.
 
 Create a config from `config/desktop-bridge.example.json`, then run:
 
@@ -17,14 +39,12 @@ python3 -m desktop_bridge --config ~/.config/experiment-console/bridge.json once
 python3 -m desktop_bridge --config ~/.config/experiment-console/bridge.json run
 ```
 
-`run` is the long-lived process. Use launchd or another local supervisor to
-restart it; the bridge itself handles tunnel reconnect and sleep/wake gaps.
-
-Render and install the provided LaunchAgent when desired:
+Install the in-place LaunchAgent replacement with:
 
 ```bash
-python3 scripts/manage_codex_bridge_launchd.py render \
-  --config ~/.config/experiment-console/bridge.json
 python3 scripts/manage_codex_bridge_launchd.py install \
   --config ~/.config/experiment-console/bridge.json
 ```
+
+The previous Console bridge config and LaunchAgent plist should be retained as
+disabled rollback artifacts during the initial production validation.

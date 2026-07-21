@@ -6,7 +6,13 @@ PYTHON_BIN="${PYTHON_BIN:-/opt/homebrew/bin/python3}"
 CONSOLE_URL="${EXPERIMENT_CONSOLE_URL:-http://127.0.0.1:5174}"
 PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-/private/tmp/pycache}"
 
+if [[ "${EXPERIMENT_CONSOLE_ENABLE_LEGACY_V3:-0}" != "1" ]]; then
+  echo "Experiment Console v3 is disabled. Use the experiment-runner skill and HCCS tmux." >&2
+  echo "Set EXPERIMENT_CONSOLE_ENABLE_LEGACY_V3=1 only for an explicit rollback." >&2
+  exit 2
+fi
+
 export EXPERIMENT_CONSOLE_URL="$CONSOLE_URL"
 export PYTHONPYCACHEPREFIX
 
-exec "$PYTHON_BIN" "$ROOT/skill/experiment-runner/scripts/experiment.py" "$@"
+exec "$PYTHON_BIN" "$ROOT/legacy/experiment-console-v3-runner/scripts/experiment.py" "$@"

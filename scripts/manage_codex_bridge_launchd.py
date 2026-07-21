@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
-        description="Install or remove the Experiment Console v3 bridge LaunchAgent."
+        description="Install or remove the HCCS tmux Goal wake bridge LaunchAgent."
     )
     result.add_argument("command", choices=["render", "install", "uninstall"])
     result.add_argument(
@@ -39,7 +39,7 @@ def parser() -> argparse.ArgumentParser:
 
 
 def make_plist(*, python: Path, config: Path) -> dict[str, object]:
-    log_dir = Path.home() / "Library" / "Logs" / "Experiment Console Bridge v3"
+    log_dir = Path.home() / "Library" / "Logs" / "Experiment Wake Bridge"
     return {
         "Label": LABEL,
         "ProgramArguments": [
@@ -79,7 +79,7 @@ def main(argv: list[str] | None = None) -> int:
             parser().error(f"bridge config does not exist: {config}")
         plist.parent.mkdir(parents=True, exist_ok=True)
         if args.command == "install":
-            log_dir = Path.home() / "Library" / "Logs" / "Experiment Console Bridge v3"
+            log_dir = Path.home() / "Library" / "Logs" / "Experiment Wake Bridge"
             log_dir.mkdir(parents=True, exist_ok=True)
         with plist.open("wb") as handle:
             plistlib.dump(

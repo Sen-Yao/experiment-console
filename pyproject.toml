@@ -1,7 +1,7 @@
 [project]
 name = "experiment-console"
 version = "3.0.0"
-description = "Durable remote experiment command executor for Codex agents."
+description = "Goal-aware tmux wake bridge for Codex experiments on HCCS."
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.115",
