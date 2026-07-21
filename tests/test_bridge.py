@@ -177,6 +177,58 @@ def test_bridge_defers_active_goal_then_delivers_when_blocked(tmp_path):
     assert EventStore(config.event_file).pending(10) == []
 
 
+def test_bridge_delivers_at_most_one_event_per_poll(tmp_path):
+    config = BridgeConfig(
+        ssh_target="HCCS-25",
+        status_file=tmp_path / "status",
+        event_file=tmp_path / "events",
+        lock_file=tmp_path / "lock",
+    )
+    first_snapshot = snapshot()
+    second_snapshot = replace(
+        first_snapshot,
+        session_id="$2",
+        session_name="codex-validation-2",
+        generation="generation-2",
+    )
+    first_session = FakeSession(
+        [
+            DeliveryOutcome("delivered", turn_id="turn-1"),
+            DeliveryOutcome("delivered", turn_id="turn-should-not-start"),
+        ]
+    )
+    first = BridgeService(
+        config,
+        tmux=FakeTmux([first_snapshot, second_snapshot]),
+        app_session_factory=factory_for(first_session),
+        status_store=MemoryStatus(),
+        event_store=EventStore(config.event_file),
+        wall_clock=lambda: 130,
+    ).run_once()
+
+    assert first.delivered == 1
+    assert len(first_session.deliveries) == 1
+    assert [event.event_id for event in EventStore(config.event_file).pending(10)] == [
+        "tmux:generation-2:terminal"
+    ]
+
+    second_session = FakeSession(
+        [DeliveryOutcome("delivered", turn_id="turn-2")]
+    )
+    second = BridgeService(
+        config,
+        tmux=FakeTmux([first_snapshot, second_snapshot]),
+        app_session_factory=factory_for(second_session),
+        status_store=MemoryStatus(),
+        event_store=EventStore(config.event_file),
+        wall_clock=lambda: 131,
+    ).run_once()
+
+    assert second.delivered == 1
+    assert second_session.deliveries[0][1] == "tmux:generation-2:terminal"
+    assert EventStore(config.event_file).pending(10) == []
+
+
 def test_bridge_marks_complete_goal_event_orphaned(tmp_path):
     config = BridgeConfig(
         ssh_target="HCCS-25",

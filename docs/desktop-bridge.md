@@ -27,9 +27,12 @@ records remain only while their source tmux generation exists, and the outbox
 has a hard record limit; reaching it makes bridge health fail explicitly.
 
 For pending delivery, the bridge starts the bundled Codex
-`app-server --stdio` process, checks the target task and Goal, submits at most
-the bounded pending batch, and closes the process. It does not require a
-standalone Codex daemon or app-server control socket.
+`app-server --stdio` process, checks the target task and Goal, and submits at
+most one accepted turn per poll before closing the process. Remaining events
+stay pending until a later poll rechecks the task and Goal. A delivered record
+means app-server accepted `turn/start`; it does not mean Codex finished the
+turn. The bridge does not require a standalone Codex daemon or app-server
+control socket.
 
 Create a config from `config/desktop-bridge.example.json`, then run:
 

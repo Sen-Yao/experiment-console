@@ -113,6 +113,9 @@ class BridgeService:
                     if outcome.status == "delivered" and outcome.turn_id:
                         self.event_store.mark_delivered(event.event_id, outcome.turn_id)
                         result.delivered += 1
+                        # Let Codex consume this turn before another event can
+                        # resume the same task on a later poll.
+                        break
                     elif outcome.status == "orphaned":
                         reason = outcome.reason or "not_deliverable"
                         self.event_store.mark_orphaned(event.event_id, reason)
