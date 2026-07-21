@@ -26,6 +26,19 @@ W&B access, and scientific result interpretation.
 Do not add experiment-framework control, scheduling policy, result validation,
 aggregation, local profile validation, or raw Console API commands to runner.
 
+## Execution Unit
+
+Default to one runner job per resolved trial attempt: one dataset, seed, and
+method/config identity. Keep epochs and checkpoints from the same training
+trajectory in that job, but split hidden loops over datasets, seeds, method
+families, readers, or other independently retryable configurations.
+
+Tightly coupled branches may remain in one job only when shared initialization,
+state, or RNG is part of the scientific estimand. Such jobs must expose
+per-branch progress, artifacts, timing, and bounded recovery. Before submission,
+inspect the entrypoint and config for hidden scans; the top-level `argv` or a
+seed-only W&B grid does not prove that a job is atomic.
+
 ## Commands
 
 Inspect a server profile before choosing GPUs:
@@ -90,6 +103,9 @@ wait, and do not create model polling or heartbeat tasks.
 - **GPU rejected after resource inspection**: another job acquired the atomic
   lock between observations. Query `resources` again and let the agent choose;
   Console does not queue or auto-select another GPU.
+- **Hidden experiment matrix**: do not package independently retryable trials
+  into one job merely to reduce Console or W&B run count. Split the trials or
+  record a scientifically necessary coupling exception before launch.
 - **No ETA**: the command has not published a completed run. Check `logs` and
   the progress writer instead of asking Console to parse W&B or ordinary output.
 - **Fetch denied**: the requested path resolves outside the job working
