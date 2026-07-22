@@ -17,6 +17,30 @@ intermediate prompts to one short instruction that names the investigation,
 manifest, and sweep and asks Codex to apply this policy. The final completion or
 error turn may use a complete verification prompt again.
 
+## Ordinary Heartbeat Fast Path
+
+Use this read-only fast path when the previous checkpoint was healthy and no launch,
+pane-topology change, error, completion, or other material transition is being
+handled:
+
+1. Load only `research`, `experiment-runner`, and this reference. Do not load
+   `research-investigation` unless this wake escalates to a material record or
+   scientific decision.
+2. Read the existing heartbeat and run manifest.
+3. Run one compact structured probe covering expected pane liveness and
+   process/GPU ownership plus W&B status, declared artifacts, and manifest
+   identities. Prefer an existing project validator and bounded machine-readable
+   output containing counts, identities, and errors rather than per-run rows.
+4. Classify the result as complete, error, zero-progress, or healthy incomplete.
+5. For healthy incomplete, calculate the delay, obtain a fresh clock reading
+   after all checks, update the same heartbeat for
+   `ceil_to_minute(fresh_now + next_delay)`, give a one-line result, and stop.
+
+On a healthy incomplete fast path, do not capture pane logs, inspect Git or
+source, reread skills, repeat tmux/GPU/process probes, edit files, launch or stop
+work, or interpret science. Escalate only when the evidence changes the decision;
+then load the additional skills and diagnostics needed for that condition.
+
 ## Valid Progress
 
 Let:
@@ -64,7 +88,9 @@ next_delay = clamp(ETA / 2, 5 minutes, 15 minutes)
 
 Do not adjust the formula for GPU count, live agent count, or trial-count
 changes. When ETA falls below five minutes, enter sticky final polling and keep
-five-minute one-shot checks until complete or invalid.
+five-minute one-shot checks until complete or invalid. Always anchor the next
+delay to a fresh time read immediately before updating the automation; time
+spent loading skills or validating progress must not shorten the requested wait.
 
 ## Wake Actions
 

@@ -97,6 +97,12 @@ handing off a long run. Use one active one-shot heartbeat for the Codex task.
 After scheduling it, checkpoint material launch state, follow current Goal rules
 to enter `blocked`, and end the turn. Do not keep a Goal active for polling.
 
+For an ordinary healthy wake, use the reference's read-only fast path: load no
+`research-investigation`, run one compact structured probe, schedule from a
+fresh post-check clock reading, report one line, and stop. Do not capture healthy
+logs, inspect Git/source, or repeat probes. Leave the fast path only when evidence
+requires completion, diagnosis, or another material decision.
+
 At every automatic or manual resume:
 
 1. consume, cancel, or update the existing heartbeat before creating another;

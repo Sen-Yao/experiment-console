@@ -19,6 +19,14 @@ Use one active one-shot heartbeat per Codex task. After each wake, re-read tmux,
 exact processes/GPU state, W&B, the run manifest, and declared artifacts before
 deciding whether the sweep is complete, invalid, or still running.
 
+Treat an ordinary healthy wake as a read-only fast path. Load `research`,
+`experiment-runner`, and its dynamic-heartbeat reference only; do not load
+`research-investigation` unless a material transition needs a durable record or
+scientific decision. Read the existing heartbeat and manifest, then use one
+compact structured probe for pane/process/GPU ownership and
+W&B/artifact/identity validity. Do not capture healthy logs, inspect Git/source,
+or repeat probes.
+
 For a healthy incomplete sweep:
 
 - count only trials whose W&B terminal state, parseable artifacts, and manifest
@@ -26,7 +34,8 @@ For a healthy incomplete sweep:
 - use elapsed wall time from the first formal agent pane launch;
 - calculate `speed = valid_completed / elapsed` and
   `ETA = remaining / speed`;
-- schedule the next one-shot heartbeat after `clamp(ETA / 2, 5m, 15m)`;
+- after all checks, read fresh time and schedule the next one-shot heartbeat for
+  `ceil_to_minute(fresh_now + clamp(ETA / 2, 5m, 15m))`;
 - once ETA is below five minutes, keep five-minute checks until terminal.
 
 Before the first valid completion, use a comparable smoke duration when one
@@ -37,7 +46,8 @@ diagnosis. Pane handling remains an agent decision based on exact evidence.
 
 Keep first and final heartbeat prompts complete. Keep intermediate prompts
 minimal. Update the existing heartbeat instead of creating another one, cancel
-or consume it on manual resume, and write Git only for material transitions.
+or consume it on manual resume, and write Git only for material transitions. A
+healthy incomplete wake returns one line and stops.
 Heartbeats are best-effort while the Mac or Codex is unavailable; failure stays
 blocked for manual recovery and never reactivates a custom bridge.
 
