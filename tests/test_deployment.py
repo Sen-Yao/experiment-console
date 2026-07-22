@@ -1,31 +1,9 @@
 from __future__ import annotations
 
-import importlib.util
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def load_launchd_module():
-    path = ROOT / "scripts" / "manage_codex_bridge_launchd.py"
-    spec = importlib.util.spec_from_file_location("bridge_launchd", path)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_launchd_runs_only_the_tmux_wake_bridge(tmp_path):
-    module = load_launchd_module()
-    payload = module.make_plist(
-        python=Path("/usr/bin/python3"), config=tmp_path / "bridge.json"
-    )
-    arguments = payload["ProgramArguments"]
-    assert arguments[-1] == "run"
-    assert "desktop_bridge" in arguments
-    assert "repin-authority" not in arguments
-
 
 def test_legacy_console_packaging_remains_available_for_rollback():
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")

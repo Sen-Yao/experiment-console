@@ -8,10 +8,8 @@ cd "$ROOT"
 echo "==> Python"
 "$PYTHON_BIN" --version
 echo "==> Compile"
-"$PYTHON_BIN" -m compileall -q backend desktop_bridge tests legacy/experiment-console-v3-runner/scripts
+"$PYTHON_BIN" -m compileall -q backend tests legacy/experiment-console-v3-runner/scripts
 echo "==> Tests"
 "$PYTHON_BIN" -m pytest -q
 "$PYTHON_BIN" -m pytest -q legacy/experiment-console-v3-runner/tests -p no:cacheprovider
-echo "==> Bridge surface"
-"$PYTHON_BIN" -m desktop_bridge --config config/desktop-bridge.example.json dry-run >/dev/null
-echo "==> wake bridge checks passed"
+echo "==> legacy rollback checks passed"

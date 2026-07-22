@@ -1,7 +1,7 @@
 [project]
 name = "experiment-console"
 version = "3.0.0"
-description = "Goal-aware tmux wake bridge for Codex experiments on HCCS."
+description = "HCCS experiment-runner knowledge with a disabled Console v3 rollback."
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.115",

@@ -4,8 +4,9 @@ Last verified: 2026-07-20 on Oliver's MacBook Pro with an isolated listener on
 `127.0.0.1:5175`. The listener, v3 health contract, empty ledger, monitor worker,
 and runner instance check all passed; the process was stopped after verification.
 
-Use this path only for isolated development. Production remains on Yggdrasil
-behind the Desktop bridge tunnel.
+Use this path only for isolated rollback development. No Console or custom
+bridge is active in production; formal experiments run directly on HCCS-25 and
+use Codex thread heartbeats for scheduled follow-up.
 
 ```bash
 cd /Users/oliver/Developer/experiment-console

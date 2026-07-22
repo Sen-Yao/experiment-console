@@ -1,23 +1,25 @@
 ---
 name: experiment-runner
-description: "Use when Codex needs to inspect HCCS-25 GPUs, prepare a committed execution worktree, launch or inspect tmux experiment panes, operate native W&B sweeps, stop a pane, or hand a long experiment to the Goal wake bridge."
+description: "Use when Codex needs to inspect HCCS-25 GPUs, prepare a committed execution worktree, launch or inspect tmux experiment panes, operate native W&B sweeps, stop a pane, or schedule dynamic follow-up for a long experiment."
 ---
 
 # Experiment Runner
 
 Treat this skill as operational knowledge, not a runtime service. Run commands
-directly over the `HCCS-25` SSH alias. Use native Git, tmux, NVIDIA, conda, and
-W&B interfaces; do not route new work through Experiment Console v3.
+directly over the `HCCS-25` SSH alias. Use native Git, tmux, NVIDIA, conda, W&B,
+and Codex's built-in thread heartbeat. Do not route new work through Experiment
+Console v3 or build a custom watcher.
 
 ## Ownership Boundary
 
 Codex owns server/GPU choice, Git state, worktree creation, commands, W&B,
-retry/stop decisions, result validation, and scientific interpretation. The Mac
-bridge only observes tagged tmux panes and wakes the bound Codex Goal.
+retry/stop decisions, result validation, heartbeat scheduling, and scientific
+interpretation. Native W&B owns assignments and aggregation; tmux owns durable
+remote process state; the run manifest binds evidence across systems.
 
-Do not add a queue, GPU allocator, experiment database, remote daemon, W&B
-adapter, watchdog, or result aggregator to this skill. Keep repeated scientific
-operations in project scripts and W&B sweep configs.
+Do not add a queue, GPU allocator, experiment database, remote daemon, bridge,
+watchdog, W&B adapter, or result aggregator. Keep repeated scientific operations
+in project scripts and W&B sweep configs.
 
 ## Start With Live Facts
 
@@ -34,7 +36,7 @@ ssh HCCS-25 nvidia-smi \
   --format=csv,noheader,nounits
 ```
 
-Choose GPUs explicitly from both memory/utilization and live compute-process
+Choose GPUs explicitly from memory/utilization and live compute-process
 evidence. Do not rely on a previous probe, kill another process, or assume that
 an apparently idle GPU belongs to this task.
 
@@ -45,18 +47,17 @@ Git, conda, credentials, proxy, or storage on HCCS-25.
 
 Use `/home/linziyao/DualRefGAD` only as the mutable development checkout. Make
 all code edits, tests, commits, pushes, and Git operations there. A formal run
-must use a detached worktree created from the committed full SHA; never run it
-from the mutable checkout.
+must use a detached worktree created from the committed full SHA.
 
 Before launch, commit and push both:
 
 - the code/config commit used by the run;
 - the research protocol/config and prepared run manifest.
 
-The run manifest binds the investigation, code SHA, research protocol commit,
-config digest, seeds, W&B destination, and later the sweep/run/result digests.
-Do not require an atomic transaction across Git, HCCS, and W&B. Record the
-manifest state as `prepared`, `launched`, `completed`, or `invalid`.
+The manifest binds the investigation, code SHA, research protocol commit,
+config digest, seeds, W&B destination, execution start, expected trials, and
+later the run/result digests. Use states `prepared`, `launched`, `completed`, or
+`invalid`; do not require an atomic transaction across Git, HCCS, and W&B.
 
 ## Execution Unit
 
@@ -67,49 +68,49 @@ method families, readers, or other independently retryable configurations.
 
 Keep tightly coupled branches together only when shared initialization, state,
 or RNG is part of the scientific estimand. Expose per-branch progress,
-artifacts, timing, and bounded recovery. Inspect the entrypoint and config for
-hidden scans; a seed-only sweep grid does not prove the trial is atomic.
+artifacts, timing, and bounded recovery.
 
-## W&B Native Sweeps
+## Native W&B And Tmux
 
-Prefer native W&B sweeps and agents for parameter assignment, run identity,
-aggregation, and audit. Read
-[references/wandb-native-sweeps.md](references/wandb-native-sweeps.md) before
-creating a sweep or diagnosing network/auth failures.
+Read [references/wandb-native-sweeps.md](references/wandb-native-sweeps.md)
+before creating a sweep or diagnosing network/auth failures. Direct HTTPS is
+the default; OpenClash is only a diagnosed network fallback.
 
-Run the direct network/project preflight before `wandb.sweep`; OpenClash is a
-diagnosed network fallback, not the default path and not an authentication
-repair. Create a sweep exactly once, record its ID in the run manifest, then
-start one tmux pane per explicitly selected GPU. W&B agents may run in
-parallel. Do not implement local sweep scheduling or automatically downgrade
-to offline mode.
+Create the sweep exactly once, record its ID, then launch one tmux pane per
+explicitly selected GPU in the committed worktree. Activate the project conda
+environment or put its `bin` first in `PATH` before `wandb agent`.
 
-For SenyaoLab investigations, the standing user authorization allows execution
-on HCCS and transmission to `HCCS/DualRefGAD` of experiment config, seed, run
-status, metadata, AUROC, and AP. It excludes raw data, source code, credentials,
-and undeclared artifacts. Ask again only if destination, data classes, or the
-investigation lifecycle changes; experiment count is not an authorization
-limit unless the user or platform explicitly makes it one.
+Use `remain-on-exit=on` when terminal evidence must survive. Record the exact
+session, pane, GPU, task id, and first formal agent-pane start time in the
+manifest. No `@codex_watch` options or Mac observer are required.
 
-## Tmux And Goal Handoff
+For SenyaoLab investigations, standing authorization permits HCCS execution
+and transmission to `HCCS/DualRefGAD` of experiment config, seed, run status,
+metadata, AUROC, and AP. It excludes raw data, source code, credentials, and
+undeclared artifacts. Reauthorize only when destination, data classes, or the
+investigation lifecycle changes.
 
-Read [references/tmux-goal-watch.md](references/tmux-goal-watch.md) for the
-exact registration contract. In summary:
+## Dynamic Heartbeat Handoff
 
-1. Create the session and all experiment panes in the detached worktree.
-2. Set window `remain-on-exit=on`.
-3. Set thread, generation, investigation, start, expected, and attention
-   options on the session.
-4. Set `@codex_watch=1` last.
-5. Verify the bridge sees the session before handing off.
+Read [references/dynamic-heartbeat.md](references/dynamic-heartbeat.md) before
+handing off a long run. Use one active one-shot heartbeat for the Codex task.
+After scheduling it, checkpoint material launch state, follow current Goal rules
+to enter `blocked`, and end the turn. Do not keep a Goal active for polling.
 
-Use `expected_seconds` and `attention_after` as advisory timing. An overrun only
-wakes Codex; it never stops work. When external execution is the only remaining
-dependency, checkpoint the manifest/investigation, follow current Goal rules to
-enter `blocked`, and end the turn. Do not keep a Goal active for model polling.
+At every automatic or manual resume:
 
-After a wake event, re-probe tmux, processes, GPUs, W&B, the run manifest, and
-declared artifacts. A pane terminal state alone is not scientific readiness.
+1. consume, cancel, or update the existing heartbeat before creating another;
+2. re-probe tmux, exact processes/GPU state, W&B, manifest, and artifacts;
+3. stop the sweep and diagnose if any result is failed, invalid, missing, or
+   identity-inconsistent;
+4. if incomplete and healthy, update the same one-shot heartbeat using the
+   bounded ETA policy;
+5. if complete, schedule nothing further and run full aggregate/replay.
+
+Heartbeat delivery is best-effort while the Mac, Codex, or local network is
+unavailable. If it does not resume a blocked Goal, fail closed and wait for
+manual recovery; never restore a custom bridge or use an active Goal as a
+poller.
 
 ## Inspect And Stop
 
@@ -132,21 +133,18 @@ processes. Healthy sibling panes continue.
 
 ## Gotchas
 
-- Non-interactive SSH does not automatically load proxy variables. This is
-  correct for the direct default. Source the mode-600 HCCS environment without
-  printing it only after a diagnosed network failure selects proxy fallback.
-- Native `wandb agent` needs the W&B backend for assignments. Offline runs do
-  not preserve native sweep scheduling; any `offline-manual` fallback is a new
-  explicit protocol.
-- A native agent resolves assigned-trial `python` from `PATH`. Activate the
-  project conda environment inside the tmux pane; invoking only the environment's
-  `wandb` executable can still run trials with system Python.
-- Set `@codex_watch=1` last. A fast command can finish before an incomplete
-  registration becomes visible.
-- `remain-on-exit` preserves normal terminal panes across bridge downtime.
-  Killing the final pane may remove the session; cancellation is already an
-  agent-observed action and does not rely on another wake.
-- One generation emits at most one attention and one terminal event. Re-arm a
-  continuing session with a new generation after Codex has handled attention.
+- Non-interactive SSH correctly has no proxy variables on the direct path.
+  Source the mode-600 fallback environment only after a diagnosed network
+  failure, never to mask `401` or `403`.
+- Native `wandb agent` needs the backend for assignments. Offline runs do not
+  preserve native sweep scheduling.
+- An absolute conda `wandb` executable does not select the assigned trial's
+  Python; put the conda environment first in pane `PATH`.
+- A one-shot heartbeat may be delayed by Mac sleep or Codex downtime. HCCS and
+  W&B remain authoritative; reconstruct state after recovery.
+- Never leave more than one active heartbeat for a task. Manual resume must
+  consume or replace the existing schedule so a stale follow-up cannot race.
+- Keep first and final heartbeat prompts complete, but intermediate prompts
+  minimal. Write Git only for material transitions, not every ETA recalculation.
 - Never put W&B keys, proxy credentials, tokens, raw data, or source payloads in
-  tmux options, argv, manifests, investigation prose, or logs.
+  tmux options, automation prompts, argv, manifests, or logs.

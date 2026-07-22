@@ -51,8 +51,8 @@ trials inside one Python process to reduce run count.
   revalidate during recovery; direct remains the default for later batches.
 - During a run: preserve the local W&B directory and inspect client retry/log
   state before stopping compute.
-- Between assignments: an agent waiting on W&B can remain alive; the tmux
-  attention deadline wakes Codex for judgment.
+- Between assignments: an agent waiting on W&B can remain alive; the next
+  one-shot Codex heartbeat rechecks it for judgment.
 - Persistent outage: Codex may wait, retry the same sweep/agent, or create an
   explicit `offline-manual` protocol. Never switch silently.
 
